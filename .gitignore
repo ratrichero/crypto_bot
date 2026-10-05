@@ -1,0 +1,18 @@
+# secrets - KHONG BAO GIO commit
+*.key
+.okx_key
+.helius_key
+*_state.json
+radar_state.json
+# du lieu chay live
+*.jsonl
+*.log
+wallets.json
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+# streamlit / os
+.DS_Store
+.streamlit/

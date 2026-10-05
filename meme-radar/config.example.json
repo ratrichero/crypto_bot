@@ -1,0 +1,68 @@
+{
+ "alert_min_amount_usd": 2000,
+ "chain": "sol",
+ "cluster_min_wallets": 2,
+ "cluster_window_min": 30,
+ "exclude_symbols": [
+  "SOL",
+  "WSOL",
+  "USDT",
+  "USDC",
+  "JUP",
+  "JLP"
+ ],
+ "horizons_min": [
+  5,
+  15,
+  60,
+  240
+ ],
+ "max_paper_positions": 25,
+ "min_amount_usd": 300,
+ "paper_size_usd": 100,
+ "poll_seconds": 15,
+ "smartmoney_limit": 100,
+ "source": "helius",
+ "helius_api_key": "",
+ "wallets_file": "wallets.json",
+ "watch_wallets": [],
+ "min_sol_spent": 0.3,
+ "ws_enabled": true,
+ "tp1_pct": 0.5,
+ "tp1_frac": 0.34,
+ "tp2_pct": 1.0,
+ "tp2_frac": 0.33,
+ "trailing_pct": 0.3,
+ "sl_pct": 0.25,
+ "time_stop_min": 480,
+ "sell_cluster_min_wallets": 2,
+ "sell_cluster_window_min": 30,
+ "size_by_mcap": [
+  [
+   50000,
+   100
+  ],
+  [
+   0,
+   50
+  ]
+ ],
+ "time_stop_keep_pct": 0.2,
+ "time_stop_keep_frac": 0.5,
+ "holder": {
+  "enabled": true,
+  "wallets": [
+   "8deJ9xeUvXSJwicYptA9mHsU2rN2pDx37KWzkDkEXhU6"
+  ],
+  "max_positions": 10,
+  "sl_pct": 0.5,
+  "trailing_pct": 0.4,
+  "trail_arm_pct": 0.2,
+  "time_stop_min": 1440,
+  "time_stop_keep_pct": 0.2,
+  "time_stop_keep_frac": 0.5,
+  "scale_in_frac": 0.5,
+  "exit_on_wallet_sell": true,
+  "log_file": "paper_trades_holder.jsonl"
+ }
+}

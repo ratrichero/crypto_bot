@@ -1,0 +1,111 @@
+[
+ {
+  "address": "8deJ9xeUvXSJwicYptA9mHsU2rN2pDx37KWzkDkEXhU6",
+  "label": "Cooker.hl/Theo Arc",
+  "profit_7d_usd": 153747
+ },
+ {
+  "address": "78N177fzNJpp8pG49xDv1efYcTMSzo9tPTKEA9mAVkh2",
+  "label": "Sheep",
+  "profit_7d_usd": 41635
+ },
+ {
+  "address": "8MoW9mtbEz6z3gPuAdYb1yWhjCAxQSYqpcTb1CQgN5qb",
+  "label": "Ashtoshii",
+  "profit_7d_usd": 33756
+ },
+ {
+  "address": "CKcWAvvDYr2H3Wj3ACr5zRynrYRSzir2zE5bTf8wiUmT",
+  "label": "unnamed",
+  "profit_7d_usd": 20397
+ },
+ {
+  "address": "67Nwfi9hgwqhxGoovT2JGLU67uxfomLwQAWncjXXzU6U",
+  "label": "Lake",
+  "profit_7d_usd": 16079
+ },
+ {
+  "address": "4g2p34qF4PYeKEHUqyEXwUnCGZMiwUQqY4sTyzUXbXZa",
+  "label": "cobuy+37SOL",
+  "src": "cobuyer_screen",
+  "fifo_sol": 36.6,
+  "fifo_rt": 104,
+  "fifo_wr": 0.61
+ },
+ {
+  "address": "8NVkytV1CtoNBXGFtwXwh4KQdbgVcA6hFmym1gMuRHru",
+  "label": "cobuy+66SOL",
+  "src": "cobuyer_screen",
+  "fifo_sol": 66.2,
+  "fifo_rt": 302,
+  "fifo_wr": 0.67
+ },
+ {
+  "address": "AJ8SJWgXBLa2vUML5k1SQmuBBjJcsncDEAxbYoAEAhde",
+  "label": "cobuy+6SOL",
+  "src": "cobuyer_screen",
+  "fifo_sol": 5.8,
+  "fifo_rt": 312,
+  "fifo_wr": 0.57
+ },
+ {
+  "address": "5gR8zqCrAnU5g11QC14oKV1fEXVCCFfibdQcKpuaQzsj",
+  "label": "cobuy+4SOL",
+  "src": "cobuyer_screen",
+  "fifo_sol": 4.2,
+  "fifo_rt": 303,
+  "fifo_wr": 0.55
+ },
+ {
+  "address": "C9kHQyAfrfZEhVWff3ZHB7VrB7TAsQ8FF3art79zEgPu",
+  "label": "cobuy+6SOL",
+  "src": "cobuyer_screen",
+  "fifo_sol": 5.7,
+  "fifo_rt": 314,
+  "fifo_wr": 0.57
+ },
+ {
+  "address": "AXgzGEvbgaFeb1xhdXkQc5D5CehZUa89ci2F9ugQPLaA",
+  "label": "cobuy+46SOL",
+  "src": "cobuyer_screen",
+  "fifo_sol": 46.3,
+  "fifo_rt": 222,
+  "fifo_wr": 0.64
+ },
+ {
+  "address": "2ke4vRh79c6JavJwFiYbzQsVhJsLAXuaYeVcyUfpft5V",
+  "label": "cobuy+12SOL",
+  "src": "cobuyer_screen",
+  "fifo_sol": 11.5,
+  "fifo_rt": 148,
+  "fifo_wr": 0.52
+ },
+ {
+  "address": "6QsnLVszvtx6eJG1N5vn78paDzK35ayJw9s6zBDgiCTF",
+  "label": "cobuy+6SOL",
+  "src": "cobuyer_screen",
+  "fifo_sol": 6.5,
+  "fifo_rt": 105,
+  "fifo_wr": 0.58
+ },
+ {
+  "address": "AyNWXhor6D98TJhMaaJfzX8hV2f93hPSbnMww3UCCHPn",
+  "label": "cobuyer_screen ACCEPT",
+  "src": "cobuyer_screen_batch2",
+  "fifo_sol": 4.6,
+  "fifo_rt": 324,
+  "fifo_wr": 0.61
+ },
+ {
+  "address": "Ar2Y6o1QmrRAskjii1cRfijeKugHH13ycxW5cd7rro1x",
+  "label": "cobuyer_screen ACCEPT",
+  "src": "cobuyer_screen_batch2",
+  "fifo_sol": 15.43,
+  "fifo_rt": 187,
+  "fifo_wr": 0.53
+ },
+ {
+  "address": "FHds7tJXCFAK2q9ExSAam4ow3PCRec5gV5BggMA4UFvk",
+  "label": "cobuyer_screen ACCEPT +2.8SOL"
+ }
+]
