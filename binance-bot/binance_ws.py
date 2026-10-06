@@ -28,6 +28,7 @@ class BinanceWS:
         self.symbols = [s.lower() for s in symbols]
         self.log = log
         self.prices = {}
+        self.mark_prices = {}
         self.last_msg = 0.0
         self.last_connect = 0.0
         self.reconnect_failures = 0
@@ -55,6 +56,10 @@ class BinanceWS:
         with self._lock:
             return (time.time() - self.last_msg) < 90 and bool(self.prices)
 
+    def mark_snapshot(self):
+        with self._lock:
+            return dict(self.mark_prices)
+
     def _backoff(self) -> float:
         # 5, 10, 20, ... with a small jitter; cap below the operator's
         # circuit cooldown.  A successful message resets the counter.
@@ -65,11 +70,15 @@ class BinanceWS:
     def _run(self):
         # Binance market-stream names are lowercase even though the raw
         # exchangeInfo/universe ids used by the engine are uppercase.
-        streams = "/".join(str(s).lower() + "@miniTicker" for s in self.symbols)
+        streams = "/".join(
+            "%s@miniTicker/%s@markPrice@1s" % (str(s).lower(), str(s).lower())
+            for s in self.symbols
+        )
         url = URL + streams
         self.log(
             "WS configured endpoint=/market stream_count=%d "
-            "reconnect_backoff=5..300s" % len(self.symbols)
+            "miniTicker+markPrice reconnect_backoff=5..300s"
+            % (len(self.symbols) * 2,)
         )
         while not self._stop:
             try:
@@ -97,15 +106,25 @@ class BinanceWS:
                     except Exception:
                         continue
                     data = d.get("data") or {}
-                    if data.get("e") != "24hrMiniTicker":
+                    event_type = data.get("e")
+                    if event_type == "24hrMiniTicker":
+                        try:
+                            px = float(data["c"])
+                        except (KeyError, ValueError, TypeError):
+                            continue
+                        with self._lock:
+                            self.prices[data["s"]] = px
+                            self.last_msg = time.time()
+                    elif event_type == "markPriceUpdate":
+                        try:
+                            mark = float(data["p"])
+                        except (KeyError, ValueError, TypeError):
+                            continue
+                        with self._lock:
+                            self.mark_prices[data["s"]] = mark
+                            self.last_msg = time.time()
+                    else:
                         continue
-                    try:
-                        px = float(data["c"])
-                    except (KeyError, ValueError, TypeError):
-                        continue
-                    with self._lock:
-                        self.prices[data["s"]] = px
-                        self.last_msg = time.time()
                     # Only reset backoff after a stable connection.  A
                     # connection that emits one frame and is immediately
                     # closed must still back off exponentially.

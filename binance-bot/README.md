@@ -13,8 +13,8 @@ live_binance.py     Engine dat lenh that qua ccxt (binanceusdm), che do
                     data_only | dry_run | live. Private calls co governor,
                     circuit breaker va cooldown theo symbol/action; client id,
                     private event fill, aggregate LONG/SHORT reconciliation.
-binance_ws.py       WS public routed /market/stream, 1 connection, reconnect
-                    exponential backoff, khong reconnect storm.
+binance_ws.py       WS public routed /market/stream, miniTicker + markPrice,
+                    1 connection, reconnect exponential backoff, khong storm.
 binance_user_ws.py  WS private routed /private/ws/<listenKey>, keepalive 30m,
                     reconnect 24h/event; nhan ORDER_TRADE_UPDATE/ACCOUNT_UPDATE.
 binance_client.py   REST public shared requests.Session + request metrics,
@@ -33,21 +33,24 @@ test_binance.py     Smoke test offline.
 module này tự chứa (deploy 1 thư mục lên VPS là chạy, không phụ thuộc chéo).
 Nếu sửa logic chiến thuật, sửa cả hai nơi.
 
-## Luật chiến thuật (giống hệt bot OKX)
+## Luật chiến thuật (nền tảng từ bot OKX, có lớp Binance risk guard)
 
-- **Regime**: ADX(14) trên nến 15m. `< adx_threshold` → ranging → chạy grid;
-  `>=` → trending → scalp. **Điểm khởi đầu: `adx_threshold = 24`,
-  `grid.step_mult = 0.8`** — là giá trị optimizer tự tune được từ bot OKX
-  paper ngày 06/10/2026.
+- **Regime**: ADX(14) trên nến 15m đã đóng. `>=25` trong 2 nến xác nhận
+  → trending → scalp; `<=20` trong 2 nến → ranging → grid; vùng 20–25 giữ
+  regime cũ để tránh flip quanh ngưỡng.
 - **Scalp**: trend filter EMA(20) trên 15m; entry khi nến 5m đóng cửa phá
   đỉnh/đáy N nến gần nhất + lọc RSI (long RSI<65, short RSI>35).
   TP 1%, SL 0.4% (net R:R ~1.8 sau phí). Tối đa 4 vị thế scalp;
   sau SL nghỉ 30 phút.
 - **Grid hai chiều**: 5 tầng mỗi bên quanh anchor; step =
-  `clamp(step_mult * ATR(14)/giá, 0.4%, 0.8%)`; TP = 1 step, không SL từng
-  lệnh; rebuild khi giá lệch anchor quá 6 step. Tối đa 7 lệnh grid.
-- **Size**: mỗi lệnh 100 USDT margin ×10 = 1000 USDT notional; tối đa 10 vị thế.
-- **Daily stop**: lỗ ≥20% equity trong ngày → đóng hết, nghỉ hết ngày.
+  `clamp(step_mult * ATR(14)/giá, 0.4%, 0.8%)`; TP = 1 step. Grid có
+  basket stop mặc định 2% mark-to-market equity; khi giá lệch anchor quá
+  6 step thì freeze level mới cho tới khi basket cũ flat, không xóa mapping
+  position đang sống; mỗi cycle tối đa 1 level mới. Tối đa 7 lệnh grid.
+- **Size hiện tại**: mỗi lệnh 100 USDT margin ×10 = 1000 USDT notional;
+  tối đa 10 vị thế. Position sizing theo risk/ATR vẫn là bước P1 tiếp theo.
+- **Daily stop**: lỗ mark-to-market ≥10% equity đầu ngày → đóng hết và nghỉ
+  hết ngày. Mức 10% là cấu hình thử nghiệm ban đầu, chưa phải mức tối ưu cuối.
 - **Kill switch**: tạo file `STOP` trong thư mục này → bot shutdown gọn.
 
 ## Điểm khác biệt so với bot OKX (lý do)
@@ -65,8 +68,8 @@ Nếu sửa logic chiến thuật, sửa cả hai nơi.
    Hedge Mode). Mỗi lệnh có `newClientOrderId`; nếu request timeout bot query
    lại theo client id một lần thay vì blind retry.
 4. **Phí**: taker Binance USDT-M 0.05% (`fee_rate = 0.0005`), giống OKX.
-   Funding 8h chưa mô hình hóa (giống bot OKX) — cần cộng vào khi đánh giá
-   P&L dài hạn.
+   Funding và slippage vẫn cần đưa vào backtest/P&L đầy đủ trước khi tối ưu
+   size dài hạn.
 5. Không có paper mode nội bộ: so sánh paper-vs-real bằng bot OKX đang chạy
    trên máy Muse.
 
@@ -89,6 +92,10 @@ Nếu sửa logic chiến thuật, sửa cả hai nơi.
   reconnect chủ động trước lifetime 24 giờ, nhận `ORDER_TRADE_UPDATE` để lấy
   fill trước khi fallback REST và nhận `ACCOUNT_UPDATE` để đánh dấu thay đổi
   account. Nếu private WS gặp lỗi safety circuit, bot dừng fail-closed.
+- Fast risk loop dùng Mark Price để cập nhật `mark_equity`, unrealized PnL,
+  daily drawdown và grid basket loss. Daily stop không còn chỉ dựa trên
+  realized balance. Reconciliation cũng halt nếu khoảng cách tới liquidation
+  price nhỏ hơn `min_liquidation_buffer_pct` (mặc định 5%).
 - Mặc định `exchange_protection=false`: SL/TP do process canh. Sau khi
   testnet/mock validation đạt, có thể bật `exchange_protection=true` để tạo
   Algo Order `STOP_MARKET`/`TAKE_PROFIT_MARKET` theo từng position; bot hủy

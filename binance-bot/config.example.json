@@ -3,10 +3,10 @@
  "_comment_universe": "universe.json do build_universe.py tao: top USDT-M perp theo volume 24h.",
  "_comment_size": "Moi lenh = order_margin_usdt * leverage notional (100 * 10 = 1000 USDT). Toi da 10 vi the.",
  "_comment_scalp": "TP 1%, SL 0.4% (net R:R ~1.8 sau phi). Breakout dinh/day N nen 5m + loc RSI + trend EMA20 tren 15m.",
- "_comment_adx": "Diem khoi dau = gia tri optimizer tune tu bot OKX paper (24, ngay 06/10/2026). <24 = ranging -> grid; >=24 = trending -> scalp.",
+ "_comment_adx": "ADX 15m: >=25 trong nhieu nen -> trending, <=20 -> ranging, vung giua giu regime cu de tranh flip.",
  "_comment_grid": "step = clamp(step_mult * ATR(14)/gia, step_min, step_max). Rebuild khi gia lech anchor qua range_steps step.",
  "_comment_hedge": "true = bat buoc: grid 2 chieu (long+short cung symbol) chi chay duoc o hedge mode. Bot tu bat luc khoi dong.",
- "_comment_risk": "Dung ngay khi lo >= 20% equity trong ngay (dong het vi the). Khong tu dong doi leverage/size/max positions.",
+ "_comment_risk": "Dung entry va dong vi the khi mark-to-market equity lo >= 10% trong ngay; grid basket stop rieng 2% equity. Chua tu dong doi leverage/size.",
  "_comment_testnet": "true = dung Binance futures testnet (can key testnet rieng). Chi de thu nghiem ky thuat, khong phan anh thanh khoan that.",
  "_comment_misc": "fee_rate = phi taker Binance USDT-M (0.05%). disabled_symbols: {\"BTCUSDT\": <unix_ts>} de tam nghi 1 coin.",
  "_comment_order": "Live dung clientOrderId + ORDER_TRADE_UPDATE; recvWindow nho, khong blind retry order timeout.",
@@ -21,6 +21,8 @@
  "new_order_resp_type": "RESULT",
  "order_event_timeout_seconds": 8,
  "reconcile_interval_seconds": 60,
+ "equity_refresh_seconds": 5,
+ "min_liquidation_buffer_pct": 0.05,
  "order_failure_cooldown_seconds": 30,
  "order_failure_cooldown_max_seconds": 900,
  "universe_file": "universe.json",
@@ -29,10 +31,12 @@
  "leverage": 10,
  "order_margin_usdt": 100,
  "max_total_positions": 10,
- "adx_threshold": 24,
+ "adx_threshold": 25,
+ "adx_range_threshold": 20,
+ "regime_confirm_bars": 2,
  "fee_rate": 0.0005,
  "slippage": 0.0001,
- "candle_refresh_seconds": 180,
+ "candle_refresh_seconds": 60,
  "fast_poll_seconds": 0.5,
  "disabled_symbols": {},
  "hedge_mode": true,
@@ -49,6 +53,7 @@
  },
  "grid": {
   "levels_each_side": 5,
+  "max_entries_per_cycle": 1,
   "max_positions": 7,
   "order_notional": 1000.0,
   "range_steps": 6,
@@ -58,7 +63,8 @@
   "step_pct": 0.005
  },
  "risk": {
-  "daily_max_loss_pct": 0.2,
+  "daily_max_loss_pct": 0.1,
+  "grid_basket_max_loss_pct": 0.02,
   "max_notional_mult": 10.0
  }
 }

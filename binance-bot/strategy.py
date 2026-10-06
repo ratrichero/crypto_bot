@@ -2,15 +2,29 @@
 from indicators import ema, rsi, adx
 
 
-def detect_regime(candles15, threshold):
-    """Returns ('trending'|'ranging', adx_value) from closed 15m bars."""
+def detect_regime(candles15, threshold, previous=None, range_threshold=None):
+    """Return ``('trending'|'ranging', adx_value)`` from closed 15m bars.
+
+    ``threshold`` is the entry threshold for trending and ``range_threshold``
+    is the lower exit threshold. Keeping the previous state between those
+    values prevents a regime flip around one noisy ADX reading.
+    """
     # REST/WS kline payloads include the currently forming candle as the last
     # row. Regime must not flip intra-candle.
     closed15 = candles15[:-1] if len(candles15) > 1 else candles15
     v = adx(closed15)
     if v is None:
         return "ranging", None
-    return ("trending" if v >= threshold else "ranging"), round(v, 1)
+    trend_threshold = float(threshold)
+    range_threshold = (trend_threshold if range_threshold is None
+                       else float(range_threshold))
+    if previous == "trending":
+        regime = "ranging" if v <= range_threshold else "trending"
+    elif previous == "ranging":
+        regime = "trending" if v >= trend_threshold else "ranging"
+    else:
+        regime = "trending" if v >= trend_threshold else "ranging"
+    return regime, round(v, 1)
 
 
 def scalp_signal(candles5, candles15, cfg):
