@@ -130,6 +130,11 @@ class BinanceEngine:
             self.ex.set_position_mode(True)
             self.log("Binance position mode: HEDGE (dual-side) OK")
         except Exception as e:
+            msg = str(e)
+            # -4059 "No need to change position side": tai khoan da o hedge mode
+            if "-4059" in msg or "No need to change position side" in msg:
+                self.log("Binance position mode: da o HEDGE tu truoc, OK")
+                return
             raise RuntimeError(
                 "Khong bat duoc hedge mode tren Binance: %s. "
                 "Grid 2 chieu BAT BUOC hedge mode (one-way se net long/short "
