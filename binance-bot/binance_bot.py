@@ -278,7 +278,8 @@ def main():
                 last_cfg_reload = now
             if ws.healthy():
                 prices = dict(ws.prices)
-            elif now - last_rest_px > 10:
+            elif now - last_rest_px > 30:
+                # fallback REST khi WS rot: toi da 30s/lan de tranh 429/418
                 prices.update(rest_tickers_fallback())
                 last_rest_px = now
             if not prices:
@@ -316,6 +317,7 @@ def main():
                             "15m": binance_client.get_klines(symbol, "15m", 100),
                             "ts": time.time(),
                         }
+                        time.sleep(0.5)  # gian request tranh 429
                     except Exception as e:
                         log(f"candle refresh {symbol} failed: {e}")
                 if not st["halted"]:

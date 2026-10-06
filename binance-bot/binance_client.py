@@ -14,10 +14,16 @@ def _get(path, params=None, tries=3):
         try:
             r = requests.get(BASE + path, params=params or {},
                              timeout=TIMEOUT)
+            if r.status_code in (429, 418):
+                # bi gioi han: KHONG retry ngay (lam ban nang them), nem luon
+                r.raise_for_status()
             r.raise_for_status()
             return r.json()
         except Exception as e:
             last = e
+            # 429/418: dung han, khong thu lai
+            if "429" in str(e) or "418" in str(e):
+                break
         time.sleep(1.5)
     raise last
 
