@@ -89,6 +89,12 @@ def default_state():
         "regimes": {},
         "day": utc_day(),
         "day_start_equity": CFG["start_equity"],
+        "intraday_peak_equity": CFG["start_equity"],
+        "mark_equity": CFG["start_equity"],
+        "unrealized_pnl": 0.0,
+        "daily_drawdown_pct": 0.0,
+        "_risk_initialized": False,
+        "signal_bars": {},
         "halted": False,
         "halt_reason": "",
         "cooldown_until": 0,
@@ -106,6 +112,12 @@ def load_state():
             d.update(st)
             d.setdefault("grids", {})
             d.setdefault("regimes", {})
+            d.setdefault("signal_bars", {})
+            d.setdefault("intraday_peak_equity", d.get("day_start_equity", d["equity"]))
+            d.setdefault("mark_equity", d.get("equity", 0.0))
+            d.setdefault("unrealized_pnl", 0.0)
+            d.setdefault("daily_drawdown_pct", 0.0)
+            d.setdefault("_risk_initialized", False)
             return d
         except Exception:
             pass
@@ -142,8 +154,26 @@ def is_disabled(symbol):
     return CFG.get("disabled_symbols", {}).get(symbol, 0) > time.time()
 
 
+def _record_close(st, rec):
+    """Persist a close and update grid/scalp bookkeeping."""
+    record_trade(rec)
+    symbol = rec["symbol"]
+    g = st["grids"].get(symbol)
+    if g:
+        for key, pid in list(g.get("taken", {}).items()):
+            if pid == rec["id"]:
+                g["taken"].pop(key, None)
+                break
+    log(f"CLOSE #{rec['id']} {symbol} {rec['side']} {rec['tag']} "
+        f"{rec['reason']} pnl={rec['pnl']:+.2f} eq={st['equity']:.2f}")
+    if rec["tag"] == "scalp" and rec["reason"] == "SL":
+        st["cooldown_until"] = (time.time()
+                               + CFG["scalp"]["cooldown_after_sl_min"] * 60)
+        log("Scalp cooldown 30p sau SL")
+
+
 def update_positions(engine, st, symbol, price):
-    """Tick-driven SL/TP check. Returns True if anything closed."""
+    """Tick-driven SL/TP check using the mark price."""
     closed = []
     for pos in [p for p in st["positions"] if p["symbol"] == symbol]:
         if pos["side"] == "long":
@@ -165,19 +195,7 @@ def update_positions(engine, st, symbol, price):
                 if rec:
                     closed.append(rec)
     for rec in closed:
-        record_trade(rec)
-        g = st["grids"].get(symbol)
-        if g:
-            for k, pid in list(g["taken"].items()):
-                if pid == rec["id"]:
-                    g["taken"].pop(k, None)
-                    break
-        log(f"CLOSE #{rec['id']} {symbol} {rec['side']} {rec['tag']} "
-            f"{rec['reason']} pnl={rec['pnl']:+.2f} eq={st['equity']:.2f}")
-        if rec["tag"] == "scalp" and rec["reason"] == "SL":
-            st["cooldown_until"] = (time.time()
-                                   + CFG["scalp"]["cooldown_after_sl_min"] * 60)
-            log("Scalp cooldown 30p sau SL")
+        _record_close(st, rec)
     return bool(closed)
 
 
@@ -188,10 +206,22 @@ def manage_scalp(engine, st, symbol, price, c5, c15):
         return False
     if time.time() < st["cooldown_until"]:
         return False
+    closed5 = c5[:-1] if len(c5) > 1 else c5
+    bar_ts = closed5[-1].get("ts") if closed5 else None
+    signal_bars = st.setdefault("signal_bars", {})
+    if bar_ts is not None and signal_bars.get(symbol) == bar_ts:
+        return False
+    if bar_ts is not None:
+        # Consume a closed candle once, even if it has no signal or the order
+        # is rejected. This prevents re-opening the same breakout after TP.
+        signal_bars[symbol] = bar_ts
     sig, info = strategy.scalp_signal(c5, c15, CFG)
     if not sig:
         return False
     if any(p["tag"] == "scalp" and p["symbol"] == symbol and p["side"] == sig
+           for p in st["positions"]):
+        return False
+    if any(p["tag"] == "scalp" and p["symbol"] == symbol and p["side"] != sig
            for p in st["positions"]):
         return False
     notional = CFG["order_margin_usdt"] * CFG["leverage"]
@@ -230,22 +260,96 @@ def acquire_instance_lock():
     return fh
 
 
+def manage_grid_risk(engine, st, mark_prices):
+    """Stop a grid basket before an unbounded one-way move consumes equity."""
+    limit_pct = float(CFG["risk"].get("grid_basket_max_loss_pct", 0.0))
+    if limit_pct <= 0:
+        return False
+    base_equity = float(st.get("mark_equity", st.get("equity", 0.0)) or 0.0)
+    if base_equity <= 0:
+        return False
+    changed = False
+    for symbol, grid in list(st["grids"].items()):
+        if grid.get("risk_halted"):
+            continue
+        positions = [p for p in st["positions"]
+                     if p.get("tag") == "grid" and p.get("symbol") == symbol]
+        if not positions:
+            continue
+        price = mark_prices.get(symbol)
+        if price is None:
+            continue
+        pnl = 0.0
+        for pos in positions:
+            if pos["side"] == "long":
+                pnl += (price - pos["entry"]) * pos["qty"]
+            else:
+                pnl += (pos["entry"] - price) * pos["qty"]
+        loss_limit = base_equity * limit_pct
+        if pnl > -loss_limit:
+            continue
+        grid["risk_halted"] = True
+        grid["rebuild_pending"] = True
+        log("GRID BASKET STOP %s pnl=%+.2f limit=-%.2f positions=%d" %
+            (symbol, pnl, loss_limit, len(positions)))
+        for pos in list(positions):
+            rec = engine.close(pos, price, "GRID_BASKET_STOP")
+            if rec:
+                _record_close(st, rec)
+                changed = True
+        grid["taken"] = {}
+    return changed
+
+
 def manage_grid(engine, st, symbol, price):
     g = CFG["grid"]
     grid = st["grids"].setdefault(symbol, {"anchor": None, "taken": {}})
+    grid.setdefault("anchor", None)
+    grid.setdefault("taken", {})
+    if grid.get("risk_halted"):
+        return False
     step = grid.get("step") or g["step_pct"]
     rng = g["range_steps"] * step
     changed = False
-    if grid["anchor"] is None or abs(price / grid["anchor"] - 1) > rng:
+    active = [p for p in st["positions"]
+              if p.get("tag") == "grid" and p.get("symbol") == symbol]
+    # Preserve level ownership across an anchor cycle. Never forget live lots.
+    for pos in active:
+        if pos.get("level") is not None:
+            grid.setdefault("taken", {}).setdefault(pos["level"], pos["id"])
+    if grid.get("rebuild_pending") and not active:
         grid["anchor"] = price
         grid["taken"] = {}
+        grid["rebuild_pending"] = False
         log(f"Grid {symbol} rebuild anchor={price:.4f}")
         changed = True
+    elif grid["anchor"] is None:
+        grid["anchor"] = price
+        grid["rebuild_pending"] = False
+        log(f"Grid {symbol} rebuild anchor={price:.4f}")
+        changed = True
+    elif abs(price / grid["anchor"] - 1) > rng:
+        if active:
+            # Existing lots must be flattened or reach their exits before a
+            # new anchor is allowed; otherwise old and new grids overlap.
+            if not grid.get("rebuild_pending"):
+                log("Grid %s trend break; freeze new levels until flat" % symbol)
+            grid["rebuild_pending"] = True
+            return changed
+        grid["anchor"] = price
+        grid["taken"] = {}
+        grid["rebuild_pending"] = False
+        log(f"Grid {symbol} rebuild anchor={price:.4f}")
+        changed = True
+    if grid.get("rebuild_pending"):
+        return changed
     anchor = grid["anchor"]
     n_grid = sum(1 for p in st["positions"] if p["tag"] == "grid")
     notional = CFG["order_margin_usdt"] * CFG["leverage"]
+    entries = 0
+    max_entries = int(g.get("max_entries_per_cycle", 1))
     for k in range(1, g["levels_each_side"] + 1):
-        if n_grid >= g["max_positions"]:
+        if entries >= max_entries or n_grid >= g["max_positions"]:
             break
         if len(st["positions"]) >= CFG["max_total_positions"]:
             break
@@ -257,8 +361,11 @@ def manage_grid(engine, st, symbol, price):
             if pos:
                 grid["taken"][bk] = pos["id"]
                 n_grid += 1
+                entries += 1
                 changed = True
                 log(f"OPEN #{pos['id']} {symbol} grid BUY k={k} @ {pos['entry']:.4f}")
+        if entries >= max_entries:
+            break
         sk = f"s{k}"
         if price >= anchor * (1 + k * step) and sk not in grid["taken"]:
             pos, _ = engine.open(symbol, "short", notional,
@@ -267,6 +374,7 @@ def manage_grid(engine, st, symbol, price):
             if pos:
                 grid["taken"][sk] = pos["id"]
                 n_grid += 1
+                entries += 1
                 changed = True
                 log(f"OPEN #{pos['id']} {symbol} grid SELL k={k} @ {pos['entry']:.4f}")
     return changed
@@ -334,7 +442,9 @@ def main():
     log(f"Warmup done: {len(candles)}/{len(SYMBOLS)}")
 
     prices = {}
+    mark_prices = {}
     last_rest_px = 0
+    last_equity_refresh = 0
     last_heartbeat = 0
     last_cfg_reload = 0
     loop = 0
@@ -354,17 +464,6 @@ def main():
                 raise binance_safety.BinanceSafetyStop(user_error)
             binance_safety.ensure_allowed()
 
-            if st["day"] != utc_day():
-                persistent_halt = str(st.get("halt_reason", "")).startswith(
-                    ("exchange ", "unmanaged ", "position ")
-                )
-                st["day"] = utc_day()
-                st["day_start_equity"] = st["equity"]
-                st["halted"] = persistent_halt
-                if not persistent_halt:
-                    st["halt_reason"] = ""
-                log(f"New day {st['day']}")
-
             # ---- prices: routed WS live, low-weight REST fallback ----
             now = time.time()
             if now - last_cfg_reload > 60:
@@ -377,16 +476,81 @@ def main():
                 last_cfg_reload = now
             if ws.healthy():
                 prices = ws.snapshot()
+                marks = ws.mark_snapshot()
+                mark_prices = {
+                    symbol: marks.get(symbol, price)
+                    for symbol, price in prices.items()
+                }
             elif now - last_rest_px > 30:
                 # /fapi/v2/ticker/price without symbol has weight 2, versus
                 # weight 40 for the all-symbol 24h statistics endpoint.
-                prices.update(rest_tickers_fallback())
+                prices = rest_tickers_fallback()
+                mark_prices = dict(prices)
                 last_rest_px = now
             if not prices:
                 time.sleep(2)
                 continue
 
             dirty = False
+
+            # Mark-to-market equity is the risk source of truth. In live mode
+            # this reads Binance account margin balance; dry-run estimates it
+            # from local positions and the mark price feed.
+            risk_equity_ready = False
+            if (DATA_ONLY or
+                    now - last_equity_refresh >= float(
+                        CFG.get("equity_refresh_seconds", 5))):
+                try:
+                    if not DATA_ONLY:
+                        mtm = engine.mark_to_market_equity(mark_prices)
+                        st["mark_equity"] = float(mtm)
+                        st["unrealized_pnl"] = float(
+                            engine.unrealized(mark_prices)
+                        )
+                        risk_equity_ready = True
+                    last_equity_refresh = now
+                except binance_safety.BinanceSafetyStop:
+                    raise
+                except Exception as e:
+                    last_equity_refresh = now
+                    st["halted"] = True
+                    st["halt_reason"] = "equity unavailable"
+                    log("CRITICAL mark-to-market equity unavailable: %s" % e)
+                    dirty = True
+            if DATA_ONLY:
+                st["mark_equity"] = st.get("equity", 0.0)
+                st["unrealized_pnl"] = 0.0
+                risk_equity_ready = True
+
+            today = utc_day()
+            if risk_equity_ready and (
+                    st.get("day") != today or not st.get("_risk_initialized")):
+                persistent_halt = str(st.get("halt_reason", "")).startswith(
+                    ("exchange ", "unmanaged ", "position ")
+                )
+                st["day"] = today
+                st["day_start_equity"] = st["mark_equity"]
+                st["intraday_peak_equity"] = st["mark_equity"]
+                st["_risk_initialized"] = True
+                st["halted"] = persistent_halt
+                if not persistent_halt:
+                    st["halt_reason"] = ""
+                    for symbol, grid in st.get("grids", {}).items():
+                        if not any(p.get("tag") == "grid"
+                                   and p.get("symbol") == symbol
+                                   for p in st["positions"]):
+                            grid["risk_halted"] = False
+                            grid["rebuild_pending"] = False
+                log(f"New risk day {today} baseline={st['day_start_equity']:.2f}")
+
+            if st.get("_risk_initialized"):
+                if st["mark_equity"] > st.get("intraday_peak_equity", 0):
+                    st["intraday_peak_equity"] = st["mark_equity"]
+                if st["day_start_equity"] > 0:
+                    st["daily_drawdown_pct"] = (
+                        st["mark_equity"] - st["day_start_equity"]
+                    ) / st["day_start_equity"]
+
 
             if MODE == "live" and not engine.reconcile_positions():
                 if not st["halted"]:
@@ -396,15 +560,17 @@ def main():
 
             # ---- FAST PATH: only trading modes may mutate positions/orders
             reconcile_hold = str(st.get("halt_reason", "")).startswith(
-                ("exchange position", "unmanaged ", "position reconciliation")
+                ("exchange position", "unmanaged ", "position ")
             )
             if not DATA_ONLY:
                 if not reconcile_hold:
+                    if manage_grid_risk(engine, st, mark_prices):
+                        dirty = True
                     for symbol in SYMBOLS:
-                        px = prices.get(symbol)
-                        if px is None:
+                        mark = mark_prices.get(symbol, prices.get(symbol))
+                        if mark is None:
                             continue
-                        if update_positions(engine, st, symbol, px):
+                        if update_positions(engine, st, symbol, mark):
                             dirty = True
                 if not st["halted"]:
                     for symbol in SYMBOLS:
@@ -440,13 +606,48 @@ def main():
                         cc = candles.get(symbol)
                         if px is None or not cc or not cc.get("15m"):
                             continue
-                        regime, av = strategy.detect_regime(
-                            cc["15m"], CFG["adx_threshold"]
-                        )
-                        prev = st["regimes"].get(symbol, {}).get("regime")
-                        st["regimes"][symbol] = {"regime": regime, "adx": av}
-                        if regime != prev and prev is not None:
-                            log(f"{symbol} regime -> {regime} (adx={av})")
+                        rec = st["regimes"].get(symbol, {})
+                        regime = rec.get("regime", "ranging")
+                        closed15 = cc["15m"][:-1] if len(cc["15m"]) > 1 else cc["15m"]
+                        regime_bar_ts = closed15[-1].get("ts") if closed15 else None
+                        if regime_bar_ts != rec.get("bar_ts"):
+                            previous = rec.get("regime")
+                            candidate, av = strategy.detect_regime(
+                                cc["15m"],
+                                CFG["adx_threshold"],
+                                previous=previous,
+                                range_threshold=CFG.get("adx_range_threshold"),
+                            )
+                            candidate_name = rec.get("candidate")
+                            candidate_count = int(rec.get("candidate_count", 0))
+                            if previous is None:
+                                regime = candidate
+                                candidate_name = None
+                                candidate_count = 0
+                            elif candidate == previous:
+                                regime = previous
+                                candidate_name = None
+                                candidate_count = 0
+                            elif candidate == candidate_name:
+                                candidate_count += 1
+                                if candidate_count >= int(CFG.get(
+                                        "regime_confirm_bars", 2)):
+                                    regime = candidate
+                                    candidate_name = None
+                                    candidate_count = 0
+                            else:
+                                candidate_name = candidate
+                                candidate_count = 1
+                            rec = {
+                                "regime": regime,
+                                "adx": av,
+                                "bar_ts": regime_bar_ts,
+                                "candidate": candidate_name,
+                                "candidate_count": candidate_count,
+                            }
+                            st["regimes"][symbol] = rec
+                            if regime != previous and previous is not None:
+                                log(f"{symbol} regime -> {regime} (adx={av})")
                         # ATR-adaptive grid step cho lan rebuild ke tiep
                         try:
                             a = atr(cc["15m"], 14)
@@ -468,34 +669,39 @@ def main():
                                             px, cc["5m"], cc["15m"]):
                                 dirty = True
 
-            # ---- daily stop (never sends closes in data_only mode) ----
-            if not DATA_ONLY and st["day_start_equity"] > 0:
-                dp = ((st["equity"] - st["day_start_equity"])
-                      / st["day_start_equity"])
+            # ---- daily stop on mark-to-market equity ----
+            if (not DATA_ONLY and st.get("_risk_initialized")
+                    and st["day_start_equity"] > 0):
+                dp = st.get("daily_drawdown_pct", 0.0)
                 if (not st["halted"]
-                        and dp <= -CFG["risk"]["daily_max_loss_pct"]):
+                        and dp <= -float(CFG["risk"]["daily_max_loss_pct"])):
                     st["halted"] = True
                     st["halt_reason"] = f"daily stop {dp*100:.2f}%"
                     for pos in list(st["positions"]):
                         rec = engine.close(
                             pos,
-                            prices.get(pos["symbol"], pos["entry"]),
+                            mark_prices.get(pos["symbol"], pos["entry"]),
                             "DAILY_STOP",
                         )
                         if rec:
-                            record_trade(rec)
-                    st["grids"] = {}
+                            _record_close(st, rec)
+                    for grid in st.get("grids", {}).values():
+                        grid["risk_halted"] = True
+                        grid["rebuild_pending"] = True
                     dirty = True
-                    log(f"HALTED {st['halt_reason']} eq={st['equity']:.2f}")
+                    log("HALTED %s mark_equity=%.2f day_start=%.2f" %
+                        (st["halt_reason"], st["mark_equity"],
+                         st["day_start_equity"]))
 
             if dirty or loop % 20 == 0:
                 save_state(st)
             loop += 1
             if now - last_heartbeat > 600:
-                u = engine.unrealized(prices)
-                log(f"heartbeat eq={st['equity']:.2f} unreal={u:+.2f} "
-                    f"pos={len(st['positions'])} ws={ws.healthy()} "
-                    f"mode={MODE}")
+                log(f"heartbeat wallet={st['equity']:.2f} "
+                    f"mark_equity={st.get('mark_equity', st['equity']):.2f} "
+                    f"unreal={st.get('unrealized_pnl', 0.0):+.2f} "
+                    f"daily_dd={st.get('daily_drawdown_pct', 0.0)*100:+.2f}% "
+                    f"pos={len(st['positions'])} ws={ws.healthy()} mode={MODE}")
                 last_heartbeat = now
         except binance_safety.BinanceSafetyStop as e:
             # Critical rule: 429/418/-1003 and a persisted circuit stop all

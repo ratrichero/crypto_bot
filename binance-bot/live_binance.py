@@ -597,11 +597,81 @@ class BinanceEngine:
         if self.dry_run:
             return
         try:
-            self.state["equity"] = self.get_balance_usdt()["total"]
+            wallet = self.get_balance_usdt()["total"]
+            self.state["wallet_equity"] = wallet
+            self.state["equity"] = wallet
         except binance_safety.BinanceSafetyStop:
             raise
         except Exception as e:
             self.log("WARNING refresh_equity that bai: %s (giu equity cu)" % e)
+
+    @staticmethod
+    def _number(value):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def mark_to_market_equity(self, mark_prices):
+        """Return account equity including open-position PnL.
+
+        Binance's futures account response normally exposes
+        ``totalMarginBalance``. That is preferred because it already includes
+        unrealized PnL. The fallback uses wallet balance plus the local
+        mark-price estimate and is only used when the exchange payload lacks
+        the aggregate fields.
+        """
+        if self.dry_run:
+            return self.state.get("equity", 0.0) + self.unrealized(mark_prices)
+        balance = self._private_call(
+            "private:account",
+            self.ex.fetch_balance,
+        )
+        info = balance.get("info") or {}
+        for key in ("totalMarginBalance", "marginBalance"):
+            value = self._number(info.get(key))
+            if value is not None:
+                return value
+        wallet = self._number(info.get("totalWalletBalance"))
+        unrealized = self._number(info.get("totalUnrealizedProfit"))
+        if wallet is not None:
+            return wallet + (unrealized or 0.0)
+        usdt = balance.get("USDT", {}) or {}
+        wallet = self._number(usdt.get("total"))
+        if wallet is None:
+            raise RuntimeError("Binance account equity missing from response")
+        return wallet + self.unrealized(mark_prices)
+
+    def _check_liquidation_buffer(self, rows):
+        """Halt new risk when an exchange position nears liquidation."""
+        minimum = float(self.cfg.get("min_liquidation_buffer_pct", 0.0))
+        if minimum <= 0:
+            return True
+        for position in rows or []:
+            info = position.get("info") or {}
+            mark = self._number(
+                position.get("markPrice") or info.get("markPrice")
+            )
+            liquidation = self._number(
+                position.get("liquidationPrice")
+                or info.get("liquidationPrice")
+            )
+            if not mark or not liquidation or mark <= 0 or liquidation <= 0:
+                continue
+            distance = abs(mark - liquidation) / mark
+            if distance < minimum:
+                self.state["halted"] = True
+                self.state["halt_reason"] = (
+                    "position liquidation buffer breached"
+                )
+                self.log(
+                    "CRITICAL liquidation buffer symbol=%s mark=%s "
+                    "liquidation=%s distance=%.2f%% minimum=%.2f%%"
+                    % (self._raw_symbol(position), mark, liquidation,
+                       distance * 100, minimum * 100)
+                )
+                return False
+        return True
 
     def _aggregate_positions(self, rows):
         """Aggregate exchange/base quantities by raw symbol and LONG/SHORT."""
@@ -640,9 +710,10 @@ class BinanceEngine:
             return True
         self._last_reconcile = now
         try:
-            exchange = self._aggregate_positions(
-                self.get_positions() if rows is None else rows
-            )
+            rows = self.get_positions() if rows is None else rows
+            if not self._check_liquidation_buffer(rows):
+                return False
+            exchange = self._aggregate_positions(rows)
         except binance_safety.BinanceSafetyStop:
             raise
         except Exception as exc:

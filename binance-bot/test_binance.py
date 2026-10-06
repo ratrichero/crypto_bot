@@ -62,17 +62,29 @@ CFG = json.load(open(os.path.join(BASE, "config.example.json")))
 
 # --- 1. config template ---
 check("config mode default dry_run", CFG.get("mode") == "dry_run")
-check("config adx_threshold == 24 (optimizer-tuned)",
-      CFG.get("adx_threshold") == 24)
+check("config adx_threshold == 25", CFG.get("adx_threshold") == 25)
+check("config adx hysteresis threshold == 20",
+      CFG.get("adx_range_threshold") == 20)
+check("config regime confirmation == 2 bars",
+      CFG.get("regime_confirm_bars") == 2)
 check("config grid.step_mult == 0.8 (optimizer-tuned)",
       CFG.get("grid", {}).get("step_mult") == 0.8)
 for k in ("scalp", "grid", "risk", "leverage", "order_margin_usdt",
           "max_total_positions", "hedge_mode", "fee_rate", "recv_window_ms",
           "order_event_timeout_seconds", "reconcile_interval_seconds",
+          "equity_refresh_seconds", "min_liquidation_buffer_pct",
           "exchange_protection"):
     check("config has " + k, k in CFG)
 check("exchange protection disabled by default",
       CFG.get("exchange_protection") is False)
+check("daily stop starts at 10 percent",
+      CFG.get("risk", {}).get("daily_max_loss_pct") == 0.1)
+check("grid basket stop configured",
+      CFG.get("risk", {}).get("grid_basket_max_loss_pct") == 0.02)
+check("grid opens at most one level per cycle",
+      CFG.get("grid", {}).get("max_entries_per_cycle") == 1)
+check("liquidation buffer configured",
+      CFG.get("min_liquidation_buffer_pct") == 0.05)
 
 # --- 2. qty_for pure function ---
 check("qty basic", live_binance.qty_for(1000, 50000, 0.001) == 0.02)
@@ -111,6 +123,13 @@ check("dry_run logs positionSide LONG",
 check("dry_run logs DRY_RUN marker", any("DRY_RUN" in m for m in logs))
 check("dry_run equity charged fee only",
       abs(st["equity"] - (1000.0 - 1000 * CFG["fee_rate"])) < 1e-9)
+mtm_st = fresh_state()
+mtm_eng = live_binance.BinanceEngine(CFG, mtm_st, dry_run=True,
+                                     log=lambda _: None)
+mtm_st["positions"].append({"side": "long", "symbol": "BTCUSDT",
+                             "entry": 50000.0, "qty": 0.02})
+check("dry_run mark-to-market includes unrealized",
+      abs(mtm_eng.mark_to_market_equity({"BTCUSDT": 49000.0}) - 980.0) < 1e-9)
 rec = eng.close(pos, 50500, "TP")  # +1% -> win
 check("dry_run close pnl positive", rec["pnl"] > 0, rec["pnl"])
 check("dry_run trade recorded", st["stats"]["trades"] == 1)
@@ -157,7 +176,8 @@ agg_rows = [
 agg = agg_eng._aggregate_positions(agg_rows)
 check("aggregate reconciliation groups grid lots", agg[("BTCUSDT", "long")] == 0.05)
 check("aggregate reconciliation keeps Hedge sides", agg[("BTCUSDT", "short")] == 0.01)
-agg_eng.cfg = {"reconcile_interval_seconds": 0}
+agg_eng.cfg = {"reconcile_interval_seconds": 0,
+                "min_liquidation_buffer_pct": 0.05}
 agg_eng._last_reconcile = 0.0
 agg_eng.state = {"positions": [
     {"symbol": "BTCUSDT", "side": "long", "qty": 0.02},
@@ -171,6 +191,14 @@ check("aggregate reconciliation accepts matching lots",
 agg_eng.state["positions"][1]["qty"] = 0.02
 check("aggregate reconciliation halts on quantity drift",
       not agg_eng.reconcile_positions(force=True, rows=agg_rows)
+      and agg_eng.state["halted"])
+agg_eng.state["halted"] = False
+agg_eng.state["halt_reason"] = ""
+liq_rows = [{"contracts": 0.02,
+             "info": {"symbol": "BTCUSDT", "positionSide": "LONG",
+                       "markPrice": "50000", "liquidationPrice": "48000"}}]
+check("liquidation buffer halts near liquidation",
+      not agg_eng.reconcile_positions(force=True, rows=liq_rows)
       and agg_eng.state["halted"])
 
 id_eng = object.__new__(live_binance.BinanceEngine)
@@ -303,7 +331,12 @@ finally:
 # --- 7. data-only mode and routed websocket endpoint ---
 data_engine = live_binance.DataOnlyEngine(log=lambda _: None)
 check("data_only has no exchange client", data_engine.ex is None)
+ws_mock = binance_ws.BinanceWS(["BTCUSDT"], lambda _: None)
+ws_mock.prices["BTCUSDT"] = 50000.0
+ws_mock.mark_prices["BTCUSDT"] = 49998.0
 check("WS uses routed market endpoint", "/market/stream?streams=" in binance_ws.URL)
+check("WS exposes mark price snapshot",
+      ws_mock.mark_snapshot().get("BTCUSDT") == 49998.0)
 check("user WS uses private endpoint", binance_user_ws.URL.endswith("/private/ws/"))
 
 # --- 8. no withdraw endpoints anywhere in this module (excl. this test) ---
@@ -334,7 +367,41 @@ check("detect_regime returns tuple",
       reg in ("trending", "ranging"), (reg, av))
 check("adx computes", adx(c15) is not None)
 
-# --- 8. kill switch + engine wiring ---
+# --- 8. signal/bar and kill-switch wiring ---
+class _SignalEngine:
+    def __init__(self):
+        self.calls = 0
+
+    def open(self, *args, **kwargs):
+        self.calls += 1
+        return ({"id": 1, "entry": 100.0, "sl": 99.0, "tp": 101.0}, "ok")
+
+old_signal = binance_bot.strategy.scalp_signal
+old_bot_log = binance_bot.log
+signal_engine = _SignalEngine()
+signal_st = {"positions": [], "cooldown_until": 0, "signal_bars": {}}
+binance_bot.strategy.scalp_signal = lambda *args: ("long", {"mock": True})
+binance_bot.log = lambda _: None
+try:
+    c5_mock = [{"o": 100.0, "h": 100.1, "l": 99.9, "c": 100.0,
+                "ts": i * 300000} for i in range(45)]
+    c5_mock.append({"o": 100.0, "h": 100.2, "l": 99.9, "c": 100.1,
+                    "ts": 45 * 300000})
+    c15_mock = [{"o": 100.0, "h": 101.0, "l": 99.0, "c": 100.0,
+                 "ts": i * 900000} for i in range(35)]
+    first_signal = binance_bot.manage_scalp(
+        signal_engine, signal_st, "BTCUSDT", 100.0, c5_mock, c15_mock
+    )
+    second_signal = binance_bot.manage_scalp(
+        signal_engine, signal_st, "BTCUSDT", 100.0, c5_mock, c15_mock
+    )
+    check("scalp signal is consumed once per closed bar",
+          first_signal is True and second_signal is False
+          and signal_engine.calls == 1)
+finally:
+    binance_bot.strategy.scalp_signal = old_signal
+    binance_bot.log = old_bot_log
+
 check("STOP kill switch defined",
       getattr(binance_bot, "STOP_P", "").endswith("STOP"))
 check("make_engine rejects bad mode", True)
