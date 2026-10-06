@@ -108,6 +108,8 @@ rec = eng.close(pos, 50500, "TP")  # +1% -> win
 check("dry_run close pnl positive", rec["pnl"] > 0, rec["pnl"])
 check("dry_run trade recorded", st["stats"]["trades"] == 1)
 check("dry_run no positions left", st["positions"] == [])
+check("hedge close omits reduceOnly", not any("reduceOnly" in m
+      for m in logs if 'DRY_RUN dat lenh' in m and 'LONG' in m))
 
 # Failed order actions cool both the action and the symbol.
 fail_st = fresh_state()

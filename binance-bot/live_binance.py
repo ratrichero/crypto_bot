@@ -104,7 +104,9 @@ class BinanceEngine:
         self.dry_run = dry_run
         self.log = log or (lambda m: print(m, flush=True))
         self._pid = state.get("_pid", 0)
-        self._filters = {}   # symbol -> (step_size, min_qty, min_notional)
+        self._filters = {}   # raw symbol -> (step_size, min_qty, min_notional)
+        self._markets = None
+        self._symbol_map = {}  # raw Binance symbol -> CCXT unified symbol
         self._lev_done = set()
         self._dry_n = 0
         # Failure state is keyed by symbol/order action.  A transient API or
@@ -201,6 +203,50 @@ class BinanceEngine:
         self._action_failures.pop(key, None)
         self._action_cooldowns.pop(key, None)
 
+    def _load_markets(self):
+        if self._markets is None:
+            self._markets = self._private_call(
+                "private:exchange_info",
+                self.ex.load_markets,
+            )
+        return self._markets
+
+    def _ccxt_symbol(self, symbol):
+        """Map raw Binance id (BTCUSDT) to CCXT id (BTC/USDT:USDT)."""
+        if self.dry_run:
+            return symbol
+        if symbol in self._symbol_map:
+            return self._symbol_map[symbol]
+        markets = self._load_markets()
+        for unified, market in markets.items():
+            info = market.get("info") or {}
+            market_id = market.get("id") or info.get("symbol")
+            if str(market_id).upper() != str(symbol).upper():
+                continue
+            if market.get("swap") is False:
+                continue
+            settle = market.get("settle")
+            if settle and str(settle).upper() != "USDT":
+                continue
+            self._symbol_map[symbol] = unified
+            return unified
+        self._symbol_map[symbol] = None
+        return None
+
+    def _raw_symbol(self, position):
+        info = position.get("info") or {}
+        raw = info.get("symbol") or position.get("symbol")
+        if raw in self._symbol_map.values():
+            for candidate, unified in self._symbol_map.items():
+                if unified == raw:
+                    return candidate
+        if raw and "/" in str(raw) and not self.dry_run:
+            markets = self._load_markets()
+            market = markets.get(raw) or {}
+            market_info = market.get("info") or {}
+            return market_info.get("symbol") or market.get("id") or raw
+        return raw
+
     def _ensure_hedge_mode(self):
         """Bat hedge (dual-side) mode cho tai khoan. Can cho grid 2 chieu."""
         try:
@@ -226,26 +272,31 @@ class BinanceEngine:
 
     def _filters_for(self, symbol):
         if symbol not in self._filters:
-            markets = self._private_call(
-                "private:exchange_info",
-                self.ex.load_markets,
-            )
-            if symbol not in markets:
+            markets = self._load_markets()
+            ccxt_symbol = self._ccxt_symbol(symbol)
+            if not ccxt_symbol or ccxt_symbol not in markets:
                 # Coin bi delist / khong co tren futures -> bo qua, khong crash
                 self._filters[symbol] = None
                 return None
-            m = markets[symbol]
-            step, minq, minn = 0.0, 0.0, 0.0
-            for f in m["info"].get("filters", []):
+            m = markets[ccxt_symbol]
+            lot = None
+            market_lot = None
+            minn = 0.0
+            for f in (m.get("info") or {}).get("filters", []):
                 ft = f.get("filterType")
                 if ft == "LOT_SIZE":
-                    step = float(f["stepSize"])
-                    minq = float(f["minQty"])
+                    lot = (float(f["stepSize"]), float(f["minQty"]))
+                elif ft == "MARKET_LOT_SIZE":
+                    market_lot = (float(f["stepSize"]), float(f["minQty"]))
                 elif ft in ("MIN_NOTIONAL", "NOTIONAL"):
                     minn = float(f.get("notional", f.get("minNotional", 0)))
-            if not step:
+            # All current bot orders are MARKET. Binance exposes a separate
+            # MARKET_LOT_SIZE filter; fall back to LOT_SIZE for symbols that
+            # do not publish the market-specific filter.
+            selected = market_lot or lot
+            if not selected:
                 raise RuntimeError("khong doc duoc LOT_SIZE cho %s" % symbol)
-            self._filters[symbol] = (step, minq, minn)
+            self._filters[symbol] = (selected[0], selected[1], minn)
         return self._filters[symbol]
 
     def _set_leverage(self, symbol):
@@ -255,12 +306,15 @@ class BinanceEngine:
             self.log("DRY_RUN set-leverage %s lev=%s cross" %
                      (symbol, self.cfg["leverage"]))
         else:
+            ccxt_symbol = self._ccxt_symbol(symbol)
+            if not ccxt_symbol:
+                raise RuntimeError("unknown_symbol: %s" % symbol)
             try:
                 self._private_call(
                     "private:trade",
                     self.ex.set_margin_mode,
                     "cross",
-                    symbol,
+                    ccxt_symbol,
                 )
             except binance_safety.BinanceSafetyStop:
                 raise
@@ -273,7 +327,7 @@ class BinanceEngine:
                 "private:trade",
                 self.ex.set_leverage,
                 self.cfg["leverage"],
-                symbol,
+                ccxt_symbol,
             )
         self._lev_done.add(symbol)
 
@@ -317,7 +371,11 @@ class BinanceEngine:
                 amt = float(p.get("contracts", 0) or 0)
                 if amt == 0:
                     continue
-                ex.add((p.get("symbol"), p.get("side")))
+                info = p.get("info") or {}
+                position_side = info.get("positionSide") or p.get("side")
+                if str(position_side).upper() in ("LONG", "SHORT"):
+                    position_side = str(position_side).lower()
+                ex.add((self._raw_symbol(p), position_side))
         except binance_safety.BinanceSafetyStop:
             raise
         except Exception as e:
@@ -343,7 +401,10 @@ class BinanceEngine:
                       reduce_only=False, ref_price=None):
         """side: 'buy'/'sell'. Returns (order_id, fill_price_or_None)."""
         params = {"positionSide": position_side}
-        if reduce_only:
+        # Binance rejects reduceOnly together with positionSide LONG/SHORT
+        # in Hedge Mode. Closing is expressed by the opposite side plus the
+        # correct positionSide; reduceOnly is only valid for BOTH/one-way.
+        if reduce_only and position_side == "BOTH":
             params["reduceOnly"] = True
         if self.dry_run:
             self._dry_n += 1
@@ -351,13 +412,16 @@ class BinanceEngine:
             self.log("DRY_RUN dat lenh: %s %s qty=%s %s" %
                      (symbol, side, qty, json.dumps(params)))
             return oid, ref_price
+        ccxt_symbol = self._ccxt_symbol(symbol)
+        if not ccxt_symbol:
+            raise RuntimeError("unknown_symbol: %s" % symbol)
         fn = (self.ex.create_market_buy_order if side == "buy"
               else self.ex.create_market_sell_order)
         try:
             od = self._private_call(
                 "private:trade",
                 fn,
-                symbol,
+                ccxt_symbol,
                 qty,
                 params,
             )
@@ -371,6 +435,9 @@ class BinanceEngine:
     def _fill_price(self, symbol, order_id, ref_price):
         if self.dry_run:
             return ref_price
+        ccxt_symbol = self._ccxt_symbol(symbol)
+        if not ccxt_symbol:
+            raise RuntimeError("unknown_symbol: %s" % symbol)
         px = None
         for _ in range(6):
             try:
@@ -378,7 +445,7 @@ class BinanceEngine:
                     "private:order_status",
                     self.ex.fetch_order,
                     order_id,
-                    symbol,
+                    ccxt_symbol,
                 )
                 if od.get("average"):
                     px = float(od["average"])

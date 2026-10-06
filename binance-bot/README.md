@@ -95,6 +95,12 @@ Nếu sửa logic chiến thuật, sửa cả hai nơi.
   restart bot liên tục; kiểm tra mọi process dùng chung public IP trước.
 - Lỗi order/private theo từng symbol/action có exponential cooldown
   (mặc định 30 giây → tối đa 15 phút), nên không lặp lại mỗi 0,5 giây.
+- Khi chạy Hedge Mode, lệnh close dùng `positionSide` + chiều ngược lại và
+  **không gửi `reduceOnly`**; Binance từ chối `reduceOnly` khi đã gửi
+  `positionSide=LONG/SHORT`.
+- Universe dùng raw id như `BTCUSDT`, còn CCXT được map sang unified id như
+  `BTC/USDT:USDT`; quantity market lấy theo `MARKET_LOT_SIZE`, không lấy mù
+  theo `quantityPrecision`.
 - Nếu `bot.log` có `SAFETY STOP`, hãy lấy dòng `BINANCE HTTP/CCXT` ngay trước
   đó để biết status/code thực tế; không xoá circuit state để ép chạy lại.
   Lệnh xem nhanh: `grep -E 'BINANCE (HTTP|CCXT)|SAFETY STOP|CIRCUIT' bot.log`.
