@@ -38,9 +38,11 @@ TZINFO = timezone(timedelta(hours=7))
 try:
     frag = st.fragment(run_every=60)
     frag15 = st.fragment(run_every=15)
+    frag5 = st.fragment(run_every=5)
 except Exception:
     frag = lambda f: f  # noqa: E731
     frag15 = lambda f: f  # noqa: E731
+    frag5 = lambda f: f  # noqa: E731
 
 # ---------------- CSS (an toan cho ca light & dark theme) ----------------
 st.markdown("""
@@ -238,6 +240,67 @@ def last_updates_line():
 
 
 # ---------------- tab LIVE ----------------
+@st.cache_data(ttl=5)
+def binance_all_prices():
+    """Gia live tat ca symbols Binance Futures: 1 request duy nhat."""
+    try:
+        r = requests.get("https://fapi.binance.com/fapi/v1/ticker/price",
+                         timeout=8)
+        data = r.json()
+        return {x["symbol"]: float(x["price"]) for x in data
+                if isinstance(x, dict) and x.get("symbol")}
+    except Exception:
+        return {}
+
+
+@frag5
+def binance_live_positions_block():
+    """Bang vi the Binance mo — cot Lãi/lỗ live theo gia thuc, refresh 5s."""
+    st.markdown('<div class="sub2">Vi the dang mo (live 5s)</div>',
+                unsafe_allow_html=True)
+    b_st = load_state(BINANCE_STATE)
+    if not b_st:
+        st.warning("Khong doc duoc file trang thai bot Binance.")
+        return
+    bpos = b_st.get("positions", [])
+    if not bpos:
+        st.caption("0 vi the dang mo.")
+        return
+    marks = binance_all_prices()
+    rows, tot = [], 0.0
+    for p in bpos:
+        try:
+            e = float(p.get("entry", 0) or 0)
+            n = float(p.get("notional", 0) or 0)
+            mk = marks.get((p.get("symbol") or "").upper(), 0) or 0
+            sgn = 1 if (p.get("side") or "").lower() == "long" else -1
+            upnl = (mk - e) / e * n * sgn if e > 0 and n > 0 and mk > 0 else 0.0
+        except Exception:
+            upnl, mk = 0.0, 0.0
+        tot += upnl
+        rows.append({
+            "ID": p.get("id"), "Symbol": p.get("symbol"),
+            "Chieu": p.get("side"), "Loai": p.get("tag"),
+            "Entry": p.get("entry"),
+            "Gia live": round(mk, 4) if mk else None,
+            "Lãi/lỗ live (U)": round(upnl, 2),
+            "SL": p.get("sl"), "TP": p.get("tp"),
+            "Notional": p.get("notional"),
+        })
+    df = pd.DataFrame(rows)
+
+    def _color(v):
+        try:
+            return "color:#16a34a" if float(v) >= 0 else "color:#dc2626"
+        except Exception:
+            return ""
+    st.dataframe(df.style.map(_color, subset=["Lãi/lỗ live (U)"]),
+                 width="stretch")
+    cls = "pos" if tot >= 0 else "neg"
+    st.markdown(f'Tong unrealized: <span class="{cls}"><b>{tot:+.2f} U</b>'
+                f'</span> · gia cap nhat 5s/lan', unsafe_allow_html=True)
+
+
 def tab_live(where, params):
     d = day_filter()
     bn = q(f"SELECT {d} AS day, pnl AS net, tag, reason, live, dry "
@@ -252,20 +315,7 @@ def tab_live(where, params):
         st.caption(f"Trong do: {n_live} lenh LIVE tien that, {n_dry} lenh dry-run.")
     pnl_charts(daily_df(bn), "Binance LIVE")
 
-    st.markdown('<div class="sub2">Vi the dang mo</div>', unsafe_allow_html=True)
-    b_st = load_state(BINANCE_STATE)
-    if not b_st:
-        st.warning("Khong doc duoc file trang thai bot Binance.")
-    else:
-        bpos = b_st.get("positions", [])
-        st.caption(f"{len(bpos)} vi the — equity {b_st.get('equity', '?')}")
-        if bpos:
-            st.dataframe(pd.DataFrame([{
-                "ID": p.get("id"), "Symbol": p.get("symbol"),
-                "Chieu": p.get("side"), "Loai": p.get("tag"),
-                "Entry": p.get("entry"), "SL": p.get("sl"), "TP": p.get("tp"),
-                "Notional": p.get("notional"),
-            } for p in bpos]), width="stretch")
+    binance_live_positions_block()
 
     rbn = q("""SELECT closed_at, symbol, side, tag, pnl AS net, reason,
                       live, dry
@@ -321,22 +371,70 @@ def okx_positions_block():
         } for p in pos]), width="stretch")
 
 
+@st.cache_data(ttl=15)
+def jupiter_marks(mints_key):
+    """Gia batch Jupiter cho list mint (key = chuoi phan cach boi dau phay)."""
+    mints = [m for m in (mints_key or "").split(",") if m]
+    if not mints:
+        return {}
+    try:
+        r = requests.get("https://lite-api.jup.ag/price/v3",
+                         params={"ids": ",".join(mints)}, timeout=10)
+        d = r.json()
+        out = {}
+        for m in mints:
+            px = (d.get(m) or {}).get("usdPrice")
+            if px:
+                out[m] = float(px)
+        return out
+    except Exception:
+        return {}
+
+
+@frag15
 def radar_positions_block():
-    st.markdown('<div class="sub2">Vi the dang mo — Radar</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sub2">Vi the dang mo — Radar (live 15s)</div>',
+                unsafe_allow_html=True)
     r_st = load_state(RADAR_STATE)
     if not r_st:
         st.warning("Khong doc duoc file trang thai radar.")
         return
+    allp = r_st.get("paper", []) + r_st.get("paper_holder", [])
+    mints = ",".join(dict.fromkeys(
+        [p.get("token") for p in allp if p.get("token")]))
+    marks = jupiter_marks(mints)
     for key, name in (("paper", "Scalp"), ("paper_holder", "Holder")):
         pp = r_st.get(key, [])
         st.caption(f"{name}: {len(pp)} vi the")
         if pp:
-            st.dataframe(pd.DataFrame([{
-                "Symbol": p.get("symbol"),
-                "Vi": (p.get("wallet") or "")[:10],
-                "Entry": p.get("entry"), "Size $": p.get("size_usd"),
-                "Con lai": f"{(p.get('remaining', 1) or 0):.0%}",
-            } for p in pp]), width="stretch")
+            rows = []
+            for p in pp:
+                try:
+                    e = float(p.get("entry", 0) or 0)
+                    s = float(p.get("size_usd", 0) or 0)
+                    rem = float(p.get("remaining", 1) or 0)
+                    mk = marks.get(p.get("token", ""), 0) or 0
+                    upnl = (mk - e) / e * s * rem if e > 0 and mk > 0 else 0.0
+                except Exception:
+                    upnl, mk = 0.0, 0.0
+                rows.append({
+                    "Symbol": p.get("symbol"),
+                    "Vi": (p.get("wallet") or "")[:10],
+                    "Entry": p.get("entry"),
+                    "Gia live": round(mk, 6) if mk else None,
+                    "Lãi/lỗ live (U)": round(upnl, 2),
+                    "Size $": p.get("size_usd"),
+                    "Con lai": f"{(p.get('remaining', 1) or 0):.0%}",
+                })
+            df = pd.DataFrame(rows)
+
+            def _c(v):
+                try:
+                    return "color:#16a34a" if float(v) >= 0 else "color:#dc2626"
+                except Exception:
+                    return ""
+            st.dataframe(df.style.map(_c, subset=["Lãi/lỗ live (U)"]),
+                         width="stretch")
 
 
 def radar_live_equity():
@@ -543,9 +641,10 @@ def main():
         tab_paper(where, params)
 
     st.divider()
-    st.markdown('<div class="small-note">Tu refresh 60s · So lieu paper chi de '
-                'doi chung, khong phai ket qua tien that.</div>',
-                unsafe_allow_html=True)
+    st.markdown('<div class="small-note">Vi the & equity live tu refresh '
+                'rieng (5s/15s) · Cac chi so khac refresh khi tai trang · '
+                'So lieu paper chi de doi chung, khong phai ket qua tien that.'
+                '</div>', unsafe_allow_html=True)
 
 
-frag(main)()
+main()
