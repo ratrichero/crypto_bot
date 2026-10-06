@@ -30,7 +30,7 @@ if not _HK:
            if os.path.exists("/home/ubuntu/muse_bot/.helius_key")
            else os.path.expanduser("~/workspace/meme-radar/.helius_key"))
 HELIUS_KEY_FILE = _HK
-SOL_WALLET = "DxYkrsJA6YdS1cqJ9ocPCYRBacd7Xan3DeYWZva89dLd"
+SOL_WALLET = "7jUg6PKSj5xgsTM7dLMGnFFS45yohVfgvhbXPTUKfC8q"
 
 TZ = "Asia/Ho_Chi_Minh"
 TZINFO = timezone(timedelta(hours=7))
