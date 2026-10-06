@@ -3,8 +3,11 @@ from indicators import ema, rsi, adx
 
 
 def detect_regime(candles15, threshold):
-    """Returns ('trending'|'ranging', adx_value)."""
-    v = adx(candles15)
+    """Returns ('trending'|'ranging', adx_value) from closed 15m bars."""
+    # REST/WS kline payloads include the currently forming candle as the last
+    # row. Regime must not flip intra-candle.
+    closed15 = candles15[:-1] if len(candles15) > 1 else candles15
+    v = adx(closed15)
     if v is None:
         return "ranging", None
     return ("trending" if v >= threshold else "ranging"), round(v, 1)
@@ -22,7 +25,8 @@ def scalp_signal(candles5, candles15, cfg):
     if len(candles5) < 40 or len(candles15) < 30:
         return None, {"reason": "warmup"}
     closed5 = candles5[:-1]
-    closes15 = [c["c"] for c in candles15]
+    closed15 = candles15[:-1]
+    closes15 = [c["c"] for c in closed15]
     e20 = ema(closes15, s["ema_trend"])
     if e20 is None:
         return None, {"reason": "warmup"}
