@@ -408,6 +408,43 @@ def tab_live_binance(where, params):
 def tab_live_radar():
     solana_kpi_frag()
 
+    # Vi the live dang mo
+    st.markdown("### 📊 Vị thế LIVE đang mở")
+    try:
+        lp = "/home/ubuntu/muse_bot/meme-radar/live_positions.json"
+        with open(lp) as f:
+            spos = json.load(f)
+        if spos:
+            # Lay gia live cho tung token de tinh P&L
+            rows = []
+            for p in spos:
+                sym = p.get("symbol", "?")
+                entry = p.get("entry", 0)
+                size = p.get("size_usd", 0)
+                remaining = p.get("remaining", 1.0)
+                # Tinh P&L don gian tu peak hien tai (chua co gia live realtime)
+                peak = p.get("peak", entry)
+                pnl_pct = (peak - entry) / entry * 100 if entry else 0
+                rows.append({
+                    "Token": sym,
+                    "Vào": f"${entry:.2e}",
+                    "Size": f"${size:.0f}",
+                    "Còn": f"{remaining*100:.0f}%",
+                    "Lãi/lỗ": f"{pnl_pct:+.1f}%",
+                    "TP1": "✓" if p.get("tp1") else "",
+                    "TP2": "✓" if p.get("tp2") else "",
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True,
+                         hide_index=True)
+        else:
+            st.info("Không có vị thế live nào đang mở.")
+    except Exception as e:
+        st.error(f"Không đọc được vị thế: {e}")
+
+    # Lich su giao dich live gan nhat (tu log)
+    st.markdown("### 📝 Giao dịch LIVE gần nhất")
+    st.info("Xem tab 🖥️ Monitor để theo dõi log realtime của live trader.")
+
 
 def tab_monitor():
     """Tab giam sat he thong real: status service + log realtime."""
