@@ -101,6 +101,11 @@ Nếu sửa logic chiến thuật, sửa cả hai nơi.
   Algo Order `STOP_MARKET`/`TAKE_PROFIT_MARKET` theo từng position; bot hủy
   algo còn lại trước khi market-close và halt entry nếu tạo protection thất
   bại. Không bật flag này trên mainnet khi chưa kiểm tra payload Hedge Mode.
+- Startup luôn đối chiếu open normal orders và open Algo Orders theo các
+  symbol bot quản lý; nếu protection bật còn kiểm tra
+  symbol/positionSide/side/type/quantity của từng guard. Mismatch hoặc không
+  đọc được đều halt để xử lý thủ công. Nếu lệnh MARKET timeout/partial hoặc không lấy
+  được fill price, bot không dùng giá tham chiếu và không ghi position giả.
 - Reconciliation nhóm quantity local theo `(symbol, LONG)` và
   `(symbol, SHORT)` để đối chiếu với aggregate Binance. Nếu drift hoặc có
   position không quản lý, bot fail-closed cả entry/auto-close để tránh gửi

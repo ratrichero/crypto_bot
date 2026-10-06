@@ -54,7 +54,8 @@ def make_engine(st):
         return DataOnlyEngine(log=log)
     if MODE in ("dry_run", "live"):
         from live_binance import BinanceEngine
-        return BinanceEngine(CFG, st, dry_run=(MODE == "dry_run"), log=log)
+        return BinanceEngine(CFG, st, dry_run=(MODE == "dry_run"),
+                             log=log, symbols=SYMBOLS)
     raise SystemExit(
         "config 'mode' khong hop le: %r (chon data_only|dry_run|live)" %
         (MODE,))
@@ -125,10 +126,23 @@ def load_state():
 
 
 def save_state(st):
+    """Atomically persist state; stop opening risk if persistence fails."""
     tmp = STATE_P + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(st, f)
-    os.replace(tmp, STATE_P)
+    try:
+        with open(tmp, "w") as f:
+            json.dump(st, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, STATE_P)
+    except Exception:
+        st["halted"] = True
+        st["halt_reason"] = "state persistence failure"
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def record_trade(rec):
@@ -156,7 +170,12 @@ def is_disabled(symbol):
 
 def _record_close(st, rec):
     """Persist a close and update grid/scalp bookkeeping."""
-    record_trade(rec)
+    try:
+        record_trade(rec)
+    except Exception:
+        st["halted"] = True
+        st["halt_reason"] = "state persistence failure"
+        raise
     symbol = rec["symbol"]
     g = st["grids"].get(symbol)
     if g:
@@ -532,7 +551,9 @@ def main():
             if risk_equity_ready and (
                     st.get("day") != today or not st.get("_risk_initialized")):
                 persistent_halt = str(st.get("halt_reason", "")).startswith(
-                    ("exchange ", "unmanaged ", "position ")
+                    ("exchange ", "unmanaged ", "position ", "open order ",
+                     "ambiguous ", "order fill ", "partial ", "close ",
+                     "state persistence ")
                 )
                 st["day"] = today
                 st["day_start_equity"] = st["mark_equity"]
@@ -564,9 +585,38 @@ def main():
                     st["halt_reason"] = "position reconciliation unavailable"
                 dirty = True
 
+            # ---- daily stop before every entry path
+            # The mark-to-market loss guard must run before FAST and SLOW
+            # strategy evaluation. Otherwise an iteration can open a new
+            # position and only then discover that the account crossed the
+            # daily loss limit.
+            if (not DATA_ONLY and st.get("_risk_initialized")
+                    and st["day_start_equity"] > 0):
+                dp = st.get("daily_drawdown_pct", 0.0)
+                if (not st["halted"]
+                        and dp <= -float(CFG["risk"]["daily_max_loss_pct"])):
+                    st["halted"] = True
+                    st["halt_reason"] = f"daily stop {dp*100:.2f}%"
+                    for pos in list(st["positions"]):
+                        rec = engine.close(
+                            pos,
+                            mark_prices.get(pos["symbol"], pos["entry"]),
+                            "DAILY_STOP",
+                        )
+                        if rec:
+                            _record_close(st, rec)
+                    for grid in st.get("grids", {}).values():
+                        grid["risk_halted"] = True
+                        grid["rebuild_pending"] = True
+                    dirty = True
+                    log("HALTED %s mark_equity=%.2f day_start=%.2f" %
+                        (st["halt_reason"], st["mark_equity"],
+                         st["day_start_equity"]))
+
             # ---- FAST PATH: only trading modes may mutate positions/orders
             reconcile_hold = str(st.get("halt_reason", "")).startswith(
-                ("exchange position", "unmanaged ", "position ")
+                ("exchange position", "exchange protection reconciliation",
+                 "unmanaged ", "position ")
             )
             if not DATA_ONLY:
                 if not reconcile_hold:
@@ -674,30 +724,6 @@ def main():
                             if manage_scalp(engine, st, symbol,
                                             px, cc["5m"], cc["15m"]):
                                 dirty = True
-
-            # ---- daily stop on mark-to-market equity ----
-            if (not DATA_ONLY and st.get("_risk_initialized")
-                    and st["day_start_equity"] > 0):
-                dp = st.get("daily_drawdown_pct", 0.0)
-                if (not st["halted"]
-                        and dp <= -float(CFG["risk"]["daily_max_loss_pct"])):
-                    st["halted"] = True
-                    st["halt_reason"] = f"daily stop {dp*100:.2f}%"
-                    for pos in list(st["positions"]):
-                        rec = engine.close(
-                            pos,
-                            mark_prices.get(pos["symbol"], pos["entry"]),
-                            "DAILY_STOP",
-                        )
-                        if rec:
-                            _record_close(st, rec)
-                    for grid in st.get("grids", {}).values():
-                        grid["risk_halted"] = True
-                        grid["rebuild_pending"] = True
-                    dirty = True
-                    log("HALTED %s mark_equity=%.2f day_start=%.2f" %
-                        (st["halt_reason"], st["mark_equity"],
-                         st["day_start_equity"]))
 
             if dirty or loop % 20 == 0:
                 save_state(st)

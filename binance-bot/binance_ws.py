@@ -94,6 +94,12 @@ class BinanceWS:
                 )
                 connected_at = time.monotonic()
                 while not self._stop:
+                    # Binance market-stream connections have a hard 24-hour
+                    # lifetime. Reconnect proactively so the bot does not
+                    # lose prices at the server-forced disconnect boundary.
+                    if time.monotonic() - connected_at >= 23 * 60 * 60:
+                        self.log("WS reconnecting before 24h lifetime")
+                        break
                     try:
                         msg = ws.recv()
                         if not msg:
