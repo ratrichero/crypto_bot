@@ -11,6 +11,8 @@ import os
 import re
 import sys
 import tempfile
+import threading
+import time
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE)
@@ -36,6 +38,7 @@ import live_binance
 import binance_client
 import binance_safety
 import binance_ws
+import binance_user_ws
 import strategy
 from indicators import adx
 import binance_bot
@@ -64,8 +67,12 @@ check("config adx_threshold == 24 (optimizer-tuned)",
 check("config grid.step_mult == 0.8 (optimizer-tuned)",
       CFG.get("grid", {}).get("step_mult") == 0.8)
 for k in ("scalp", "grid", "risk", "leverage", "order_margin_usdt",
-          "max_total_positions", "hedge_mode", "fee_rate"):
+          "max_total_positions", "hedge_mode", "fee_rate", "recv_window_ms",
+          "order_event_timeout_seconds", "reconcile_interval_seconds",
+          "exchange_protection"):
     check("config has " + k, k in CFG)
+check("exchange protection disabled by default",
+      CFG.get("exchange_protection") is False)
 
 # --- 2. qty_for pure function ---
 check("qty basic", live_binance.qty_for(1000, 50000, 0.001) == 0.02)
@@ -110,6 +117,118 @@ check("dry_run trade recorded", st["stats"]["trades"] == 1)
 check("dry_run no positions left", st["positions"] == [])
 check("hedge close omits reduceOnly", not any("reduceOnly" in m
       for m in logs if 'DRY_RUN dat lenh' in m and 'LONG' in m))
+
+# --- 4b. private-event and idempotent-order unit wiring (no network) ---
+user_eng = object.__new__(live_binance.BinanceEngine)
+user_eng._order_events = {}
+user_eng._order_condition = threading.Condition()
+user_eng._last_reconcile = time.time()
+user_eng._last_account_event = 0.0
+user_eng._account_position_snapshot = {}
+user_logs = []
+user_eng.log = user_logs.append
+user_eng.on_user_event({
+    "e": "ORDER_TRADE_UPDATE",
+    "o": {"i": "123", "s": "BTCUSDT", "X": "FILLED",
+          "x": "TRADE", "ps": "LONG", "ap": "50001"},
+})
+order_event = user_eng._wait_order_event("123", 0.01)
+check("ORDER_TRADE_UPDATE wakes waiter",
+      order_event and order_event.get("X") == "FILLED")
+check("ORDER_TRADE_UPDATE logs positionSide",
+      any("positionSide=LONG" in m for m in user_logs))
+user_eng.on_user_event({"e": "ACCOUNT_UPDATE", "a": {
+    "P": [{"s": "BTCUSDT", "ps": "LONG", "pa": "0.02"}],
+}})
+check("ACCOUNT_UPDATE stores aggregate position",
+      user_eng._account_position_snapshot[("BTCUSDT", "long")] == 0.02)
+check("ACCOUNT_UPDATE requests reconciliation", user_eng._last_reconcile == 0.0)
+
+agg_eng = object.__new__(live_binance.BinanceEngine)
+agg_eng.dry_run = False
+agg_eng._symbol_map = {}
+agg_eng._markets = {}
+agg_eng._raw_symbol = lambda p: p.get("info", {}).get("symbol")
+agg_rows = [
+    {"contracts": 0.02, "info": {"symbol": "BTCUSDT", "positionSide": "LONG"}},
+    {"contracts": 0.03, "info": {"symbol": "BTCUSDT", "positionSide": "LONG"}},
+    {"contracts": 0.01, "info": {"symbol": "BTCUSDT", "positionSide": "SHORT"}},
+]
+agg = agg_eng._aggregate_positions(agg_rows)
+check("aggregate reconciliation groups grid lots", agg[("BTCUSDT", "long")] == 0.05)
+check("aggregate reconciliation keeps Hedge sides", agg[("BTCUSDT", "short")] == 0.01)
+agg_eng.cfg = {"reconcile_interval_seconds": 0}
+agg_eng._last_reconcile = 0.0
+agg_eng.state = {"positions": [
+    {"symbol": "BTCUSDT", "side": "long", "qty": 0.02},
+    {"symbol": "BTCUSDT", "side": "long", "qty": 0.03},
+    {"symbol": "BTCUSDT", "side": "short", "qty": 0.01},
+], "halted": False, "halt_reason": ""}
+agg_eng._filters_for = lambda _: (0.001, 0.001, 5.0)
+agg_eng.log = lambda _: None
+check("aggregate reconciliation accepts matching lots",
+      agg_eng.reconcile_positions(force=True, rows=agg_rows))
+agg_eng.state["positions"][1]["qty"] = 0.02
+check("aggregate reconciliation halts on quantity drift",
+      not agg_eng.reconcile_positions(force=True, rows=agg_rows)
+      and agg_eng.state["halted"])
+
+id_eng = object.__new__(live_binance.BinanceEngine)
+id_eng.dry_run = False
+id_eng.cfg = {"new_order_resp_type": "RESULT"}
+id_eng.state = {"_client_nonce": 0}
+id_eng._client_nonce = 0
+id_eng._last_order_response = None
+id_eng.log = lambda _: None
+id_eng._ccxt_symbol = lambda _: "BTC/USDT:USDT"
+id_eng.ex = type("FakeExchange", (), {
+    "create_market_buy_order": lambda *args: None,
+    "create_market_sell_order": lambda *args: None,
+    "fapiPrivateGetOrder": lambda *args: None,
+})()
+order_calls = []
+def fake_private(endpoint, fn, *args):
+    if endpoint == "private:trade":
+        order_calls.append((endpoint, args))
+        raise TimeoutError("simulated transport timeout")
+    return {"orderId": "9001", "clientOrderId": args[0].get("origClientOrderId")}
+id_eng._private_call = fake_private
+reconciled_id, reconciled_client_id = id_eng._place_market(
+    "BTCUSDT", "buy", 0.02, "LONG", ref_price=50000
+)
+params_sent = order_calls[0][1][2]
+check("timeout recovery returns existing order", reconciled_id == "9001")
+check("timeout recovery keeps client id", reconciled_client_id == params_sent["newClientOrderId"])
+check("timeout recovery makes one create call", len(order_calls) == 1)
+check("order payload has RESULT response", params_sent["newOrderRespType"] == "RESULT")
+
+prot = object.__new__(live_binance.BinanceEngine)
+prot.dry_run = False
+prot.cfg = {"exchange_protection": True, "protection_working_type": "MARK_PRICE",
+            "protection_price_protect": False}
+prot._price_ticks = {"BTCUSDT": 0.1}
+prot._filters_for = lambda _: (0.001, 0.001, 5.0)
+prot._new_client_order_id = lambda symbol, side: "algo-test-" + side
+prot.ex = type("FakeExchange", (), {
+    "fapiPrivatePostAlgoOrder": lambda *args: None,
+    "fapiPrivateDeleteAlgoOrder": lambda *args: None,
+})()
+algo_calls = []
+def fake_algo(endpoint, fn, params):
+    algo_calls.append(params)
+    return {"algoId": str(7000 + len(algo_calls))}
+prot._private_call = fake_algo
+protection_ids = prot._create_exchange_protection({
+    "symbol": "BTCUSDT", "side": "long", "qty": 0.02,
+    "sl": 49000.03, "tp": 51000.07,
+})
+check("algo protection creates SL and TP", set(protection_ids) == {"sl", "tp"})
+check("algo protection sends Hedge positionSide",
+      all(p.get("positionSide") == "LONG" for p in algo_calls))
+check("algo protection has no reduceOnly",
+      all("reduceOnly" not in p for p in algo_calls))
+check("algo protection rounds trigger to tick",
+      algo_calls[0]["triggerPrice"] == "49000.0")
 
 # Failed order actions cool both the action and the symbol.
 fail_st = fresh_state()
@@ -185,6 +304,7 @@ finally:
 data_engine = live_binance.DataOnlyEngine(log=lambda _: None)
 check("data_only has no exchange client", data_engine.ex is None)
 check("WS uses routed market endpoint", "/market/stream?streams=" in binance_ws.URL)
+check("user WS uses private endpoint", binance_user_ws.URL.endswith("/private/ws/"))
 
 # --- 8. no withdraw endpoints anywhere in this module (excl. this test) ---
 src = ""

@@ -11,9 +11,12 @@ binance_bot.py      Vong lap chinh: routed WS gia real-time -> SL/TP + grid
                     switch: file STOP; single-instance lock theo IP.
 live_binance.py     Engine dat lenh that qua ccxt (binanceusdm), che do
                     data_only | dry_run | live. Private calls co governor,
-                    circuit breaker va cooldown theo symbol/action.
+                    circuit breaker va cooldown theo symbol/action; client id,
+                    private event fill, aggregate LONG/SHORT reconciliation.
 binance_ws.py       WS public routed /market/stream, 1 connection, reconnect
                     exponential backoff, khong reconnect storm.
+binance_user_ws.py  WS private routed /private/ws/<listenKey>, keepalive 30m,
+                    reconnect 24h/event; nhan ORDER_TRADE_UPDATE/ACCOUNT_UPDATE.
 binance_client.py   REST public shared requests.Session + request metrics,
                     rate limiter, status/API-code logging; fallback dung
                     ticker price weight thap.
@@ -57,7 +60,10 @@ Nếu sửa logic chiến thuật, sửa cả hai nơi.
 2. **Đơn vị khối lượng.** Binance đặt lệnh theo số lượng base asset
    (ví dụ BTC), làm tròn XUỐNG theo `stepSize`, kiểm tra `minQty` và
    `minNotional` từ exchangeInfo trước khi gửi.
-3. **Đóng lệnh** dùng market + `reduceOnly=true`.
+3. **Đóng lệnh Hedge Mode** dùng market chiều ngược lại + `positionSide`
+   tương ứng; không gửi `reduceOnly` (Binance từ chối cặp tham số này trong
+   Hedge Mode). Mỗi lệnh có `newClientOrderId`; nếu request timeout bot query
+   lại theo client id một lần thay vì blind retry.
 4. **Phí**: taker Binance USDT-M 0.05% (`fee_rate = 0.0005`), giống OKX.
    Funding 8h chưa mô hình hóa (giống bot OKX) — cần cộng vào khi đánh giá
    P&L dài hạn.
@@ -79,9 +85,19 @@ Nếu sửa logic chiến thuật, sửa cả hai nơi.
 - Code **không chứa bất kỳ endpoint rút tiền nào** (test tự quét).
 - Key trên Binance phải: **chỉ quyền Trade Futures, TẮT quyền Withdraw,
   whitelist IP của VPS**. Kiểm tra lại trên trang API Management trước khi live.
-- SL/TP do process canh (không đặt stop sẵn trên sàn): nếu process chết,
-  vị thế không có stop cho tới khi watchdog/systemd dựng lại. Chưa nên
-  scale size lớn khi chưa có stop dự phòng trên sàn.
+- Private user-data WS được mở trong `live`: listenKey keepalive định kỳ,
+  reconnect chủ động trước lifetime 24 giờ, nhận `ORDER_TRADE_UPDATE` để lấy
+  fill trước khi fallback REST và nhận `ACCOUNT_UPDATE` để đánh dấu thay đổi
+  account. Nếu private WS gặp lỗi safety circuit, bot dừng fail-closed.
+- Mặc định `exchange_protection=false`: SL/TP do process canh. Sau khi
+  testnet/mock validation đạt, có thể bật `exchange_protection=true` để tạo
+  Algo Order `STOP_MARKET`/`TAKE_PROFIT_MARKET` theo từng position; bot hủy
+  algo còn lại trước khi market-close và halt entry nếu tạo protection thất
+  bại. Không bật flag này trên mainnet khi chưa kiểm tra payload Hedge Mode.
+- Reconciliation nhóm quantity local theo `(symbol, LONG)` và
+  `(symbol, SHORT)` để đối chiếu với aggregate Binance. Nếu drift hoặc có
+  position không quản lý, bot fail-closed cả entry/auto-close để tránh gửi
+  lệnh ngược chiều tạo position mới; cần đối chiếu thủ công trước khi resume.
 
 ## Rate-limit / IP-ban guard
 
@@ -89,7 +105,9 @@ Nếu sửa logic chiến thuật, sửa cả hai nơi.
   `BINANCE_IP_SCOPE` + endpoint. Bot giữ một `bot.lock` để không có hai bản
   cùng host cùng đốt request budget.
 - Log mỗi request có `request_id`, endpoint, HTTP status, Binance API code,
-  latency, `X-MBX-USED-WEIGHT-*` và `Retry-After` (body được redact).
+  latency, `X-MBX-USED-WEIGHT-*`, order-count headers và `Retry-After` (body
+  được redact). Signed CCXT requests dùng `adjustForTimeDifference` và
+  `recv_window_ms` (mặc định 5000 ms).
 - HTTP **429**, **418**, hoặc API code **-1003** mở circuit persistent trong
   `binance_circuit.json`, dừng mọi request/trading và **không retry**. Không
   restart bot liên tục; kiểm tra mọi process dùng chung public IP trước.
@@ -122,17 +140,24 @@ python3 binance_bot.py           # mo phong/log lenh, van khong dat lenh that
 
 Chỉ chuyển sang `live` sau khi `data_only` và `dry_run` đã chạy ổn định,
 không có `429`, `418`, `-1003`, WS reconnect storm hoặc lỗi payload. Tham
-chiếu tài liệu chính thức Binance về [USDⓈ-M REST](https://developers.binance.com/docs/derivatives/usds-margined-futures/general-info)
-và [market WebSocket](https://developers.binance.com/docs/derivatives/usds-margined-futures/websocket-market-streams).
+chiếu tài liệu chính thức Binance về [USDⓈ-M REST](https://developers.binance.com/docs/derivatives/usds-margined-futures/general-info),
+[user-data stream](https://developers.binance.com/docs/derivatives/usds-margined-futures/user-data-streams),
+[ORDER_TRADE_UPDATE](https://developers.binance.com/docs/derivatives/usds-margined-futures/user-data-streams/Event-Order-Update)
+và [New Algo Order](https://developers.binance.com/docs/derivatives/usds-margined-futures/trade/rest-api/New-Algo-Order).
 
 1. Trên Binance: tạo API key **chỉ Trade Futures**, **tắt Withdraw**,
    whitelist IP VPS.
 2. Trên VPS: `export BINANCE_API_KEY=... BINANCE_API_SECRET=...`
    (hoặc cho vào EnvironmentFile của systemd service, chmod 600).
 3. `cp config.example.json config.json`, sửa `"mode": "live"`.
-   (Khuyên bật `"use_testnet": true` trước với key testnet để kiểm tra kỹ
-   thuật, rồi mới tắt.)
-4. Chạy `python3 binance_bot.py`, theo dõi 30–60 phút đầu, đối chiếu app Binance.
-5. Size test nhỏ trước (giảm `order_margin_usdt`), Cường gật đầu mới để size chuẩn.
+   (Bắt buộc bật `"use_testnet": true` trước với key testnet để kiểm tra:
+   listenKey/keepalive, client id timeout recovery, `ORDER_TRADE_UPDATE`,
+   aggregate LONG/SHORT và payload Algo Order. `exchange_protection` vẫn để
+   false cho tới khi test xong.)
+4. Chạy testnet, xác nhận một open/close nhỏ và restart/reconnect không tạo
+   lệnh trùng; kiểm tra `client_order_id`, event order, position aggregate.
+5. Chỉ sau validation trên mới chuyển endpoint mainnet; theo dõi 30–60 phút
+   đầu và đối chiếu app Binance.
+6. Size test nhỏ trước (giảm `order_margin_usdt`), Cường gật đầu mới để size chuẩn.
 
 Mọi thay đổi code đều push lên repo git (luật đứng).

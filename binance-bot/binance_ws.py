@@ -63,7 +63,9 @@ class BinanceWS:
         return base + random.uniform(0.0, min(3.0, base * 0.1))
 
     def _run(self):
-        streams = "/".join(s + "@miniTicker" for s in self.symbols)
+        # Binance market-stream names are lowercase even though the raw
+        # exchangeInfo/universe ids used by the engine are uppercase.
+        streams = "/".join(str(s).lower() + "@miniTicker" for s in self.symbols)
         url = URL + streams
         self.log(
             "WS configured endpoint=/market stream_count=%d "

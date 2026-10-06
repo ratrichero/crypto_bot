@@ -94,6 +94,7 @@ def default_state():
         "cooldown_until": 0,
         "stats": {"trades": 0, "wins": 0, "losses": 0, "fees": 0.0},
         "_pid": 0,
+        "_client_nonce": 0,
     }
 
 
@@ -296,6 +297,18 @@ def main():
         f"fast={FAST_POLL}s, equity={st['equity']:.2f} MODE={MODE} "
         f"single_instance={bool(lock_handle)}")
 
+    if MODE == "live":
+        try:
+            engine.start_user_stream()
+        except binance_safety.BinanceSafetyStop as e:
+            log("USER WS START STOPPED by Binance safety circuit: %s" % e)
+            save_state(st)
+            return
+        except Exception:
+            log("USER WS START ERROR:\n" + traceback.format_exc())
+            save_state(st)
+            return
+
     ws = BinanceWS(SYMBOLS, log)
     ws.start()
 
@@ -311,6 +324,7 @@ def main():
         except binance_safety.BinanceSafetyStop as e:
             log("WARMUP STOPPED by Binance safety circuit: %s" % e)
             ws.stop()
+            getattr(engine, "stop_user_stream", lambda: None)()
             save_state(st)
             return
         except Exception as e:
@@ -329,18 +343,26 @@ def main():
             if os.path.exists(STOP_P):
                 log("STOP file -> shutdown")
                 ws.stop()
+                getattr(engine, "stop_user_stream", lambda: None)()
                 save_state(st)
                 binance_client.close()
                 return
             if ws.fatal_error:
                 raise binance_safety.BinanceSafetyStop(ws.fatal_error)
+            user_error = getattr(engine, "user_stream_error", lambda: None)()
+            if user_error:
+                raise binance_safety.BinanceSafetyStop(user_error)
             binance_safety.ensure_allowed()
 
             if st["day"] != utc_day():
+                persistent_halt = str(st.get("halt_reason", "")).startswith(
+                    ("exchange ", "unmanaged ", "position ")
+                )
                 st["day"] = utc_day()
                 st["day_start_equity"] = st["equity"]
-                st["halted"] = False
-                st["halt_reason"] = ""
+                st["halted"] = persistent_halt
+                if not persistent_halt:
+                    st["halt_reason"] = ""
                 log(f"New day {st['day']}")
 
             # ---- prices: routed WS live, low-weight REST fallback ----
@@ -366,14 +388,24 @@ def main():
 
             dirty = False
 
+            if MODE == "live" and not engine.reconcile_positions():
+                if not st["halted"]:
+                    st["halted"] = True
+                    st["halt_reason"] = "position reconciliation unavailable"
+                dirty = True
+
             # ---- FAST PATH: only trading modes may mutate positions/orders
+            reconcile_hold = str(st.get("halt_reason", "")).startswith(
+                ("exchange position", "unmanaged ", "position reconciliation")
+            )
             if not DATA_ONLY:
-                for symbol in SYMBOLS:
-                    px = prices.get(symbol)
-                    if px is None:
-                        continue
-                    if update_positions(engine, st, symbol, px):
-                        dirty = True
+                if not reconcile_hold:
+                    for symbol in SYMBOLS:
+                        px = prices.get(symbol)
+                        if px is None:
+                            continue
+                        if update_positions(engine, st, symbol, px):
+                            dirty = True
                 if not st["halted"]:
                     for symbol in SYMBOLS:
                         px = prices.get(symbol)
@@ -470,6 +502,7 @@ def main():
             # REST/private trading; do not let the 0.5s loop retry it.
             log("SAFETY STOP: %s" % e)
             ws.stop()
+            getattr(engine, "stop_user_stream", lambda: None)()
             save_state(st)
             binance_client.close()
             return

@@ -13,11 +13,11 @@ DESIGN CHOICES (differences vs OKX worth knowing):
   2. Quantity, not contracts. Binance sizes orders in base asset
      (e.g. BTC), rounded DOWN to the symbol's stepSize; minQty and
      minNotional are enforced before sending.
-  3. SL/TP like the OKX bot: NO exchange-side conditional orders. The fast
-     loop (~0.5s) watches WS prices and closes with reduce-only market
-     orders. Same trade-off: if this process dies, no protective stop rests
-     on the exchange. Mitigations: watchdog/systemd restart, daily stop,
-     small sizes. Add exchange-side stops before scaling up.
+  3. SL/TP like the OKX bot by default: the fast loop (~0.5s) watches WS
+     prices and closes with opposite-side market orders. Optional
+     exchange-side STOP_MARKET/TAKE_PROFIT_MARKET Algo Orders are guarded by
+     config ``exchange_protection`` and remain disabled until testnet
+     validation.
 
 SAFETY:
   - Credentials ONLY from env BINANCE_API_KEY / BINANCE_API_SECRET.
@@ -29,6 +29,7 @@ SAFETY:
 """
 import json
 import os
+import threading
 import time
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
@@ -104,7 +105,9 @@ class BinanceEngine:
         self.dry_run = dry_run
         self.log = log or (lambda m: print(m, flush=True))
         self._pid = state.get("_pid", 0)
+        self._client_nonce = state.get("_client_nonce", 0)
         self._filters = {}   # raw symbol -> (step_size, min_qty, min_notional)
+        self._price_ticks = {}
         self._markets = None
         self._symbol_map = {}  # raw Binance symbol -> CCXT unified symbol
         self._lev_done = set()
@@ -114,6 +117,13 @@ class BinanceEngine:
         self._action_failures = {}
         self._action_cooldowns = {}
         self._symbol_cooldowns = {}
+        self._order_events = {}
+        self._order_condition = threading.Condition()
+        self._last_account_event = 0.0
+        self._account_position_snapshot = {}
+        self._last_reconcile = 0.0
+        self._user_ws = None
+        self._last_order_response = None
         self._cooldown_base = float(cfg.get("order_failure_cooldown_seconds", 30))
         self._cooldown_max = float(cfg.get("order_failure_cooldown_max_seconds", 900))
         if dry_run:
@@ -127,7 +137,11 @@ class BinanceEngine:
                 "apiKey": key,
                 "secret": secret,
                 "enableRateLimit": True,
-                "options": {"defaultType": "future"},
+                "options": {
+                    "defaultType": "future",
+                    "adjustForTimeDifference": True,
+                    "recvWindow": int(cfg.get("recv_window_ms", 5000)),
+                },
             })
             if cfg.get("use_testnet"):
                 self.ex.set_sandbox_mode(True)
@@ -161,6 +175,123 @@ class BinanceEngine:
             exchange=self.ex,
             **kwargs,
         )
+
+    def _new_client_order_id(self, symbol, side):
+        self._client_nonce += 1
+        self.state["_client_nonce"] = self._client_nonce
+        # A persisted counter makes the id stable/auditable without using a
+        # random retry token. Binance allows at most 36 restricted characters.
+        raw = "".join(ch for ch in str(symbol).upper()
+                      if ch.isalnum() or ch in "_-" )
+        return "b%s%s%s" % (
+            raw[:18],
+            "L" if side in ("long", "buy") else "S",
+            self._client_nonce,
+        )[:36]
+
+    def _find_order_by_client_id(self, symbol, client_order_id):
+        """Reconcile an ambiguous network failure exactly once."""
+        if self.dry_run or not client_order_id:
+            return None
+        params = {"symbol": symbol, "origClientOrderId": client_order_id}
+        try:
+            return self._private_call(
+                "private:order_status",
+                self.ex.fapiPrivateGetOrder,
+                params,
+            )
+        except binance_safety.BinanceSafetyStop:
+            raise
+        except Exception as exc:
+            # -2013/order-not-found is the expected negative result. Other
+            # errors are logged and the original create error is preserved.
+            if "-2013" not in str(exc) and "order does not exist" not in str(exc).lower():
+                self.log("WARNING reconcile clientOrderId %s failed: %s" %
+                         (client_order_id, binance_safety.redact_body(exc)))
+            return None
+
+    def start_user_stream(self):
+        """Start private ORDER_TRADE_UPDATE/ACCOUNT_UPDATE listener."""
+        if self.dry_run or self._user_ws is not None:
+            return
+        listen_key = self._new_user_stream_key()
+        from binance_user_ws import BinanceUserDataWS
+        self._user_ws = BinanceUserDataWS(
+            listen_key=listen_key,
+            renew=self._renew_user_stream,
+            new_listen_key=self._new_user_stream_key,
+            on_event=self.on_user_event,
+            log=self.log,
+        )
+        self._user_ws.start()
+        self.log("USER WS started for order/account events")
+
+    def _new_user_stream_key(self):
+        response = self._private_call(
+            "private:user_stream",
+            self.ex.fapiPrivatePostListenKey,
+            {},
+        )
+        listen_key = response.get("listenKey")
+        if not listen_key:
+            raise RuntimeError("Binance listenKey missing from response")
+        return listen_key
+
+    def _renew_user_stream(self):
+        if self._user_ws is None:
+            return ""
+        response = self._private_call(
+            "private:user_stream",
+            self.ex.fapiPrivatePutListenKey,
+            {"listenKey": self._user_ws.listen_key},
+        )
+        return response.get("listenKey") or self._user_ws.listen_key
+
+    def stop_user_stream(self):
+        if self._user_ws is not None:
+            self._user_ws.stop()
+
+    def user_stream_error(self):
+        return self._user_ws.fatal_error if self._user_ws else None
+
+    def on_user_event(self, event):
+        kind = event.get("e")
+        if kind == "ORDER_TRADE_UPDATE":
+            order = event.get("o") or {}
+            order_id = order.get("i")
+            if order_id is not None:
+                with self._order_condition:
+                    self._order_events[str(order_id)] = order
+                    self._order_condition.notify_all()
+            self.log("USER ORDER event symbol=%s order=%s status=%s exec=%s "
+                     "positionSide=%s"
+                     % (order.get("s"), order.get("i"), order.get("X"),
+                        order.get("x"), order.get("ps")))
+        elif kind == "ACCOUNT_UPDATE":
+            self._last_account_event = time.time()
+            for position in (event.get("a") or {}).get("P", []):
+                symbol = position.get("s")
+                side = str(position.get("ps") or "").lower()
+                if symbol and side in ("long", "short"):
+                    try:
+                        amount = abs(float(position.get("pa", 0) or 0))
+                    except (TypeError, ValueError):
+                        continue
+                    self._account_position_snapshot[(symbol, side)] = amount
+            # Reconcile promptly on the next main-loop iteration, while the
+            # periodic guard below also catches a dropped/private-stream gap.
+            self._last_reconcile = 0.0
+
+    def _wait_order_event(self, order_id, timeout):
+        key = str(order_id)
+        deadline = time.monotonic() + max(0.0, timeout)
+        with self._order_condition:
+            while key not in self._order_events:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._order_condition.wait(timeout=remaining)
+            return dict(self._order_events[key])
 
     def _action_key(self, action, symbol, side=None, tag=None, level=None):
         return ":".join(str(x) for x in (action, symbol, side or "-",
@@ -244,8 +375,8 @@ class BinanceEngine:
             markets = self._load_markets()
             market = markets.get(raw) or {}
             market_info = market.get("info") or {}
-            return market_info.get("symbol") or market.get("id") or raw
-        return raw
+            return str(market_info.get("symbol") or market.get("id") or raw).upper()
+        return str(raw).upper() if raw else raw
 
     def _ensure_hedge_mode(self):
         """Bat hedge (dual-side) mode cho tai khoan. Can cho grid 2 chieu."""
@@ -282,9 +413,12 @@ class BinanceEngine:
             lot = None
             market_lot = None
             minn = 0.0
+            tick = 0.0
             for f in (m.get("info") or {}).get("filters", []):
                 ft = f.get("filterType")
-                if ft == "LOT_SIZE":
+                if ft == "PRICE_FILTER":
+                    tick = float(f.get("tickSize", 0) or 0)
+                elif ft == "LOT_SIZE":
                     lot = (float(f["stepSize"]), float(f["minQty"]))
                 elif ft == "MARKET_LOT_SIZE":
                     market_lot = (float(f["stepSize"]), float(f["minQty"]))
@@ -297,7 +431,113 @@ class BinanceEngine:
             if not selected:
                 raise RuntimeError("khong doc duoc LOT_SIZE cho %s" % symbol)
             self._filters[symbol] = (selected[0], selected[1], minn)
+            self._price_ticks[symbol] = tick
         return self._filters[symbol]
+
+    def _rounded_trigger_price(self, symbol, price):
+        if price is None:
+            return None
+        if symbol not in self._price_ticks:
+            self._filters_for(symbol)
+        tick = self._price_ticks.get(symbol) or 0
+        if not tick:
+            return str(price)
+        step = Decimal(str(tick))
+        value = (Decimal(str(price)) / step).to_integral_value(
+            rounding=ROUND_DOWN
+        ) * step
+        return format(value, "f")
+
+    def _create_exchange_protection(self, pos):
+        """Create optional Binance conditional orders for a live position."""
+        if self.dry_run or not self.cfg.get("exchange_protection", False):
+            return {}
+        orders = {}
+        order_side = "SELL" if pos["side"] == "long" else "BUY"
+        position_side = "LONG" if pos["side"] == "long" else "SHORT"
+        triggers = (
+            ("sl", pos.get("sl"), "STOP_MARKET"),
+            ("tp", pos.get("tp"), "TAKE_PROFIT_MARKET"),
+        )
+        try:
+            for label, trigger, order_type in triggers:
+                if trigger is None:
+                    continue
+                client_algo_id = self._new_client_order_id(
+                    pos["symbol"], pos["side"]
+                )[:36]
+                params = {
+                    "algoType": "CONDITIONAL",
+                    "symbol": pos["symbol"],
+                    "side": order_side,
+                    "positionSide": position_side,
+                    "type": order_type,
+                    "quantity": pos["qty"],
+                    "triggerPrice": self._rounded_trigger_price(
+                        pos["symbol"], trigger
+                    ),
+                    "workingType": self.cfg.get(
+                        "protection_working_type", "MARK_PRICE"
+                    ),
+                    "clientAlgoId": client_algo_id,
+                    "priceProtect": (
+                        "TRUE" if self.cfg.get("protection_price_protect", False)
+                        else "FALSE"
+                    ),
+                }
+                response = self._private_call(
+                    "private:trade",
+                    self.ex.fapiPrivatePostAlgoOrder,
+                    params,
+                )
+                algo_id = response.get("algoId")
+                if not algo_id:
+                    raise RuntimeError("Binance algo order missing algoId")
+                orders[label] = algo_id
+            return orders
+        except binance_safety.BinanceSafetyStop:
+            raise
+        except Exception:
+            # If the second protection order fails, remove the first one so
+            # the position is not left with only half of its intended guard.
+            for algo_id in orders.values():
+                if algo_id:
+                    try:
+                        self._private_call(
+                            "private:trade",
+                            self.ex.fapiPrivateDeleteAlgoOrder,
+                            {"symbol": pos["symbol"], "algoId": algo_id},
+                        )
+                    except binance_safety.BinanceSafetyStop:
+                        raise
+                    except Exception as cancel_error:
+                        self.log("CRITICAL protection cleanup failed algo=%s: %s"
+                                 % (algo_id, binance_safety.redact_body(cancel_error)))
+            raise
+
+    def _cancel_exchange_protection(self, pos):
+        if self.dry_run:
+            return
+        if (not self.cfg.get("exchange_protection", False)
+                and not pos.get("sl_algo_id") and not pos.get("tp_algo_id")):
+            return
+        for key in ("sl_algo_id", "tp_algo_id"):
+            algo_id = pos.get(key)
+            if not algo_id:
+                continue
+            try:
+                self._private_call(
+                    "private:trade",
+                    self.ex.fapiPrivateDeleteAlgoOrder,
+                    {"symbol": pos["symbol"], "algoId": algo_id},
+                )
+            except binance_safety.BinanceSafetyStop:
+                raise
+            except Exception as exc:
+                # An already-triggered/canceled algo order is harmless. Any
+                # other error is logged; the market close remains idempotent.
+                self.log("WARNING cancel protection algo=%s failed: %s"
+                         % (algo_id, binance_safety.redact_body(exc)))
 
     def _set_leverage(self, symbol):
         if symbol in self._lev_done:
@@ -363,19 +603,83 @@ class BinanceEngine:
         except Exception as e:
             self.log("WARNING refresh_equity that bai: %s (giu equity cu)" % e)
 
-    def _reconcile_startup(self):
-        """Loai paper-ghost khoi state; canh bao vi the san khong quan ly."""
+    def _aggregate_positions(self, rows):
+        """Aggregate exchange/base quantities by raw symbol and LONG/SHORT."""
+        result = {}
+        for position in rows or []:
+            amount = float(position.get("contracts", 0) or 0)
+            if amount == 0:
+                continue
+            info = position.get("info") or {}
+            position_side = info.get("positionSide") or position.get("side")
+            position_side = str(position_side or "").lower()
+            if position_side == "both":
+                position_side = "long" if amount > 0 else "short"
+            if position_side not in ("long", "short"):
+                continue
+            symbol = self._raw_symbol(position)
+            if not symbol:
+                continue
+            key = (symbol, position_side)
+            result[key] = result.get(key, 0.0) + abs(amount)
+        return result
+
+    def reconcile_positions(self, force=False, rows=None):
+        """Compare local grid lots with exchange aggregate Hedge positions.
+
+        Binance exposes one aggregate LONG and one aggregate SHORT position per
+        symbol, while the strategy stores individual grid/scalp lots. Therefore
+        this validates grouped quantities and never tries to import an unknown
+        lot into local state automatically.
+        """
+        if self.dry_run:
+            return True
+        now = time.time()
+        interval = float(self.cfg.get("reconcile_interval_seconds", 60))
+        if not force and now - self._last_reconcile < interval:
+            return True
+        self._last_reconcile = now
         try:
-            ex = set()
-            for p in self.get_positions():
-                amt = float(p.get("contracts", 0) or 0)
-                if amt == 0:
-                    continue
-                info = p.get("info") or {}
-                position_side = info.get("positionSide") or p.get("side")
-                if str(position_side).upper() in ("LONG", "SHORT"):
-                    position_side = str(position_side).lower()
-                ex.add((self._raw_symbol(p), position_side))
+            exchange = self._aggregate_positions(
+                self.get_positions() if rows is None else rows
+            )
+        except binance_safety.BinanceSafetyStop:
+            raise
+        except Exception as exc:
+            self.log("WARNING position reconciliation failed: %s" %
+                     binance_safety.redact_body(exc))
+            return False
+
+        local = {}
+        for position in self.state["positions"]:
+            key = (position["symbol"], position["side"])
+            local[key] = local.get(key, 0.0) + float(position.get("qty", 0) or 0)
+        keys = set(local) | set(exchange)
+        mismatches = []
+        for key in sorted(keys):
+            expected = local.get(key, 0.0)
+            actual = exchange.get(key, 0.0)
+            step = 0.0
+            try:
+                step = float((self._filters_for(key[0]) or (0,))[0] or 0)
+            except Exception:
+                pass
+            tolerance = max(step * 1.1, abs(expected) * 0.001, 1e-10)
+            if abs(expected - actual) > tolerance:
+                mismatches.append((key, expected, actual))
+        if mismatches:
+            self.state["halted"] = True
+            self.state["halt_reason"] = "exchange position reconciliation mismatch"
+            self.log("CRITICAL POSITION RECONCILE mismatch=%s; halt new entries"
+                     % mismatches)
+            return False
+        return True
+
+    def _reconcile_startup(self):
+        """Remove paper ghosts, then validate aggregate exchange quantities."""
+        try:
+            rows = self.get_positions()
+            exchange = self._aggregate_positions(rows)
         except binance_safety.BinanceSafetyStop:
             raise
         except Exception as e:
@@ -384,8 +688,9 @@ class BinanceEngine:
         kept = [p for p in self.state["positions"] if p.get("live")]
         pruned = [p for p in self.state["positions"] if not p.get("live")]
         still = []
+        exchange_keys = set(exchange)
         for p in kept:
-            if (p["symbol"], p["side"]) in ex:
+            if (p["symbol"], p["side"]) in exchange_keys:
                 still.append(p)
             else:
                 pruned.append(p)
@@ -393,9 +698,13 @@ class BinanceEngine:
             self.log("WARNING loai bo %d vi the khong ton tai tren san: ids=%s"
                      % (len(pruned), [p["id"] for p in pruned]))
         self.state["positions"] = still
-        for k in sorted(ex - {(p["symbol"], p["side"]) for p in still}):
-            self.log("WARNING san co vi the %s ma state khong quan ly "
-                     "-> tu dong tay hoac xoa state.json" % (k,))
+        local_keys = {(p["symbol"], p["side"]) for p in still}
+        for key in sorted(exchange_keys - local_keys):
+            self.log("CRITICAL san co vi the %s qty=%s ma state khong quan ly "
+                     "-> halt de doi chieu/close tay" % (key, exchange[key]))
+            self.state["halted"] = True
+            self.state["halt_reason"] = "unmanaged exchange position"
+        self.reconcile_positions(force=True, rows=rows)
 
     def _place_market(self, symbol, side, qty, position_side,
                       reduce_only=False, ref_price=None):
@@ -411,10 +720,13 @@ class BinanceEngine:
             oid = "dryrun-%d" % self._dry_n
             self.log("DRY_RUN dat lenh: %s %s qty=%s %s" %
                      (symbol, side, qty, json.dumps(params)))
-            return oid, ref_price
+            return oid, None
         ccxt_symbol = self._ccxt_symbol(symbol)
         if not ccxt_symbol:
             raise RuntimeError("unknown_symbol: %s" % symbol)
+        client_order_id = self._new_client_order_id(symbol, side)
+        params["newClientOrderId"] = client_order_id
+        params["newOrderRespType"] = self.cfg.get("new_order_resp_type", "RESULT")
         fn = (self.ex.create_market_buy_order if side == "buy"
               else self.ex.create_market_sell_order)
         try:
@@ -428,18 +740,54 @@ class BinanceEngine:
         except binance_safety.BinanceSafetyStop:
             raise
         except Exception as e:
+            # A transport timeout can happen after Binance accepted the
+            # order. Reconcile once by clientOrderId; never blindly submit a
+            # second order.
+            text = str(e).lower()
+            uncertain = any(word in text for word in
+                            ("timeout", "timed out", "network", "connection"))
+            if uncertain:
+                existing = self._find_order_by_client_id(symbol, client_order_id)
+                if existing and existing.get("orderId") is not None:
+                    self.log("ORDER reconciled after transport failure "
+                             "clientOrderId=%s orderId=%s"
+                             % (client_order_id, existing.get("orderId")))
+                    self._last_order_response = existing
+                    return existing.get("orderId"), client_order_id
             raise RuntimeError("dat lenh %s %s that bai: %s"
                                % (symbol, side, e))
-        return od.get("id"), None
+        self._last_order_response = od
+        return od.get("id"), od.get("clientOrderId") or client_order_id
 
     def _fill_price(self, symbol, order_id, ref_price):
         if self.dry_run:
             return ref_price
+
+        response = self._last_order_response or {}
+        self._last_order_response = None
+        if response.get("average") and float(response["average"] or 0) > 0:
+            return float(response["average"])
+        if response.get("avgPrice") and float(response["avgPrice"] or 0) > 0:
+            return float(response["avgPrice"])
+
+        # Prefer the ordered private stream. This removes the old six-request
+        # polling burst when ORDER_TRADE_UPDATE is healthy.
+        if self._user_ws is not None and self._user_ws.running:
+            event_order = self._wait_order_event(
+                order_id,
+                float(self.cfg.get("order_event_timeout_seconds", 8)),
+            )
+            if event_order:
+                avg = event_order.get("ap") or event_order.get("avgPrice")
+                if avg and float(avg) > 0:
+                    return float(avg)
+
         ccxt_symbol = self._ccxt_symbol(symbol)
         if not ccxt_symbol:
             raise RuntimeError("unknown_symbol: %s" % symbol)
         px = None
-        for _ in range(6):
+        # REST is now a bounded fallback, not the normal order-status path.
+        for _ in range(2):
             try:
                 od = self._private_call(
                     "private:order_status",
@@ -508,8 +856,9 @@ class BinanceEngine:
                     return None, "size_too_small"
             bside = "buy" if side == "long" else "sell"
             ps = "LONG" if side == "long" else "SHORT"
-            oid, _ = self._place_market(symbol, bside, qty, ps,
-                                        ref_price=price)
+            oid, client_order_id = self._place_market(
+                symbol, bside, qty, ps, ref_price=price
+            )
             entry = self._fill_price(symbol, oid, price)
             if side == "long":
                 sl = entry * (1 - sl_pct) if sl_pct else None
@@ -524,14 +873,39 @@ class BinanceEngine:
                 "notional": notional, "sl": sl, "tp": tp, "tag": tag,
                 "level": level, "opened_at": int(time.time()), "fee_entry": fee,
                 "live": True, "dry": self.dry_run, "ord_id": oid,
+                "client_order_id": client_order_id,
             }
             self.state["equity"] -= fee
             self.state["stats"]["fees"] += fee
             self.state["positions"].append(pos)
+            if not self.dry_run and self.cfg.get("exchange_protection", False):
+                try:
+                    protection = self._create_exchange_protection(pos)
+                    pos["sl_algo_id"] = protection.get("sl")
+                    pos["tp_algo_id"] = protection.get("tp")
+                    pos["protection_status"] = "armed"
+                except binance_safety.BinanceSafetyStop:
+                    raise
+                except Exception as protection_error:
+                    # Keep the already-created position in state, stop new
+                    # entries, and let local SL/TP remain the fallback.
+                    pos["protection_status"] = "failed"
+                    pos["protection_error"] = binance_safety.redact_body(
+                        protection_error
+                    )
+                    self.state["halted"] = True
+                    self.state["halt_reason"] = (
+                        "exchange protection failed for %s" % symbol
+                    )
+                    self.log("CRITICAL UNPROTECTED position #%s %s: %s" %
+                             (pos["id"], symbol,
+                              binance_safety.redact_body(protection_error)))
             self._mark_action_success(key)
-            self.log("%s OPEN #%d %s %s entry=%s sl=%s tp=%s ord=%s" %
-                     ("DRY_RUN" if self.dry_run else "LIVE",
-                      pos["id"], symbol, side, entry, sl, tp, oid))
+            self.log("%s OPEN #%d %s %s entry=%s sl=%s tp=%s ord=%s "
+                     "protection=%s"
+                     % ("DRY_RUN" if self.dry_run else "LIVE",
+                        pos["id"], symbol, side, entry, sl, tp, oid,
+                        pos.get("protection_status", "disabled")))
             return pos, "ok"
         except binance_safety.BinanceSafetyStop:
             raise
@@ -541,7 +915,7 @@ class BinanceEngine:
 
     # ---------------------------------------------------------------- close
     def close(self, pos, price, reason):
-        """Dong bang market reduce-only, with per-position cooldown."""
+        """Dong bang market Hedge order, with per-position cooldown."""
         symbol = pos["symbol"]
         side = pos["side"]
         key = self._action_key("close", symbol, side, pos.get("tag"),
@@ -550,6 +924,7 @@ class BinanceEngine:
         if cooldown:
             return None
         try:
+            self._cancel_exchange_protection(pos)
             bside = "sell" if side == "long" else "buy"
             ps = "LONG" if side == "long" else "SHORT"
             if self.dry_run:
@@ -562,8 +937,9 @@ class BinanceEngine:
                 qty = qty_for(pos["qty"] * price, price, step, minq, minn)
                 if qty is None:
                     qty = minq  # vi the qua nho -> thu dong voi minQty
-            oid, _ = self._place_market(symbol, bside, qty, ps,
-                                        reduce_only=True, ref_price=price)
+            oid, client_order_id = self._place_market(
+                symbol, bside, qty, ps, reduce_only=True, ref_price=price
+            )
             ex = self._fill_price(symbol, oid, price)
             if side == "long":
                 pnl = (ex - pos["entry"]) * pos["qty"]
@@ -585,6 +961,7 @@ class BinanceEngine:
                 "pnl": round(net, 2), "reason": reason,
                 "closed_at": int(time.time()),
                 "live": True, "dry": self.dry_run, "close_ord": oid,
+                "close_client_order_id": client_order_id,
             }
             self.state["positions"] = [p for p in self.state["positions"]
                                         if p["id"] != pos["id"]]

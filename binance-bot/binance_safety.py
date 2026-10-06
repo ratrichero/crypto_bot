@@ -101,6 +101,7 @@ class RequestGovernor:
             "private:exchange_info": 1.0,
             "private:trade": 0.35,
             "private:order_status": 1.0,
+            "private:user_stream": 60.0,
         }
         if endpoint_intervals:
             self.endpoint_intervals.update(endpoint_intervals)
@@ -114,6 +115,7 @@ class RequestGovernor:
         self._loaded_path: Optional[str] = None
         self._log: Optional[Callable[[str], None]] = None
         self._observed_weight: Optional[int] = None
+        self._observed_order_count: Optional[int] = None
 
     def configure(
         self,
@@ -241,6 +243,7 @@ class RequestGovernor:
         if not headers:
             return
         used = None
+        order_count = None
         for name, value in headers.items():
             key = str(name).lower()
             if key.startswith("x-mbx-used-weight-"):
@@ -249,9 +252,18 @@ class RequestGovernor:
                 except (TypeError, ValueError):
                     continue
                 used = max(used or 0, candidate)
-        if used is not None:
+            elif key.startswith("x-mbx-order-count-"):
+                try:
+                    candidate = int(float(value))
+                except (TypeError, ValueError):
+                    continue
+                order_count = max(order_count or 0, candidate)
+        if used is not None or order_count is not None:
             with self._lock:
-                self._observed_weight = used
+                if used is not None:
+                    self._observed_weight = used
+                if order_count is not None:
+                    self._observed_order_count = order_count
 
     def trip(
         self,
@@ -307,6 +319,7 @@ class RequestGovernor:
             self._weighted_requests.clear()
             self._last_request.clear()
             self._observed_weight = None
+            self._observed_order_count = None
             if self._state_path:
                 try:
                     os.remove(self._state_path)
@@ -319,6 +332,11 @@ class RequestGovernor:
     def observed_weight(self) -> Optional[int]:
         with self._lock:
             return self._observed_weight
+
+    @property
+    def observed_order_count(self) -> Optional[int]:
+        with self._lock:
+            return self._observed_order_count
 
 
 GOVERNOR = RequestGovernor()
@@ -536,9 +554,9 @@ def call_private(
         headers = getattr(exchange, "last_response_headers", None)
         GOVERNOR.observe_headers(headers)
         log("BINANCE CCXT request_id=%s endpoint=%s status=success "
-            "latency_ms=%.1f used_weight=%s"
+            "latency_ms=%.1f used_weight=%s order_count=%s"
             % (rid, endpoint, (time.monotonic() - started) * 1000,
-               GOVERNOR.observed_weight))
+               GOVERNOR.observed_weight, GOVERNOR.observed_order_count))
         return result
     except BinanceSafetyStop:
         raise
@@ -550,10 +568,12 @@ def call_private(
                 headers = dict(candidate)
         GOVERNOR.observe_headers(headers)
         log("BINANCE CCXT request_id=%s endpoint=%s status=%s api_code=%s "
-            "latency_ms=%.1f retry_after=%s body=%s"
+            "latency_ms=%.1f retry_after=%s used_weight=%s order_count=%s "
+            "body=%s"
             % (rid, endpoint, status, api_code,
                (time.monotonic() - started) * 1000,
-               parse_retry_after(headers), redact_body(body)))
+               parse_retry_after(headers), GOVERNOR.observed_weight,
+               GOVERNOR.observed_order_count, redact_body(body)))
         fatal = trip_for_exception(exc, endpoint=endpoint, request_id=rid)
         if fatal:
             raise fatal from exc
