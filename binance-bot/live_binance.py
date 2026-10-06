@@ -143,7 +143,12 @@ class BinanceEngine:
 
     def _filters_for(self, symbol):
         if symbol not in self._filters:
-            m = self.ex.load_markets()[symbol]
+            markets = self.ex.load_markets()
+            if symbol not in markets:
+                # Coin bi delist / khong co tren futures -> bo qua, khong crash
+                self._filters[symbol] = None
+                return None
+            m = markets[symbol]
             step, minq, minn = 0.0, 0.0, 0.0
             for f in m["info"].get("filters", []):
                 ft = f.get("filterType")
@@ -288,7 +293,10 @@ class BinanceEngine:
         if self.dry_run:
             qty = qty_for(notional, price, 0.000001)  # chi de log, khong gui
         else:
-            step, minq, minn = self._filters_for(symbol)
+            filters = self._filters_for(symbol)
+            if filters is None:
+                return None, "unknown_symbol"
+            step, minq, minn = filters
             qty = qty_for(notional, price, step, minq, minn)
             if qty is None:
                 return None, "size_too_small"
