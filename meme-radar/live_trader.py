@@ -36,7 +36,7 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 SOL_MINT = "So11111111111111111111111111111111111111112"
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
-TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnAA9JxkRrP8"
+TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
 
 SIG_P = os.path.join(BASE, "signals.jsonl")
 ALERT_P = os.path.join(BASE, "alerts.jsonl")
@@ -272,15 +272,28 @@ class RpcClient:
         return dec
 
     def get_token_balance_base(self, owner, mint):
-        """Tra ve (base_units:int, decimals:int|None). 0 neu khong co account."""
-        res = self.call("getTokenAccountsByOwner",
-                        [owner, {"mint": mint}, {"encoding": "jsonParsed"}])
+        """Tra ve (base_units:int, decimals:int|None). 0 neu khong co account.
+        Query ca Token program chuan va Token-2022 (nhieu meme moi dung 2022)."""
         total = 0
         dec = None
-        for item in res.get("value", []):
-            info = item["account"]["data"]["parsed"]["info"]["tokenAmount"]
-            total += int(info["amount"])
-            dec = info["decimals"]
+        for prog in (TOKEN_PROGRAM, TOKEN_2022_PROGRAM):
+            try:
+                res = self.call(
+                    "getTokenAccountsByOwner",
+                    [owner, {"programId": prog},
+                     {"encoding": "jsonParsed"}])
+            except Exception:
+                continue
+            for item in res.get("value", []):
+                try:
+                    pinfo = item["account"]["data"]["parsed"]["info"]
+                except (KeyError, TypeError):
+                    continue
+                if pinfo.get("mint") != mint:
+                    continue
+                tinfo = pinfo["tokenAmount"]
+                total += int(tinfo["amount"])
+                dec = tinfo["decimals"]
         return total, dec
 
     def send_transaction(self, b64tx, skip_preflight=False):
@@ -409,6 +422,19 @@ class Swapper:
             if st == "failed":
                 raise SwapError(f"tx failed on-chain: {sig[:12]}")
             time.sleep(2)
+        # Timeout: fallback kiem tra truc tiep via getTransaction
+        # (RPC co the lag, tx da thanh cong nhung status chua cap nhat)
+        try:
+            tx = self.rpc.call(
+                "getTransaction",
+                [sig, {"encoding": "json",
+                       "maxSupportedTransactionVersion": 0}])
+            if tx and tx.get("meta") and tx["meta"].get("err") is None:
+                log(f"confirm fallback: tx {sig[:12]}... thanh cong "
+                    f"(getTransaction), chap nhan")
+                return True
+        except Exception as e:
+            log(f"confirm fallback loi: {e}")
         return False
 
     def _quote_swap(self, in_mint, out_mint, amount_base):
