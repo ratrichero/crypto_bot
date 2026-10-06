@@ -497,13 +497,16 @@ def is_rate_limit_failure(
     exc: Optional[BaseException] = None,
 ) -> bool:
     text = (redact_body(body) + " " + str(exc or "")).lower()
+    # Chi trip khi co dau hieu ban THAT (status/api code hoac message loi cu the).
+    # Khong match "rate limit" chung chung vi dinh ca CCXT warning
+    # (vd: "fetching open orders without symbol has stricter rate limits").
     return (
         status_code in (418, 429)
         or api_code == -1003
         or "too many requests" in text
-        or "rate limit" in text
-        or "ratelimit" in text
+        or "way too many requests" in text
         or "ip banned" in text
+        or "banned until" in text
         or "ip ban" in text
         or "request weight" in text and "limit" in text
     )

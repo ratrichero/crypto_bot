@@ -595,6 +595,22 @@ try:
 except Exception:
     check("make_engine rejects bad mode", False)
 
+
+# --- CCXT warning khong duoc trip circuit (bug 06/10/2026) ---
+from binance_safety import is_rate_limit_failure
+ccxt_warn = 'binanceusdm fetchOpenOrders() WARNING: fetching open orders without specifying a symbol has stricter rate limits'
+check("CCXT warning khong trip circuit",
+      is_rate_limit_failure(status_code=None, api_code=None, body=ccxt_warn) == False)
+check("429 that van trip",
+      is_rate_limit_failure(status_code=429, api_code=None, body="") == True)
+check("418 that van trip",
+      is_rate_limit_failure(status_code=418, api_code=None, body="") == True)
+check("-1003 van trip",
+      is_rate_limit_failure(status_code=None, api_code=-1003, body="") == True)
+check("ban message that van trip",
+      is_rate_limit_failure(status_code=None, api_code=None,
+                            body="Way too many requests; IP banned until 123") == True)
+
 # --- restore env ---
 for k, v in _saved.items():
     if v is not None:
