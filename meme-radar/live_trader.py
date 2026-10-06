@@ -11,8 +11,9 @@ Exit ladder mirror y het paper (radar.py manage_positions, plan scalp):
 
 An toan:
   - mode mac dinh dry_run (chi log, khong gui tx, khong can key)
-  - mode live: bat buoc file .solana_key ton tai + pubkey khop wallet_address,
-    thieu -> fail closed (dung chuong trinh)
+  - mode live: bat buoc private key (env SOLANA_PRIVATE_KEY, nap tu file .env
+    chmod 600 — uu tien) hoac file .solana_key ton tai + pubkey khop
+    wallet_address, thieu -> fail closed (dung chuong trinh)
   - kill switch: file STOP trong thu muc nay -> dung nhe nhang.
     CHU Y: STOP KHONG tu dong dong vi the dang mo — phai xu ly tay.
   - daily stop: dung mo moi khi lo thuc te trong ngay < -daily_stop_pct
@@ -45,6 +46,28 @@ TRADES_P = os.path.join(BASE, "live_trades.jsonl")
 LOG_P = os.path.join(BASE, "live_trader.log")
 STOP_P = os.path.join(BASE, "STOP")
 CFG_P = os.path.join(BASE, "config.live.json")
+ENV_P = os.path.join(BASE, ".env")
+
+
+def _load_env_file(path=ENV_P):
+    """Nap KEY=VALUE tu file .env (chmod 600) vao os.environ neu chua co. Khong log gia tri."""
+    try:
+        if not os.path.exists(path):
+            return
+        with open(path) as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k, v = k.strip(), v.strip().strip('"').strip("'")
+                if k and k not in os.environ:
+                    os.environ[k] = v
+    except Exception:
+        pass
+
+
+_load_env_file()
 
 # ---------------------------------------------------------------- config
 
@@ -177,23 +200,29 @@ def decide_exits(pos, price, now, P):
 
 
 def load_keypair(cfg):
-    """Doc private key base58, verify pubkey khop wallet_address. Fail closed."""
+    """Doc private key base58 tu env SOLANA_PRIVATE_KEY (uu tien, nap tu .env)
+    hoac file .solana_key; verify pubkey khop wallet_address. Fail closed."""
     from solders.keypair import Keypair
-    kp_path = os.path.join(BASE, cfg["key_file"])
-    if not os.path.exists(kp_path):
-        raise SystemExit(
-            f"FATAL: mode=live nhung khong thay key file {kp_path} -> dung")
-    secret = open(kp_path).read().strip()
+    secret = os.environ.get("SOLANA_PRIVATE_KEY", "").strip()
+    src = "env SOLANA_PRIVATE_KEY"
     if not secret:
-        raise SystemExit("FATAL: key file rong -> dung")
+        kp_path = os.path.join(BASE, cfg["key_file"])
+        if not os.path.exists(kp_path):
+            raise SystemExit(
+                f"FATAL: mode=live nhung khong thay key (env SOLANA_PRIVATE_KEY "
+                f"trong va khong co key file {kp_path}) -> dung")
+        secret = open(kp_path).read().strip()
+        src = f"key file {kp_path}"
+    if not secret:
+        raise SystemExit(f"FATAL: key rong ({src}) -> dung")
     try:
         kp = Keypair.from_base58_string(secret)
     except Exception as e:
-        raise SystemExit(f"FATAL: key file khong hop le: {e}")
+        raise SystemExit(f"FATAL: key khong hop le ({src}): {e}")
     pubkey = str(kp.pubkey())
     if pubkey != cfg["wallet_address"]:
         raise SystemExit(
-            f"FATAL: pubkey tu key file ({pubkey[:8]}...) khong khop "
+            f"FATAL: pubkey tu key ({pubkey[:8]}...) khong khop "
             f"wallet_address trong config -> dung (chong nham vi)")
     return kp
 
