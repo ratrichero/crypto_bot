@@ -409,6 +409,108 @@ def tab_live_radar():
     solana_kpi_frag()
 
 
+def tab_monitor():
+    """Tab giam sat he thong real: status service + log realtime."""
+    import subprocess
+
+    st.subheader("🖥️ Giám sát hệ thống REAL")
+
+    services = {
+        "muse-binance": "🔴 Binance Futures LIVE",
+        "muse-radar": "🦅 Radar paper (Solana)",
+        "muse-live-trader": "☀️ Live Trader (Solana tiền thật)",
+        "muse-dashboard": "📊 Dashboard",
+    }
+
+    # Status services
+    st.markdown("### Trạng thái service")
+    cols = st.columns(len(services))
+    for i, (svc, label) in enumerate(services.items()):
+        try:
+            r = subprocess.run(
+                ["systemctl", "is-active", svc],
+                capture_output=True, text=True, timeout=5)
+            active = r.stdout.strip() == "active"
+        except Exception:
+            active = False
+        with cols[i]:
+            if active:
+                st.success(f"✅ {label}")
+            else:
+                st.error(f"❌ {label}")
+
+    st.divider()
+
+    # Log realtime
+    st.markdown("### Log realtime (20 dòng mới nhất)")
+    svc_choice = st.selectbox(
+        "Chọn service",
+        list(services.keys()),
+        format_func=lambda x: services[x])
+
+    try:
+        r = subprocess.run(
+            ["journalctl", "-u", svc_choice, "--since", "10 min ago",
+             "--no-pager", "-n", "20"],
+            capture_output=True, text=True, timeout=10)
+        logs = r.stdout.strip()
+        if logs:
+            # Chi lay phan message, bo timestamp systemd
+            lines = []
+            for line in logs.split("\n")[-20:]:
+                # Cat bo phan dau "Oct 06 22:23:14 ip-... python[xxx]: "
+                if "python[" in line:
+                    line = line.split("python[", 1)[1].split("]: ", 1)[-1]
+                lines.append(line)
+            st.code("\n".join(lines), language="text")
+        else:
+            st.info("Chưa có log trong 10 phút qua.")
+    except Exception as e:
+        st.error(f"Không đọc được log: {e}")
+
+    st.divider()
+    st.markdown("### Vị thế LIVE đang mở")
+    # Binance positions tu state
+    try:
+        with open(BINANCE_STATE) as f:
+            bstate = json.load(f)
+        bpos = bstate.get("positions", [])
+        halt = bstate.get("halt_reason")
+        if halt:
+            st.warning(f"⚠️ Binance HALT: {halt}")
+        if bpos:
+            df = pd.DataFrame([{
+                "Symbol": p.get("symbol"),
+                "Side": p.get("side"),
+                "Tag": p.get("tag"),
+                "Entry": p.get("entry"),
+            } for p in bpos])
+            st.dataframe(df, use_container_width=True)
+        else:
+            st.info("Binance: không có vị thế mở.")
+    except Exception as e:
+        st.error(f"Không đọc được Binance state: {e}")
+
+    # Solana live positions
+    try:
+        lp = "/home/ubuntu/muse_bot/meme-radar/live_positions.json"
+        with open(lp) as f:
+            spos = json.load(f)
+        if spos:
+            df = pd.DataFrame([{
+                "Symbol": p.get("symbol"),
+                "Entry": f"{p.get('entry', 0):.2e}",
+                "Size $": p.get("size_usd"),
+                "Còn lại": f"{p.get('remaining', 1)*100:.0f}%",
+                "Manual": "✓" if p.get("manual_add") else "",
+            } for p in spos])
+            st.dataframe(df, use_container_width=True)
+        else:
+            st.info("Solana: không có vị thế live.")
+    except Exception as e:
+        st.error(f"Không đọc được Solana positions: {e}")
+
+
 # ---------------- tab PAPER ----------------
 def okx_positions_block():
     st.markdown('<div class="sub2">Vi the dang mo — OKX</div>', unsafe_allow_html=True)
@@ -700,9 +802,10 @@ def main():
         where = "WHERE closed_at >= now() - make_interval(days => %s)"
         params = (days,)
 
-    t1, t2, t3, t4 = st.tabs([
+    t1, t2, t3, t4, t5 = st.tabs([
         "🔴 Live Binance", "☀️ Live Radar",
-        "📄 Paper OKX", "🦅 Paper Radar"])
+        "📄 Paper OKX", "🦅 Paper Radar",
+        "🖥️ Monitor"])
     with t1:
         tab_live_binance(where, params)
     with t2:
@@ -711,6 +814,8 @@ def main():
         tab_paper_okx(where, params)
     with t4:
         tab_paper_radar(where, params)
+    with t5:
+        tab_monitor()
 
     st.divider()
     st.markdown('<div class="small-note">Vi the & equity live tu refresh '
