@@ -269,7 +269,13 @@ def manage_grid_risk(engine, st, mark_prices):
     if base_equity <= 0:
         return False
     changed = False
-    for symbol, grid in list(st["grids"].items()):
+    grid_symbols = set(st.get("grids", {})) | {
+        p.get("symbol") for p in st["positions"] if p.get("tag") == "grid"
+    }
+    for symbol in sorted(s for s in grid_symbols if s):
+        grid = st["grids"].setdefault(
+            symbol, {"anchor": None, "taken": {}}
+        )
         if grid.get("risk_halted"):
             continue
         positions = [p for p in st["positions"]
