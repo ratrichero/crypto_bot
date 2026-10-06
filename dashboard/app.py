@@ -301,12 +301,44 @@ def binance_live_positions_block():
                 f'</span> · gia cap nhat 5s/lan', unsafe_allow_html=True)
 
 
-def tab_live(where, params):
+@frag15
+def binance_equity_realtime():
+    st.markdown('<div class="sub2">⚡ Equity realtime — Binance LIVE</div>',
+                unsafe_allow_html=True)
+    rows = q("""SELECT ts AT TIME ZONE 'Asia/Ho_Chi_Minh' AS ts, equity
+                FROM equity_snapshots WHERE system='binance'
+                  AND ts >= now() - interval '6 hours'
+                ORDER BY ts""")
+    if not rows:
+        st.info("Chua co snapshot — doi service muse-binance-equity-snap.")
+        return
+    eq = float(rows[-1]["equity"])
+    cls = "pos" if eq >= 1000 else "neg"
+    c1, c2 = st.columns([1, 3])
+    with c1:
+        st.markdown(f'<div class="kpi-card" style="border-left-color:'
+                    f'{"#16a34a" if eq >= 1000 else "#dc2626"}">'
+                    f'<div class="kpi-label">Equity Binance (U)</div>'
+                    f'<div class="kpi-value {cls}">{eq:.2f} U</div>'
+                    f'<div class="kpi-sub">{eq - 1000:+.2f} vs von 1000 · live</div></div>',
+                    unsafe_allow_html=True)
+    with c2:
+        df = pd.DataFrame(rows)
+        df["ts"] = pd.to_datetime(df["ts"])
+        fig = px.line(df, x="ts", y="equity",
+                      title="Equity 6h qua (snapshot 15s)")
+        fig.update_layout(paper_bgcolor="rgba(0,0,0,0)",
+                          plot_bgcolor="rgba(0,0,0,0)",
+                          xaxis_title=None, yaxis_title="U")
+        st.plotly_chart(fig, width="stretch")
+    st.caption("Tu refresh 15s · totalMarginBalance thuc tren san.")
+
+
+@frag
+def live_kpi_frag(where, params):
     d = day_filter()
     bn = q(f"SELECT {d} AS day, pnl AS net, tag, reason, live, dry "
            f"FROM binance_trades {where} ORDER BY closed_at", params)
-
-    section("📈 Binance Futures — LIVE (tien that)")
     kpi_cards("Hieu suat", bn)
     n = len(bn)
     n_live = sum(1 for r in bn if r.get("live") and not r.get("dry"))
@@ -314,8 +346,6 @@ def tab_live(where, params):
     if n:
         st.caption(f"Trong do: {n_live} lenh LIVE tien that, {n_dry} lenh dry-run.")
     pnl_charts(daily_df(bn), "Binance LIVE")
-
-    binance_live_positions_block()
 
     rbn = q("""SELECT closed_at, symbol, side, tag, pnl AS net, reason,
                       live, dry
@@ -333,7 +363,9 @@ def tab_live(where, params):
     else:
         st.info("Binance LIVE chua co lenh dong.")
 
-    st.divider()
+
+@frag
+def solana_kpi_frag():
     section("☀️ Solana meme — live")
     bal = sol_balance()
     if bal is None:
@@ -352,6 +384,15 @@ def tab_live(where, params):
     c3.markdown(f'<div class="kpi-card"><div class="kpi-label">Trang thai</div>'
                 f'<div class="kpi-value {cls}" style="font-size:17px">'
                 f'{status}</div></div>', unsafe_allow_html=True)
+
+
+def tab_live(where, params):
+    section("📈 Binance Futures — LIVE (tien that)")
+    binance_equity_realtime()
+    live_kpi_frag(where, params)
+    binance_live_positions_block()
+    st.divider()
+    solana_kpi_frag()
 
 
 # ---------------- tab PAPER ----------------
@@ -512,105 +553,118 @@ def radar_equity_realtime():
     st.caption("Tu refresh 15s · P&L tich luy tu dau (paper, chua tru phi giao dich that).")
 
 
-def tab_paper(where, params):
+@frag
+def okx_kpi_frag(where, params):
     d = day_filter()
     okx = q(f"SELECT {d} AS day, (pnl - fee) AS net, tag, reason "
             f"FROM okx_trades {where} ORDER BY closed_at", params)
+    section("Bot OKX — paper trade")
+    kpi_cards("Hieu suat", okx)
+    pnl_charts(daily_df(okx), "OKX paper")
+    okx_positions_block()
+    rokx = q(f"""SELECT closed_at, inst AS symbol, side, tag,
+                        (pnl - fee) AS net, reason
+                 FROM okx_trades {where}
+                 ORDER BY closed_at DESC LIMIT 50""", params)
+    trades_table(rokx,
+                 {"closed_at": "Dong luc", "symbol": "Cap",
+                  "side": "Chieu", "tag": "Loai", "net": "P&L rong (U)",
+                  "reason": "Ly do"},
+                 "50 lenh OKX gan nhat")
+
+
+@frag
+def radar_kpi_frag(where, params):
+    d = day_filter()
     scalp = q(f"SELECT {d} AS day, pnl_usd AS net, wallet, reason "
               f"FROM radar_trades {where} AND plan='scalp' ORDER BY closed_at",
               params)
     holder = q(f"SELECT {d} AS day, pnl_usd AS net, wallet, reason "
                f"FROM radar_trades {where} AND plan='holder' ORDER BY closed_at",
                params)
+    kpi_cards("Plan scalp", scalp)
+    kpi_cards("Plan holder", holder)
 
+    ds, dh = daily_df(scalp), daily_df(holder)
+    for df_, nm in ((ds, "Scalp"), (dh, "Holder")):
+        df_["he"] = nm
+    alld = pd.concat([ds, dh], ignore_index=True)
+    st.markdown('<div class="sub2">P&L theo ngay</div>', unsafe_allow_html=True)
+    if not alld.empty:
+        c1, c2 = st.columns(2)
+        with c1:
+            fig = px.line(alld, x="day", y="cum", color="he",
+                          title="Radar — P&L cong don (U)")
+            fig.update_layout(paper_bgcolor="rgba(0,0,0,0)",
+                              plot_bgcolor="rgba(0,0,0,0)")
+            st.plotly_chart(fig, width="stretch")
+        with c2:
+            fig = px.bar(alld, x="day", y="net", color="he",
+                         barmode="group",
+                         title="Radar — P&L tung ngay (U)")
+            fig.update_layout(paper_bgcolor="rgba(0,0,0,0)",
+                              plot_bgcolor="rgba(0,0,0,0)")
+            st.plotly_chart(fig, width="stretch")
+    else:
+        st.info("Chua co du lieu trong khoang da chon.")
+
+    st.markdown('<div class="sub2">Thong ke ly do thoat lenh — scalp</div>',
+                unsafe_allow_html=True)
+    rb = q(f"""SELECT reason, COUNT(*) AS n, SUM(pnl_usd) AS pnl
+               FROM radar_trades {where} AND plan='scalp'
+               GROUP BY reason ORDER BY pnl DESC""", params)
+    if rb:
+        st.dataframe(pd.DataFrame([{
+            "Ly do": r["reason"] or "?", "Lenh": r["n"],
+            "P&L (U)": round(r["pnl"] or 0, 1),
+        } for r in rb]), width="stretch")
+    else:
+        st.info("Chua co du lieu.")
+
+    st.markdown('<div class="sub2">Xep hang vi (theo P&L paper)</div>',
+                unsafe_allow_html=True)
+    wl = q(f"""SELECT t.wallet, w.label, COUNT(*) AS n,
+                      SUM(t.pnl_usd) AS pnl,
+                      AVG(CASE WHEN t.pnl_usd > 0 THEN 1.0 ELSE 0.0 END) AS wr
+               FROM radar_trades t LEFT JOIN wallets w
+                 ON w.address = t.wallet
+               {where} GROUP BY t.wallet, w.label
+               ORDER BY pnl DESC""", params)
+    if wl:
+        st.dataframe(pd.DataFrame([{
+            "Vi": (r["wallet"] or "")[:12],
+            "Label": r["label"] or "",
+            "Lenh": r["n"], "P&L (U)": round(r["pnl"] or 0, 1),
+            "Winrate": f"{(r['wr'] or 0):.0%}",
+        } for r in wl]), width="stretch")
+    else:
+        st.info("Chua co du lieu.")
+
+
+@frag
+def radar_trades_frag(where, params):
+    rrc = q(f"""SELECT closed_at, symbol, plan, pnl_usd AS net, reason
+                FROM radar_trades {where}
+                ORDER BY closed_at DESC LIMIT 50""", params)
+    trades_table(rrc,
+                 {"closed_at": "Dong luc", "symbol": "Symbol",
+                  "plan": "Plan", "net": "P&L rong (U)",
+                  "reason": "Ly do"},
+                 "50 lenh radar gan nhat")
+
+
+def tab_paper(where, params):
     ptab1, ptab2 = st.tabs(["🤖 Bot OKX", "🦅 Radar meme"])
 
     with ptab1:
-        section("Bot OKX — paper trade")
-        kpi_cards("Hieu suat", okx)
-        pnl_charts(daily_df(okx), "OKX paper")
-        okx_positions_block()
-        rokx = q(f"""SELECT closed_at, inst AS symbol, side, tag,
-                            (pnl - fee) AS net, reason
-                     FROM okx_trades {where}
-                     ORDER BY closed_at DESC LIMIT 50""", params)
-        trades_table(rokx,
-                     {"closed_at": "Dong luc", "symbol": "Cap",
-                      "side": "Chieu", "tag": "Loai", "net": "P&L rong (U)",
-                      "reason": "Ly do"},
-                     "50 lenh OKX gan nhat")
+        okx_kpi_frag(where, params)
 
     with ptab2:
         section("Radar meme Solana — paper")
         radar_equity_realtime()
-        kpi_cards("Plan scalp", scalp)
-        kpi_cards("Plan holder", holder)
-
-        ds, dh = daily_df(scalp), daily_df(holder)
-        for df_, nm in ((ds, "Scalp"), (dh, "Holder")):
-            df_["he"] = nm
-        alld = pd.concat([ds, dh], ignore_index=True)
-        st.markdown('<div class="sub2">P&L theo ngay</div>', unsafe_allow_html=True)
-        if not alld.empty:
-            c1, c2 = st.columns(2)
-            with c1:
-                fig = px.line(alld, x="day", y="cum", color="he",
-                              title="Radar — P&L cong don (U)")
-                fig.update_layout(paper_bgcolor="rgba(0,0,0,0)",
-                                  plot_bgcolor="rgba(0,0,0,0)")
-                st.plotly_chart(fig, width="stretch")
-            with c2:
-                fig = px.bar(alld, x="day", y="net", color="he",
-                             barmode="group",
-                             title="Radar — P&L tung ngay (U)")
-                fig.update_layout(paper_bgcolor="rgba(0,0,0,0)",
-                                  plot_bgcolor="rgba(0,0,0,0)")
-                st.plotly_chart(fig, width="stretch")
-        else:
-            st.info("Chua co du lieu trong khoang da chon.")
-
-        st.markdown('<div class="sub2">Thong ke ly do thoat lenh — scalp</div>',
-                    unsafe_allow_html=True)
-        rb = q(f"""SELECT reason, COUNT(*) AS n, SUM(pnl_usd) AS pnl
-                   FROM radar_trades {where} AND plan='scalp'
-                   GROUP BY reason ORDER BY pnl DESC""", params)
-        if rb:
-            st.dataframe(pd.DataFrame([{
-                "Ly do": r["reason"] or "?", "Lenh": r["n"],
-                "P&L (U)": round(r["pnl"] or 0, 1),
-            } for r in rb]), width="stretch")
-        else:
-            st.info("Chua co du lieu.")
-
-        st.markdown('<div class="sub2">Xep hang vi (theo P&L paper)</div>',
-                    unsafe_allow_html=True)
-        wl = q(f"""SELECT t.wallet, w.label, COUNT(*) AS n,
-                          SUM(t.pnl_usd) AS pnl,
-                          AVG(CASE WHEN t.pnl_usd > 0 THEN 1.0 ELSE 0.0 END) AS wr
-                   FROM radar_trades t LEFT JOIN wallets w
-                     ON w.address = t.wallet
-                   {where} GROUP BY t.wallet, w.label
-                   ORDER BY pnl DESC""", params)
-        if wl:
-            st.dataframe(pd.DataFrame([{
-                "Vi": (r["wallet"] or "")[:12],
-                "Label": r["label"] or "",
-                "Lenh": r["n"], "P&L (U)": round(r["pnl"] or 0, 1),
-                "Winrate": f"{(r['wr'] or 0):.0%}",
-            } for r in wl]), width="stretch")
-        else:
-            st.info("Chua co du lieu.")
-
+        radar_kpi_frag(where, params)
         radar_positions_block()
-
-        rrc = q(f"""SELECT closed_at, symbol, plan, pnl_usd AS net, reason
-                    FROM radar_trades {where}
-                    ORDER BY closed_at DESC LIMIT 50""", params)
-        trades_table(rrc,
-                     {"closed_at": "Dong luc", "symbol": "Symbol",
-                      "plan": "Plan", "net": "P&L rong (U)",
-                      "reason": "Ly do"},
-                     "50 lenh radar gan nhat")
+        radar_trades_frag(where, params)
 
 
 # ---------------- main ----------------
@@ -642,7 +696,7 @@ def main():
 
     st.divider()
     st.markdown('<div class="small-note">Vi the & equity live tu refresh '
-                'rieng (5s/15s) · Cac chi so khac refresh khi tai trang · '
+                'rieng (5s/15s) · KPI tu refresh 60s · '
                 'So lieu paper chi de doi chung, khong phai ket qua tien that.'
                 '</div>', unsafe_allow_html=True)
 
