@@ -163,7 +163,8 @@ class BinanceEngine:
                 self.ex.set_margin_mode("cross", symbol)
             except Exception as e:
                 # -4046 "No need to change margin type": da dung che do -> bo qua
-                if "-4046" not in str(e):
+                msg = str(e)
+                if "-4046" not in msg and "No need to change margin type" not in msg:
                     raise
             self.ex.set_leverage(self.cfg["leverage"], symbol)
         self._lev_done.add(symbol)
