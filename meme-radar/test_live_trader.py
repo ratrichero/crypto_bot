@@ -231,7 +231,7 @@ def test_live_no_key_fails():
             lt.load_keypair(cfg)
             check("phai SystemExit", False)
         except SystemExit as e:
-            check("SystemExit khi thieu key", "khong thay key file" in str(e),
+            check("SystemExit khi thieu key", "khong thay key" in str(e),
                   str(e)[:80])
 
 

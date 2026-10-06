@@ -1,19 +1,22 @@
-"""Dashboard theo doi bot Binance LIVE + OKX paper + radar meme Solana. Tieng Viet.
+"""Dashboard Crypto Bots — 2 tab: LIVE (tien that) va PAPER (chay thu). Tieng Viet.
 
 Chay:  DATABASE_URL=postgres://... streamlit run app.py
 Tu refresh 60s. Vi the dang mo doc truc tiep tu state file cua bot.
 """
+import json
 import os
-import time
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import plotly.express as px
 import psycopg
 import psycopg.rows
+import requests
 import streamlit as st
 
 st.set_page_config(page_title="Crypto Bots Dashboard", layout="wide")
 
+# ---------------- cau hinh ----------------
 DB = os.environ.get("DATABASE_URL")
 BINANCE_STATE = os.environ.get("BINANCE_STATE",
                                "/home/ubuntu/muse_bot/binance-bot/state.json")
@@ -21,12 +24,39 @@ OKX_STATE = os.environ.get("OKX_STATE",
                            os.path.expanduser("~/workspace/trading-bot/state.json"))
 RADAR_STATE = os.environ.get("RADAR_STATE",
                              os.path.expanduser("~/workspace/meme-radar/radar_state.json"))
-WALLETS_JSON = os.environ.get("WALLETS_JSON",
-                              os.path.expanduser("~/workspace/meme-radar/wallets.json"))
+_HK = os.environ.get("HELIUS_KEY_FILE")
+if not _HK:
+    _HK = ("/home/ubuntu/muse_bot/.helius_key"
+           if os.path.exists("/home/ubuntu/muse_bot/.helius_key")
+           else os.path.expanduser("~/workspace/meme-radar/.helius_key"))
+HELIUS_KEY_FILE = _HK
+SOL_WALLET = "DxYkrsJA6YdS1cqJ9ocPCYRBacd7Xan3DeYWZva89dLd"
 
 TZ = "Asia/Ho_Chi_Minh"
+TZINFO = timezone(timedelta(hours=7))
+
+# ---------------- CSS (an toan cho ca light & dark theme) ----------------
+st.markdown("""
+<style>
+.kpi-card{background:rgba(127,127,127,.09);border-radius:10px;
+  padding:12px 14px;border-left:4px solid #64748b;height:100%;}
+.kpi-label{font-size:11px;letter-spacing:.5px;text-transform:uppercase;
+  opacity:.62;margin-bottom:2px;}
+.kpi-value{font-size:25px;font-weight:700;line-height:1.15;}
+.kpi-sub{font-size:12px;opacity:.6;margin-top:2px;}
+.pos{color:#16a34a;}.neg{color:#dc2626;}
+.sec{font-size:19px;font-weight:700;margin:22px 0 8px 0;
+  padding-bottom:6px;border-bottom:2px solid rgba(127,127,127,.28);}
+.sub2{font-size:15px;font-weight:600;margin:14px 0 6px 0;opacity:.92;}
+.addr{font-family:monospace;font-size:13px;word-break:break-all;
+  padding-top:4px;}
+div[data-testid="stTabs"] button{font-size:15px;font-weight:600;}
+.small-note{font-size:12px;opacity:.6;}
+</style>
+""", unsafe_allow_html=True)
 
 
+# ---------------- data helpers ----------------
 @st.cache_resource
 def get_conn():
     if not DB:
@@ -72,17 +102,6 @@ def metrics(rows):
     return (pnl, wins / n, gw / gl if gl else 99.0, pnl / n, n)
 
 
-def kpi_row(title, rows):
-    pnl, wr, pf, exp, n = metrics(rows)
-    st.subheader(title)
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("P&L ròng", f"{pnl:+.1f} U")
-    c2.metric("Winrate", f"{wr:.0%}")
-    c3.metric("Profit factor", f"{pf:.2f}")
-    c4.metric("Kỳ vọng/lệnh", f"{exp:+.2f} U")
-    c5.metric("Số lệnh", f"{n}")
-
-
 def daily_df(rows):
     if not rows:
         return pd.DataFrame(columns=["day", "net"])
@@ -93,6 +112,327 @@ def daily_df(rows):
     return g
 
 
+def load_state(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def fmt_ts(dt):
+    if not dt:
+        return "chua co"
+    try:
+        return dt.astimezone(TZINFO).strftime("%d/%m %H:%M")
+    except Exception:
+        return "?"
+
+
+@st.cache_data(ttl=180)
+def sol_balance():
+    """So du SOL cua vi bot; None neu khong doc duoc. Khong bao gio in key."""
+    try:
+        with open(HELIUS_KEY_FILE) as f:
+            key = f.read().strip()
+    except Exception:
+        return None
+    if not key:
+        return None
+    try:
+        r = requests.post(
+            f"https://mainnet.helius-rpc.com/?api-key={key}",
+            json={"jsonrpc": "2.0", "id": 1, "method": "getBalance",
+                  "params": [SOL_WALLET]},
+            timeout=15)
+        return r.json()["result"]["value"] / 1e9
+    except Exception:
+        return None
+
+
+# ---------------- UI helpers ----------------
+def section(title):
+    st.markdown(f'<div class="sec">{title}</div>', unsafe_allow_html=True)
+
+
+def kpi_cards(title, rows):
+    st.markdown(f'<div class="sub2">{title}</div>', unsafe_allow_html=True)
+    pnl, wr, pf, exp, n = metrics(rows)
+    if not n:
+        st.info("Chua co lenh dong trong khoang da chon.")
+        return
+    s = lambda x: "pos" if x > 0 else ("neg" if x < 0 else "")
+    items = [
+        ("P&L rong", f"{pnl:+.2f} U", s(pnl)),
+        ("Winrate", f"{wr:.0%}", ""),
+        ("Profit factor", f"{pf:.2f}", ""),
+        ("Ky vong / lenh", f"{exp:+.2f} U", s(exp)),
+        ("So lenh dong", f"{n}", ""),
+    ]
+    cols = st.columns(5)
+    for col, (label, val, cls) in zip(cols, items):
+        col.markdown(
+            f'<div class="kpi-card"><div class="kpi-label">{label}</div>'
+            f'<div class="kpi-value {cls}">{val}</div></div>',
+            unsafe_allow_html=True)
+
+
+def pnl_charts(df, prefix):
+    if df.empty:
+        st.info(f"{prefix}: chua co du lieu trong khoang da chon.")
+        return
+    c1, c2 = st.columns(2)
+    with c1:
+        fig = px.line(df, x="day", y="cum",
+                      title=f"{prefix} — P&L cong don (U)")
+        fig.update_layout(paper_bgcolor="rgba(0,0,0,0)",
+                          plot_bgcolor="rgba(0,0,0,0)")
+        st.plotly_chart(fig, width="stretch")
+    with c2:
+        d2 = df.copy()
+        d2["mau"] = d2["net"].apply(lambda x: "lai" if x >= 0 else "lo")
+        fig = px.bar(d2, x="day", y="net", color="mau",
+                     color_discrete_map={"lai": "#16a34a", "lo": "#dc2626"},
+                     title=f"{prefix} — P&L tung ngay (U)")
+        fig.update_layout(paper_bgcolor="rgba(0,0,0,0)",
+                          plot_bgcolor="rgba(0,0,0,0)", showlegend=False)
+        st.plotly_chart(fig, width="stretch")
+
+
+def trades_table(rows, cols_map, title="Lenh dong gan nhat"):
+    st.markdown(f'<div class="sub2">{title}</div>', unsafe_allow_html=True)
+    if not rows:
+        st.info("Chua co du lieu.")
+        return
+    df = pd.DataFrame(rows)
+    if "closed_at" in df.columns:
+        df["closed_at"] = pd.to_datetime(df["closed_at"])\
+            .dt.tz_convert(TZ).dt.strftime("%m-%d %H:%M")
+    st.dataframe(df.rename(columns=cols_map)[list(cols_map.values())],
+                 width="stretch")
+
+
+def last_updates_line():
+    parts = []
+    for label, tbl in (("Binance", "binance_trades"), ("OKX", "okx_trades"),
+                       ("Radar", "radar_trades")):
+        r = q(f"SELECT MAX(closed_at) AS m FROM {tbl}")
+        m = r[0]["m"] if r and r[0].get("m") else None
+        parts.append(f"{label}: {fmt_ts(m)}")
+    for label, path in (("State Binance", BINANCE_STATE),
+                        ("State OKX", OKX_STATE),
+                        ("State radar", RADAR_STATE)):
+        try:
+            m = datetime.fromtimestamp(os.path.getmtime(path), tz=TZINFO)
+            parts.append(f"{label}: {m.strftime('%H:%M')}")
+        except OSError:
+            parts.append(f"{label}: ?")
+    return " · ".join(parts)
+
+
+# ---------------- tab LIVE ----------------
+def tab_live(where, params):
+    d = day_filter()
+    bn = q(f"SELECT {d} AS day, pnl AS net, tag, reason, live, dry "
+           f"FROM binance_trades {where} ORDER BY closed_at", params)
+
+    section("📈 Binance Futures — LIVE (tien that)")
+    kpi_cards("Hieu suat", bn)
+    n = len(bn)
+    n_live = sum(1 for r in bn if r.get("live") and not r.get("dry"))
+    n_dry = sum(1 for r in bn if r.get("dry"))
+    if n:
+        st.caption(f"Trong do: {n_live} lenh LIVE tien that, {n_dry} lenh dry-run.")
+    pnl_charts(daily_df(bn), "Binance LIVE")
+
+    st.markdown('<div class="sub2">Vi the dang mo</div>', unsafe_allow_html=True)
+    b_st = load_state(BINANCE_STATE)
+    if not b_st:
+        st.warning("Khong doc duoc file trang thai bot Binance.")
+    else:
+        bpos = b_st.get("positions", [])
+        st.caption(f"{len(bpos)} vi the — equity {b_st.get('equity', '?')}")
+        if bpos:
+            st.dataframe(pd.DataFrame([{
+                "ID": p.get("id"), "Symbol": p.get("symbol"),
+                "Chieu": p.get("side"), "Loai": p.get("tag"),
+                "Entry": p.get("entry"), "SL": p.get("sl"), "TP": p.get("tp"),
+                "Notional": p.get("notional"),
+            } for p in bpos]), width="stretch")
+
+    rbn = q("""SELECT closed_at, symbol, side, tag, pnl AS net, reason,
+                      live, dry
+               FROM binance_trades ORDER BY closed_at DESC LIMIT 50""")
+    if rbn:
+        dfb = pd.DataFrame(rbn)
+        dfb["che_do"] = dfb.apply(
+            lambda r: "LIVE" if (r["live"] and not r["dry"]) else "dry-run",
+            axis=1)
+        trades_table(dfb.to_dict("records"),
+                     {"closed_at": "Dong luc", "symbol": "Symbol",
+                      "side": "Chieu", "tag": "Loai", "net": "P&L rong (U)",
+                      "reason": "Ly do", "che_do": "Che do"},
+                     "50 lenh Binance gan nhat")
+    else:
+        st.info("Binance LIVE chua co lenh dong.")
+
+    st.divider()
+    section("☀️ Solana meme — live")
+    bal = sol_balance()
+    if bal is None:
+        bal_txt, status, cls = "?", "khong doc duoc so du", ""
+    elif bal < 0.05:
+        bal_txt, status, cls = f"{bal:.3f} SOL", "🟡 Chua nap SOL — cho funding", "neg"
+    else:
+        bal_txt, status, cls = f"{bal:.3f} SOL", "🟢 Da san sang test", "pos"
+    c1, c2, c3 = st.columns(3)
+    c1.markdown(f'<div class="kpi-card"><div class="kpi-label">Vi bot</div>'
+                f'<div class="addr">{SOL_WALLET}</div></div>',
+                unsafe_allow_html=True)
+    c2.markdown(f'<div class="kpi-card"><div class="kpi-label">So du</div>'
+                f'<div class="kpi-value">{bal_txt}</div></div>',
+                unsafe_allow_html=True)
+    c3.markdown(f'<div class="kpi-card"><div class="kpi-label">Trang thai</div>'
+                f'<div class="kpi-value {cls}" style="font-size:17px">'
+                f'{status}</div></div>', unsafe_allow_html=True)
+
+
+# ---------------- tab PAPER ----------------
+def okx_positions_block():
+    st.markdown('<div class="sub2">Vi the dang mo — OKX</div>', unsafe_allow_html=True)
+    okx_st = load_state(OKX_STATE)
+    if not okx_st:
+        st.warning("Khong doc duoc file trang thai bot OKX.")
+        return
+    pos = okx_st.get("positions", [])
+    st.caption(f"{len(pos)} vi the — equity {okx_st.get('equity', '?')}")
+    if pos:
+        st.dataframe(pd.DataFrame([{
+            "Cap": p.get("inst"), "Chieu": p.get("side"),
+            "Loai": p.get("tag"), "Entry": p.get("entry"),
+            "Notional": p.get("notional"),
+        } for p in pos]), width="stretch")
+
+
+def radar_positions_block():
+    st.markdown('<div class="sub2">Vi the dang mo — Radar</div>', unsafe_allow_html=True)
+    r_st = load_state(RADAR_STATE)
+    if not r_st:
+        st.warning("Khong doc duoc file trang thai radar.")
+        return
+    for key, name in (("paper", "Scalp"), ("paper_holder", "Holder")):
+        pp = r_st.get(key, [])
+        st.caption(f"{name}: {len(pp)} vi the")
+        if pp:
+            st.dataframe(pd.DataFrame([{
+                "Symbol": p.get("symbol"),
+                "Vi": (p.get("wallet") or "")[:10],
+                "Entry": p.get("entry"), "Size $": p.get("size_usd"),
+                "Con lai": f"{(p.get('remaining', 1) or 0):.0%}",
+            } for p in pp]), width="stretch")
+
+
+def tab_paper(where, params):
+    d = day_filter()
+    okx = q(f"SELECT {d} AS day, (pnl - fee) AS net, tag, reason "
+            f"FROM okx_trades {where} ORDER BY closed_at", params)
+    scalp = q(f"SELECT {d} AS day, pnl_usd AS net, wallet, reason "
+              f"FROM radar_trades {where} AND plan='scalp' ORDER BY closed_at",
+              params)
+    holder = q(f"SELECT {d} AS day, pnl_usd AS net, wallet, reason "
+               f"FROM radar_trades {where} AND plan='holder' ORDER BY closed_at",
+               params)
+
+    ptab1, ptab2 = st.tabs(["🤖 Bot OKX", "🦅 Radar meme"])
+
+    with ptab1:
+        section("Bot OKX — paper trade")
+        kpi_cards("Hieu suat", okx)
+        pnl_charts(daily_df(okx), "OKX paper")
+        okx_positions_block()
+        rokx = q(f"""SELECT closed_at, inst AS symbol, side, tag,
+                            (pnl - fee) AS net, reason
+                     FROM okx_trades {where}
+                     ORDER BY closed_at DESC LIMIT 50""", params)
+        trades_table(rokx,
+                     {"closed_at": "Dong luc", "symbol": "Cap",
+                      "side": "Chieu", "tag": "Loai", "net": "P&L rong (U)",
+                      "reason": "Ly do"},
+                     "50 lenh OKX gan nhat")
+
+    with ptab2:
+        section("Radar meme Solana — paper")
+        kpi_cards("Plan scalp", scalp)
+        kpi_cards("Plan holder", holder)
+
+        ds, dh = daily_df(scalp), daily_df(holder)
+        for df_, nm in ((ds, "Scalp"), (dh, "Holder")):
+            df_["he"] = nm
+        alld = pd.concat([ds, dh], ignore_index=True)
+        st.markdown('<div class="sub2">P&L theo ngay</div>', unsafe_allow_html=True)
+        if not alld.empty:
+            c1, c2 = st.columns(2)
+            with c1:
+                fig = px.line(alld, x="day", y="cum", color="he",
+                              title="Radar — P&L cong don (U)")
+                fig.update_layout(paper_bgcolor="rgba(0,0,0,0)",
+                                  plot_bgcolor="rgba(0,0,0,0)")
+                st.plotly_chart(fig, width="stretch")
+            with c2:
+                fig = px.bar(alld, x="day", y="net", color="he",
+                             barmode="group",
+                             title="Radar — P&L tung ngay (U)")
+                fig.update_layout(paper_bgcolor="rgba(0,0,0,0)",
+                                  plot_bgcolor="rgba(0,0,0,0)")
+                st.plotly_chart(fig, width="stretch")
+        else:
+            st.info("Chua co du lieu trong khoang da chon.")
+
+        st.markdown('<div class="sub2">Thong ke ly do thoat lenh — scalp</div>',
+                    unsafe_allow_html=True)
+        rb = q(f"""SELECT reason, COUNT(*) AS n, SUM(pnl_usd) AS pnl
+                   FROM radar_trades {where} AND plan='scalp'
+                   GROUP BY reason ORDER BY pnl DESC""", params)
+        if rb:
+            st.dataframe(pd.DataFrame([{
+                "Ly do": r["reason"] or "?", "Lenh": r["n"],
+                "P&L (U)": round(r["pnl"] or 0, 1),
+            } for r in rb]), width="stretch")
+        else:
+            st.info("Chua co du lieu.")
+
+        st.markdown('<div class="sub2">Xep hang vi (theo P&L paper)</div>',
+                    unsafe_allow_html=True)
+        wl = q(f"""SELECT t.wallet, w.label, COUNT(*) AS n,
+                          SUM(t.pnl_usd) AS pnl,
+                          AVG(CASE WHEN t.pnl_usd > 0 THEN 1.0 ELSE 0.0 END) AS wr
+                   FROM radar_trades t LEFT JOIN wallets w
+                     ON w.address = t.wallet
+                   {where} GROUP BY t.wallet, w.label
+                   ORDER BY pnl DESC""", params)
+        if wl:
+            st.dataframe(pd.DataFrame([{
+                "Vi": (r["wallet"] or "")[:12],
+                "Label": r["label"] or "",
+                "Lenh": r["n"], "P&L (U)": round(r["pnl"] or 0, 1),
+                "Winrate": f"{(r['wr'] or 0):.0%}",
+            } for r in wl]), width="stretch")
+        else:
+            st.info("Chua co du lieu.")
+
+        radar_positions_block()
+
+        rrc = q(f"""SELECT closed_at, symbol, plan, pnl_usd AS net, reason
+                    FROM radar_trades {where}
+                    ORDER BY closed_at DESC LIMIT 50""", params)
+        trades_table(rrc,
+                     {"closed_at": "Dong luc", "symbol": "Symbol",
+                      "plan": "Plan", "net": "P&L rong (U)",
+                      "reason": "Ly do"},
+                     "50 lenh radar gan nhat")
+
+
+# ---------------- main ----------------
 def main():
     st.title("📊 Crypto Bots Dashboard")
     if not DB:
@@ -101,182 +441,28 @@ def main():
                  "streamlit run app.py")
         st.stop()
 
-    filt = st.radio("Khoảng thời gian", ["7 ngày", "30 ngày", "Tất cả"],
+    st.caption(f"Du lieu cap nhat lan cuoi — {last_updates_line()}")
+
+    filt = st.radio("Khoang thoi gian", ["7 ngay", "30 ngay", "Tat ca"],
                     horizontal=True, key="rng")
-    days = {"7 ngày": 7, "30 ngày": 30, "Tất cả": None}[filt]
+    days = {"7 ngay": 7, "30 ngay": 30, "Tat ca": None}[filt]
 
-    def _where(n=1):
-        if days is None:
-            return "", ()
-        return ("WHERE closed_at >= now() - make_interval(days => %s)", (days,) * n)
-
-    where, params = _where(1)
-
-    d = day_filter()
-
-    # ================= BINANCE LIVE (tien that) =================
-    st.header("🔴 Binance LIVE — tiền thật")
-    bn = q(f"SELECT {d} AS day, pnl AS net, tag, reason, live, dry "
-           f"FROM binance_trades {where} ORDER BY closed_at", params)
-    pnl, wr, pf, exp, n = metrics(bn)
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("P&L ròng", f"{pnl:+.1f} U")
-    c2.metric("Winrate", f"{wr:.0%}")
-    c3.metric("Profit factor", f"{pf:.2f}")
-    c4.metric("Kỳ vọng/lệnh", f"{exp:+.2f} U")
-    c5.metric("Số lệnh", f"{n}")
-    n_live = sum(1 for r in bn if r.get("live") and not r.get("dry"))
-    n_dry = sum(1 for r in bn if r.get("dry"))
-    if n:
-        st.caption(f"Trong đó: {n_live} lệnh LIVE tiền thật, {n_dry} lệnh dry-run.")
-
-    bnd = daily_df(bn)
-    if not bnd.empty:
-        c1, c2 = st.columns(2)
-        with c1:
-            st.plotly_chart(px.line(bnd, x="day", y="cum",
-                                    title="Binance LIVE — P&L cộng dồn (U)"),
-                            width="stretch")
-        with c2:
-            st.plotly_chart(px.bar(bnd, x="day", y="net",
-                                   title="Binance LIVE — P&L từng ngày (U)"),
-                            width="stretch")
+    if days is None:
+        where, params = "", ()
     else:
-        st.info("Binance LIVE chưa có lệnh đóng trong khoảng đã chọn.")
+        where = "WHERE closed_at >= now() - make_interval(days => %s)"
+        params = (days,)
 
-    try:
-        import json
-        b_st = json.load(open(BINANCE_STATE))
-        bpos = b_st.get("positions", [])
-        st.subheader(f"Vị thế đang mở: {len(bpos)} "
-                     f"(equity {b_st.get('equity', '?')})")
-        if bpos:
-            st.dataframe(pd.DataFrame([{
-                "ID": p.get("id"), "Symbol": p.get("symbol"),
-                "Chiều": p.get("side"), "Loại": p.get("tag"),
-                "Entry": p.get("entry"), "SL": p.get("sl"), "TP": p.get("tp"),
-                "Notional": p.get("notional"),
-            } for p in bpos]), width="stretch")
-    except Exception as e:
-        st.warning(f"Không đọc được {BINANCE_STATE}: {e}")
-
-    st.subheader("50 lệnh Binance gần nhất")
-    rbn = q("""SELECT closed_at, symbol, side, tag, pnl AS net, reason,
-                      live, dry
-               FROM binance_trades ORDER BY closed_at DESC LIMIT 50""")
-    if rbn:
-        dfb = pd.DataFrame(rbn)
-        dfb["closed_at"] = pd.to_datetime(dfb["closed_at"]).dt.tz_convert(TZ)\
-            .dt.strftime("%m-%d %H:%M")
-        dfb["chế độ"] = dfb.apply(
-            lambda r: "LIVE" if (r["live"] and not r["dry"]) else "dry-run",
-            axis=1)
-        st.dataframe(dfb[["closed_at", "symbol", "side", "tag", "net",
-                           "reason", "chế độ"]].rename(columns={
-            "closed_at": "Đóng lúc", "symbol": "Symbol", "side": "Chiều",
-            "tag": "Loại", "net": "P&L ròng (U)", "reason": "Lý do"}),
-            width="stretch")
+    tab_live_, tab_paper_ = st.tabs(["🔴 LIVE — Tien that", "📄 PAPER — Chay thu"])
+    with tab_live_:
+        tab_live(where, params)
+    with tab_paper_:
+        tab_paper(where, params)
 
     st.divider()
-
-    okx = q(f"SELECT {d} AS day, (pnl - fee) AS net, tag, reason "
-            f"FROM okx_trades {where} ORDER BY closed_at", params)
-    scalp = q(f"SELECT {d} AS day, pnl_usd AS net, wallet "
-              f"FROM radar_trades {where} AND plan='scalp' ORDER BY closed_at",
-              params)
-    holder = q(f"SELECT {d} AS day, pnl_usd AS net, wallet "
-               f"FROM radar_trades {where} AND plan='holder' ORDER BY closed_at",
-               params)
-
-    st.header("KPI tổng")
-    kpi_row("🤖 Bot OKX (paper)", okx)
-    kpi_row("🦅 Radar meme — plan scalp", scalp)
-    kpi_row("🦉 Radar meme — plan holder", holder)
-
-    st.header("P&L theo ngày")
-    do, ds, dh = daily_df(okx), daily_df(scalp), daily_df(holder)
-    for df_, nm in ((do, "OKX"), (ds, "Scalp"), (dh, "Holder")):
-        df_["system"] = nm
-    alld = pd.concat([do, ds, dh], ignore_index=True)
-    if not alld.empty:
-        c1, c2 = st.columns(2)
-        with c1:
-            st.plotly_chart(px.line(alld, x="day", y="cum", color="system",
-                                    title="P&L cộng dồn (U)"),
-                            width="stretch")
-        with c2:
-            st.plotly_chart(px.bar(alld, x="day", y="net", color="system",
-                                   barmode="group", title="P&L từng ngày (U)"),
-                            width="stretch")
-    else:
-        st.info("Chưa có dữ liệu trong khoảng đã chọn.")
-
-    st.header("Vị thế đang mở")
-    try:
-        import json
-        okx_st = json.load(open(OKX_STATE))
-        pos = okx_st.get("positions", [])
-        st.subheader(f"OKX — {len(pos)} vị thế (equity {okx_st.get('equity', '?')})")
-        if pos:
-            st.dataframe(pd.DataFrame([{
-                "Cặp": p.get("inst"), "Chiều": p.get("side"),
-                "Loại": p.get("tag"), "Entry": p.get("entry"),
-                "Notional": p.get("notional"),
-            } for p in pos]), width="stretch")
-    except Exception as e:
-        st.warning(f"Không đọc được {OKX_STATE}: {e}")
-    try:
-        import json
-        r_st = json.load(open(RADAR_STATE))
-        for key, name in (("paper", "Radar scalp"), ("paper_holder", "Radar holder")):
-            pp = r_st.get(key, [])
-            st.subheader(f"{name} — {len(pp)} vị thế")
-            if pp:
-                st.dataframe(pd.DataFrame([{
-                    "Symbol": p.get("symbol"), "Ví": (p.get("wallet") or "")[:10],
-                    "Entry": p.get("entry"), "Size $": p.get("size_usd"),
-                    "Còn lại": f"{(p.get('remaining', 1) or 0):.0%}",
-                } for p in pp]), width="stretch")
-    except Exception as e:
-        st.warning(f"Không đọc được {RADAR_STATE}: {e}")
-
-    st.header("Xếp hạng ví radar (theo P&L paper)")
-    wl = q(f"""SELECT t.wallet, w.label, COUNT(*) AS n,
-                      SUM(t.pnl_usd) AS pnl,
-                      AVG(CASE WHEN t.pnl_usd > 0 THEN 1.0 ELSE 0.0 END) AS wr
-               FROM radar_trades t LEFT JOIN wallets w ON w.address = t.wallet
-               {where} GROUP BY t.wallet, w.label
-               ORDER BY pnl DESC""", params)
-    if wl:
-        st.dataframe(pd.DataFrame([{
-            "Ví": (r["wallet"] or "")[:12],
-            "Label": r["label"] or "",
-            "Lệnh": r["n"], "P&L (U)": round(r["pnl"] or 0, 1),
-            "Winrate": f"{(r['wr'] or 0):.0%}",
-        } for r in wl]), width="stretch")
-
-    st.header("50 lệnh đóng gần nhất")
-    w2, p2 = _where(2)
-    recent = q(f"""(SELECT closed_at, 'OKX' AS system, inst AS symbol, tag AS kind,
-                          side, (pnl - fee) AS net, reason
-                   FROM okx_trades {w2})
-                  UNION ALL
-                  (SELECT closed_at, 'radar-' || plan AS system, symbol,
-                          plan AS kind, '' AS side, pnl_usd AS net, reason
-                   FROM radar_trades {w2})
-                  ORDER BY closed_at DESC LIMIT 50""", p2)
-    if recent:
-        df = pd.DataFrame(recent)
-        df["closed_at"] = pd.to_datetime(df["closed_at"]).dt.tz_convert(TZ)\
-            .dt.strftime("%m-%d %H:%M")
-        st.dataframe(df.rename(columns={
-            "closed_at": "Đóng lúc", "system": "Hệ thống", "symbol": "Symbol",
-            "kind": "Loại", "side": "Chiều", "net": "P&L ròng (U)",
-            "reason": "Lý do"}), width="stretch")
-
-    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
-    now7 = _dt.now(_tz(_td(hours=7))).strftime("%H:%M:%S")
-    st.caption(f"Cập nhật: {now7} (+07) — tự refresh 60s")
+    st.markdown('<div class="small-note">Tu refresh 60s · So lieu paper chi de '
+                'doi chung, khong phai ket qua tien that.</div>',
+                unsafe_allow_html=True)
 
 
 try:
