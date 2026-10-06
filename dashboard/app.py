@@ -35,6 +35,13 @@ SOL_WALLET = "DxYkrsJA6YdS1cqJ9ocPCYRBacd7Xan3DeYWZva89dLd"
 TZ = "Asia/Ho_Chi_Minh"
 TZINFO = timezone(timedelta(hours=7))
 
+try:
+    frag = st.fragment(run_every=60)
+    frag15 = st.fragment(run_every=15)
+except Exception:
+    frag = lambda f: f  # noqa: E731
+    frag15 = lambda f: f  # noqa: E731
+
 # ---------------- CSS (an toan cho ca light & dark theme) ----------------
 st.markdown("""
 <style>
@@ -332,6 +339,81 @@ def radar_positions_block():
             } for p in pp]), width="stretch")
 
 
+def radar_live_equity():
+    """Tinh equity radar paper TRUC TIEP luc render (khong qua snapshot):
+    tong pnl lenh dong + realized vi the mo + unrealized theo gia Jupiter live."""
+    st_ = load_state(RADAR_STATE)
+    if not st_:
+        return None, "khong doc duoc radar_state"
+    pos = st_.get("paper", []) + st_.get("paper_holder", [])
+    # pnl lenh dong tu DB (da sync)
+    r = q("SELECT COALESCE(SUM(pnl_usd),0) AS s FROM radar_trades")
+    closed = float(r[0]["s"]) if r else 0.0
+    # gia batch Jupiter
+    mints = [p.get("token") for p in pos if p.get("token")]
+    marks = {}
+    try:
+        rr = requests.get("https://lite-api.jup.ag/price/v3",
+                           params={"ids": ",".join(dict.fromkeys(mints))},
+                           timeout=10)
+        d = rr.json()
+        for m in mints:
+            px = (d.get(m) or {}).get("usdPrice")
+            if px:
+                marks[m] = float(px)
+    except Exception:
+        pass
+    real_o, unreal = 0.0, 0.0
+    for p in pos:
+        try:
+            real_o += float(p.get("realized", 0) or 0)
+            e = float(p.get("entry", 0) or 0)
+            s = float(p.get("size_usd", 0) or 0)
+            rem = float(p.get("remaining", 1) or 0)
+            mk = marks.get(p.get("token", ""))
+            if e > 0 and s > 0 and rem > 0 and mk:
+                unreal += (mk - e) / e * s * rem
+        except Exception:
+            pass
+    return closed + real_o + unreal, f"{len(pos)} vi the mo"
+
+
+@frag15
+def radar_equity_realtime():
+    st.markdown('<div class="sub2">⚡ Equity realtime</div>',
+                unsafe_allow_html=True)
+    eq, note = radar_live_equity()
+    rows = q("""SELECT ts AT TIME ZONE 'Asia/Ho_Chi_Minh' AS ts, equity
+                FROM equity_snapshots WHERE system='radar'
+                  AND ts >= now() - interval '6 hours'
+                ORDER BY ts""")
+    if eq is None:
+        st.warning(f"Khong tinh duoc equity: {note}")
+        return
+    cls = "pos" if eq >= 0 else "neg"
+    c1, c2 = st.columns([1, 3])
+    with c1:
+        st.markdown(f'<div class="kpi-card" style="border-left-color:'
+                    f'{"#16a34a" if eq >= 0 else "#dc2626"}">'
+                    f'<div class="kpi-label">Equity paper (P&L tich luy)</div>'
+                    f'<div class="kpi-value {cls}">{eq:+.1f} U</div>'
+                    f'<div class="kpi-sub">{note} · live</div></div>',
+                    unsafe_allow_html=True)
+    with c2:
+        if rows:
+            df = pd.DataFrame(rows)
+            df["ts"] = pd.to_datetime(df["ts"])
+            fig = px.line(df, x="ts", y="equity",
+                          title="Equity 6h qua (snapshot 15s)")
+            fig.update_layout(paper_bgcolor="rgba(0,0,0,0)",
+                              plot_bgcolor="rgba(0,0,0,0)",
+                              xaxis_title=None, yaxis_title="U")
+            st.plotly_chart(fig, width="stretch")
+        else:
+            st.info("Chua co snapshot — doi service muse-equity-snap.")
+    st.caption("Tu refresh 15s · P&L tich luy tu dau (paper, chua tru phi giao dich that).")
+
+
 def tab_paper(where, params):
     d = day_filter()
     okx = q(f"SELECT {d} AS day, (pnl - fee) AS net, tag, reason "
@@ -362,6 +444,7 @@ def tab_paper(where, params):
 
     with ptab2:
         section("Radar meme Solana — paper")
+        radar_equity_realtime()
         kpi_cards("Plan scalp", scalp)
         kpi_cards("Plan holder", holder)
 
@@ -464,10 +547,5 @@ def main():
                 'doi chung, khong phai ket qua tien that.</div>',
                 unsafe_allow_html=True)
 
-
-try:
-    frag = st.fragment(run_every=60)
-except Exception:
-    frag = lambda f: f  # noqa: E731
 
 frag(main)()
