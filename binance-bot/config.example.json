@@ -1,5 +1,5 @@
 {
- "_comment_mode": "dry_run = chi log lenh se dat, KHONG goi API xac thuc, khong can key. live = dat lenh that, can env BINANCE_API_KEY/BINANCE_API_SECRET. DOI MODE CAN RESTART.",
+ "_comment_mode": "data_only = chi doc data/tin hieu, khong mo dong vi the. dry_run = log lenh se dat, KHONG goi API xac thuc. live = lenh that, can env BINANCE_API_KEY/BINANCE_API_SECRET. DOI MODE CAN RESTART.",
  "_comment_universe": "universe.json do build_universe.py tao: top USDT-M perp theo volume 24h.",
  "_comment_size": "Moi lenh = order_margin_usdt * leverage notional (100 * 10 = 1000 USDT). Toi da 10 vi the.",
  "_comment_scalp": "TP 1%, SL 0.4% (net R:R ~1.8 sau phi). Breakout dinh/day N nen 5m + loc RSI + trend EMA20 tren 15m.",
@@ -11,6 +11,9 @@
  "_comment_misc": "fee_rate = phi taker Binance USDT-M (0.05%). disabled_symbols: {\"BTCUSDT\": <unix_ts>} de tam nghi 1 coin.",
  "mode": "dry_run",
  "use_testnet": false,
+ "warmup_delay_seconds": 0.75,
+ "order_failure_cooldown_seconds": 30,
+ "order_failure_cooldown_max_seconds": 900,
  "universe_file": "universe.json",
  "universe_top_n": 30,
  "start_equity": 1000.0,

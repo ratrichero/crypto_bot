@@ -10,6 +10,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE)
@@ -32,6 +33,9 @@ _saved = {k: os.environ.pop(k, None)
           for k in ("BINANCE_API_KEY", "BINANCE_API_SECRET")}
 
 import live_binance
+import binance_client
+import binance_safety
+import binance_ws
 import strategy
 from indicators import adx
 import binance_bot
@@ -105,6 +109,19 @@ check("dry_run close pnl positive", rec["pnl"] > 0, rec["pnl"])
 check("dry_run trade recorded", st["stats"]["trades"] == 1)
 check("dry_run no positions left", st["positions"] == [])
 
+# Failed order actions cool both the action and the symbol.
+fail_st = fresh_state()
+fail_eng = live_binance.BinanceEngine(CFG, fail_st, dry_run=True,
+                                      log=lambda _: None)
+fail_eng.get_balance_usdt = lambda: (_ for _ in ()).throw(
+    RuntimeError("synthetic balance failure"))
+_, first_why = fail_eng.open("BTCUSDT", "long", 1000, 50000,
+                             0.004, 0.01, "grid", level="b1")
+_, second_why = fail_eng.open("BTCUSDT", "short", 1000, 50000,
+                              0.004, 0.01, "grid", level="s1")
+check("failed action has cooldown", "action_failed" in first_why)
+check("same symbol is cooled", "cooldown" in second_why)
+
 # --- 5. live engine without keys raises before any network ---
 try:
     live_binance.BinanceEngine(CFG, fresh_state(), dry_run=False)
@@ -112,7 +129,62 @@ try:
 except RuntimeError as e:
     check("live without keys raises", "BINANCE_API_KEY" in str(e))
 
-# --- 6. no withdraw endpoints anywhere in this module (excl. this test) ---
+# --- 6. request safety: rate-limit response is observed once, never retried ---
+class _FakeResponse:
+    status_code = 429
+    headers = {
+        "Retry-After": "7",
+        "X-MBX-USED-WEIGHT-1M": "2400",
+    }
+    text = '{"code":-1003,"msg":"Too many requests; IP banned"}'
+
+    def json(self):
+        return {"code": -1003, "msg": "Too many requests; IP banned"}
+
+
+class _FakeSession:
+    def __init__(self):
+        self.calls = 0
+
+    def get(self, *args, **kwargs):
+        self.calls += 1
+        return _FakeResponse()
+
+
+old_session = binance_client.SESSION
+fake_session = _FakeSession()
+state_fd, state_path = tempfile.mkstemp(prefix="binance-circuit-test-", suffix=".json")
+os.close(state_fd)
+os.remove(state_path)
+binance_client.SESSION = fake_session
+binance_safety.configure(state_path=state_path)
+try:
+    try:
+        binance_client._get("/fapi/v2/ticker/price", tries=3)
+        check("429 raises", False)
+    except binance_safety.BinanceRateLimitError as e:
+        check("429 raises", True)
+        check("429 keeps API code -1003", "api_code=-1003" in str(e))
+    check("429 is not retried", fake_session.calls == 1, fake_session.calls)
+    try:
+        binance_client._get("/fapi/v2/ticker/price", tries=3)
+        check("circuit blocks next request", False)
+    except binance_safety.BinanceCircuitOpen:
+        check("circuit blocks next request", True)
+finally:
+    binance_client.SESSION = old_session
+    binance_safety.reset_for_tests()
+    try:
+        os.remove(state_path)
+    except FileNotFoundError:
+        pass
+
+# --- 7. data-only mode and routed websocket endpoint ---
+data_engine = live_binance.DataOnlyEngine(log=lambda _: None)
+check("data_only has no exchange client", data_engine.ex is None)
+check("WS uses routed market endpoint", "/market/stream?streams=" in binance_ws.URL)
+
+# --- 8. no withdraw endpoints anywhere in this module (excl. this test) ---
 src = ""
 for f in os.listdir(BASE):
     if f.endswith(".py") and f != os.path.basename(__file__):

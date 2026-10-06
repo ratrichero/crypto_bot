@@ -8,7 +8,10 @@ Price ticks arrive real-time via websocket (miniTicker stream). SL/TP +
 grid triggers are checked on a fast loop (~0.5s); candle/strategy work runs
 on a slow loop. Kill switch: create file STOP in this dir.
 
-Modes (config "mode"): "dry_run" | "live" (default "dry_run").
+Modes (config "mode"): "data_only" | "dry_run" | "live"
+(default "dry_run").
+  data_only: public market data/candles and signal calculations only; no
+             simulated positions and no authenticated calls.
   dry_run: signals flow through BinanceEngine but ONLY LOGGED, zero
            authenticated calls, no API key needed.
   live:    places real orders on Binance, needs env BINANCE_API_KEY /
@@ -21,6 +24,7 @@ import traceback
 from datetime import datetime, timezone
 
 import binance_client
+import binance_safety
 import strategy
 from indicators import atr
 from binance_ws import BinanceWS
@@ -37,15 +41,23 @@ STOP_P = os.path.join(BASE, "STOP")
 FAST_POLL = CFG.get("fast_poll_seconds", 0.5)
 SLOW_EVERY = 10          # slow tasks every N fast loops (~5s)
 CANDLE_PER_SLOW = 2      # symbols refreshed per slow tick
+WARMUP_DELAY = float(CFG.get("warmup_delay_seconds", 0.75))
 MODE = CFG.get("mode", "dry_run")
+DATA_ONLY = MODE == "data_only"
+LOCK_P = os.path.join(BASE, "bot.lock")
+CIRCUIT_P = os.path.join(BASE, "binance_circuit.json")
 
 
 def make_engine(st):
+    if MODE == "data_only":
+        from live_binance import DataOnlyEngine
+        return DataOnlyEngine(log=log)
     if MODE in ("dry_run", "live"):
         from live_binance import BinanceEngine
         return BinanceEngine(CFG, st, dry_run=(MODE == "dry_run"), log=log)
     raise SystemExit(
-        "config 'mode' khong hop le: %r (chon dry_run|live)" % (MODE,))
+        "config 'mode' khong hop le: %r (chon data_only|dry_run|live)" %
+        (MODE,))
 
 
 def log(msg):
@@ -112,13 +124,16 @@ def record_trade(rec):
 
 
 def rest_tickers_fallback():
+    """Low-weight REST fallback; never hide a rate-limit/circuit signal."""
     try:
-        rows = binance_client.get_ticker_24h()
+        rows = binance_client.get_symbol_prices()
         want = set(SYMBOLS)
-        return {r["symbol"]: float(r["lastPrice"]) for r in rows
-                if r["symbol"] in want and r.get("lastPrice")}
+        return {r["symbol"]: float(r["price"]) for r in rows
+                if r["symbol"] in want and r.get("price")}
+    except binance_safety.BinanceSafetyStop:
+        raise
     except Exception as e:
-        log(f"fallback tickers failed: {e}")
+        log(f"fallback prices failed: {e}")
         return {}
 
 
@@ -132,14 +147,22 @@ def update_positions(engine, st, symbol, price):
     for pos in [p for p in st["positions"] if p["symbol"] == symbol]:
         if pos["side"] == "long":
             if pos["sl"] and price <= pos["sl"]:
-                closed.append(engine.close(pos, pos["sl"], "SL"))
+                rec = engine.close(pos, pos["sl"], "SL")
+                if rec:
+                    closed.append(rec)
             elif pos["tp"] and price >= pos["tp"]:
-                closed.append(engine.close(pos, pos["tp"], "TP"))
+                rec = engine.close(pos, pos["tp"], "TP")
+                if rec:
+                    closed.append(rec)
         else:
             if pos["sl"] and price >= pos["sl"]:
-                closed.append(engine.close(pos, pos["sl"], "SL"))
+                rec = engine.close(pos, pos["sl"], "SL")
+                if rec:
+                    closed.append(rec)
             elif pos["tp"] and price <= pos["tp"]:
-                closed.append(engine.close(pos, pos["tp"], "TP"))
+                rec = engine.close(pos, pos["tp"], "TP")
+                if rec:
+                    closed.append(rec)
     for rec in closed:
         record_trade(rec)
         g = st["grids"].get(symbol)
@@ -177,8 +200,33 @@ def manage_scalp(engine, st, symbol, price, c5, c15):
         log(f"OPEN #{pos['id']} {symbol} scalp {sig} entry={pos['entry']:.4f} "
             f"sl={pos['sl']:.4f} tp={pos['tp']:.4f} info={info}")
         return True
+    if str(why).startswith(("cooldown", "symbol cooldown")):
+        return False
     log(f"Scalp {symbol} {sig} rejected: {why}")
     return False
+
+
+def acquire_instance_lock():
+    """Prevent two bot copies from sharing the same IP/request budget."""
+    try:
+        import fcntl
+    except ImportError:
+        log("WARNING fcntl unavailable; cannot enforce single-instance lock")
+        return None
+    fh = open(LOCK_P, "a+")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fh.close()
+        raise SystemExit(
+            "binance-bot dang chay (lock=%s); khong khoi dong them instance" %
+            LOCK_P
+        )
+    fh.seek(0)
+    fh.truncate()
+    fh.write("pid=%d\\n" % os.getpid())
+    fh.flush()
+    return fh
 
 
 def manage_grid(engine, st, symbol, price):
@@ -224,16 +272,35 @@ def manage_grid(engine, st, symbol, price):
 
 
 def main():
+    # One process per host/IP.  This lock is held for the lifetime of main.
+    lock_handle = acquire_instance_lock()
+    binance_client.configure(log, state_path=CIRCUIT_P)
+    try:
+        binance_safety.ensure_allowed()
+    except binance_safety.BinanceSafetyStop as e:
+        log("START BLOCKED by Binance safety circuit: %s" % e)
+        return
+
     st = load_state()
-    engine = make_engine(st)
+    try:
+        engine = make_engine(st)
+    except binance_safety.BinanceSafetyStop as e:
+        log("START STOPPED by Binance safety circuit: %s" % e)
+        save_state(st)
+        return
+    except Exception:
+        log("ENGINE START ERROR:\n" + traceback.format_exc())
+        save_state(st)
+        return
     log(f"Bot start MULTI-TICK (Binance). {len(SYMBOLS)} symbols, "
-        f"fast={FAST_POLL}s, equity={st['equity']:.2f} MODE={MODE}")
+        f"fast={FAST_POLL}s, equity={st['equity']:.2f} MODE={MODE} "
+        f"single_instance={bool(lock_handle)}")
 
     ws = BinanceWS(SYMBOLS, log)
     ws.start()
 
     candles = {}
-    log("Warmup: fetching candles...")
+    log("Warmup: fetching candles with shared session/rate limiter...")
     for symbol in SYMBOLS:
         try:
             candles[symbol] = {
@@ -241,9 +308,15 @@ def main():
                 "15m": binance_client.get_klines(symbol, "15m", 100),
                 "ts": time.time(),
             }
+        except binance_safety.BinanceSafetyStop as e:
+            log("WARMUP STOPPED by Binance safety circuit: %s" % e)
+            ws.stop()
+            save_state(st)
+            return
         except Exception as e:
             log(f"warmup {symbol} failed: {e}")
-        time.sleep(0.2)
+        # Stagger symbols so startup does not create a request burst.
+        time.sleep(WARMUP_DELAY)
     log(f"Warmup done: {len(candles)}/{len(SYMBOLS)}")
 
     prices = {}
@@ -257,7 +330,11 @@ def main():
                 log("STOP file -> shutdown")
                 ws.stop()
                 save_state(st)
+                binance_client.close()
                 return
+            if ws.fatal_error:
+                raise binance_safety.BinanceSafetyStop(ws.fatal_error)
+            binance_safety.ensure_allowed()
 
             if st["day"] != utc_day():
                 st["day"] = utc_day()
@@ -266,7 +343,7 @@ def main():
                 st["halt_reason"] = ""
                 log(f"New day {st['day']}")
 
-            # ---- prices: WS live, REST fallback at most every 10s ----
+            # ---- prices: routed WS live, low-weight REST fallback ----
             now = time.time()
             if now - last_cfg_reload > 60:
                 try:
@@ -277,9 +354,10 @@ def main():
                     log(f"cfg reload failed: {e}")
                 last_cfg_reload = now
             if ws.healthy():
-                prices = dict(ws.prices)
+                prices = ws.snapshot()
             elif now - last_rest_px > 30:
-                # fallback REST khi WS rot: toi da 30s/lan de tranh 429/418
+                # /fapi/v2/ticker/price without symbol has weight 2, versus
+                # weight 40 for the all-symbol 24h statistics endpoint.
                 prices.update(rest_tickers_fallback())
                 last_rest_px = now
             if not prices:
@@ -288,28 +366,30 @@ def main():
 
             dirty = False
 
-            # ---- FAST PATH: SL/TP + grid triggers every tick-loop ----
-            for symbol in SYMBOLS:
-                px = prices.get(symbol)
-                if px is None:
-                    continue
-                if update_positions(engine, st, symbol, px):
-                    dirty = True
-            if not st["halted"]:
+            # ---- FAST PATH: only trading modes may mutate positions/orders
+            if not DATA_ONLY:
                 for symbol in SYMBOLS:
                     px = prices.get(symbol)
-                    cc = candles.get(symbol)
-                    if px is None or not cc:
+                    if px is None:
                         continue
-                    regime = st["regimes"].get(symbol, {}).get("regime", "ranging")
-                    if regime == "ranging" and not is_disabled(symbol):
-                        if manage_grid(engine, st, symbol, px):
-                            dirty = True
+                    if update_positions(engine, st, symbol, px):
+                        dirty = True
+                if not st["halted"]:
+                    for symbol in SYMBOLS:
+                        px = prices.get(symbol)
+                        cc = candles.get(symbol)
+                        if px is None or not cc:
+                            continue
+                        regime = st["regimes"].get(symbol, {}).get("regime", "ranging")
+                        if regime == "ranging" and not is_disabled(symbol):
+                            if manage_grid(engine, st, symbol, px):
+                                dirty = True
 
-            # ---- SLOW PATH: candles + regime + scalp entries ----
+            # ---- SLOW PATH: candles + regime + optional scalp entries ----
             if loop % SLOW_EVERY == 0:
                 due = [s for s in SYMBOLS
-                       if now - candles.get(s, {}).get("ts", 0) > CFG["candle_refresh_seconds"]]
+                       if now - candles.get(s, {}).get("ts", 0)
+                       > CFG["candle_refresh_seconds"]]
                 for symbol in due[:CANDLE_PER_SLOW]:
                     try:
                         candles[symbol] = {
@@ -317,7 +397,9 @@ def main():
                             "15m": binance_client.get_klines(symbol, "15m", 100),
                             "ts": time.time(),
                         }
-                        time.sleep(0.5)  # gian request tranh 429
+                        time.sleep(0.5)  # them gian request giua cac symbol
+                    except binance_safety.BinanceSafetyStop:
+                        raise
                     except Exception as e:
                         log(f"candle refresh {symbol} failed: {e}")
                 if not st["halted"]:
@@ -326,7 +408,9 @@ def main():
                         cc = candles.get(symbol)
                         if px is None or not cc or not cc.get("15m"):
                             continue
-                        regime, av = strategy.detect_regime(cc["15m"], CFG["adx_threshold"])
+                        regime, av = strategy.detect_regime(
+                            cc["15m"], CFG["adx_threshold"]
+                        )
                         prev = st["regimes"].get(symbol, {}).get("regime")
                         st["regimes"][symbol] = {"regime": regime, "adx": av}
                         if regime != prev and prev is not None:
@@ -346,20 +430,28 @@ def main():
                             astep = g["step_pct"]
                         st["grids"].setdefault(
                             symbol, {"anchor": None, "taken": {}})["step"] = astep
-                        if regime == "trending" and not is_disabled(symbol):
-                            if manage_scalp(engine, st, symbol, px, cc["5m"], cc["15m"]):
+                        if (not DATA_ONLY and regime == "trending"
+                                and not is_disabled(symbol)):
+                            if manage_scalp(engine, st, symbol,
+                                            px, cc["5m"], cc["15m"]):
                                 dirty = True
 
-            # ---- daily stop ----
-            if st["day_start_equity"] > 0:
-                dp = (st["equity"] - st["day_start_equity"]) / st["day_start_equity"]
-                if not st["halted"] and dp <= -CFG["risk"]["daily_max_loss_pct"]:
+            # ---- daily stop (never sends closes in data_only mode) ----
+            if not DATA_ONLY and st["day_start_equity"] > 0:
+                dp = ((st["equity"] - st["day_start_equity"])
+                      / st["day_start_equity"])
+                if (not st["halted"]
+                        and dp <= -CFG["risk"]["daily_max_loss_pct"]):
                     st["halted"] = True
                     st["halt_reason"] = f"daily stop {dp*100:.2f}%"
                     for pos in list(st["positions"]):
-                        rec = engine.close(pos, prices.get(pos["symbol"], pos["entry"]),
-                                           "DAILY_STOP")
-                        record_trade(rec)
+                        rec = engine.close(
+                            pos,
+                            prices.get(pos["symbol"], pos["entry"]),
+                            "DAILY_STOP",
+                        )
+                        if rec:
+                            record_trade(rec)
                     st["grids"] = {}
                     dirty = True
                     log(f"HALTED {st['halt_reason']} eq={st['equity']:.2f}")
@@ -370,8 +462,17 @@ def main():
             if now - last_heartbeat > 600:
                 u = engine.unrealized(prices)
                 log(f"heartbeat eq={st['equity']:.2f} unreal={u:+.2f} "
-                    f"pos={len(st['positions'])} ws={ws.healthy()}")
+                    f"pos={len(st['positions'])} ws={ws.healthy()} "
+                    f"mode={MODE}")
                 last_heartbeat = now
+        except binance_safety.BinanceSafetyStop as e:
+            # Critical rule: 429/418/-1003 and a persisted circuit stop all
+            # REST/private trading; do not let the 0.5s loop retry it.
+            log("SAFETY STOP: %s" % e)
+            ws.stop()
+            save_state(st)
+            binance_client.close()
+            return
         except Exception:
             log("LOOP ERROR:\n" + traceback.format_exc())
         time.sleep(FAST_POLL)

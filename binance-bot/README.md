@@ -6,18 +6,24 @@ vì volume lớn hơn**; code OKX giữ nguyên không đụng.
 ## Kiến trúc
 
 ```
-binance_bot.py      Vong lap chinh: WS gia real-time -> SL/TP + grid trigger
-                    (~0.5s); nen/regime/scalp tren slow loop. Kill switch: file STOP.
+binance_bot.py      Vong lap chinh: routed WS gia real-time -> SL/TP + grid
+                    trigger (~0.5s); nen/regime/scalp tren slow loop. Kill
+                    switch: file STOP; single-instance lock theo IP.
 live_binance.py     Engine dat lenh that qua ccxt (binanceusdm), che do
-                    dry_run | live. SL/TP do process tu canh gia roi dong
-                    market reduce-only (giong bot OKX).
-binance_ws.py       WS public: 1 combined stream !miniTicker@arr cho moi symbol.
-binance_client.py   REST public: klines, ticker 24h, exchangeInfo.
+                    data_only | dry_run | live. Private calls co governor,
+                    circuit breaker va cooldown theo symbol/action.
+binance_ws.py       WS public routed /market/stream, 1 connection, reconnect
+                    exponential backoff, khong reconnect storm.
+binance_client.py   REST public shared requests.Session + request metrics,
+                    rate limiter, status/API-code logging; fallback dung
+                    ticker price weight thap.
+binance_safety.py   Governor theo public-IP scope/endpoint va circuit state
+                    persistent; 429/418/-1003 khong retry.
 build_universe.py   Top USDT-M perp theo quote volume 24h -> universe.json.
 strategy.py         Tin hieu scalp + regime (copy y het tu trading-bot/).
 indicators.py       EMA/RSI/ADX/ATR thuan python (copy y het tu trading-bot/).
 config.example.json Mau config day du, co ghi chu tung tham so.
-test_binance.py     Smoke test offline (39 checks).
+test_binance.py     Smoke test offline.
 ```
 
 `strategy.py` và `indicators.py` là bản copy verbatim từ `trading-bot/` để
@@ -60,9 +66,13 @@ Nếu sửa logic chiến thuật, sửa cả hai nơi.
 
 ## Mô hình an toàn
 
-- `mode`: `dry_run` (mặc định) | `live`. Đổi mode phải restart.
+- `mode`: `data_only` | `dry_run` (mặc định) | `live`. Đổi mode phải restart.
+- **data_only**: chỉ đọc market data/candles và chạy regime/tín hiệu; không
+  tạo vị thế paper, không gọi API xác thực. Đây là mode đầu tiên cần chạy sau
+  khi IP hết ban.
 - **dry_run**: không cần key, **không gọi bất kỳ API xác thực nào** (kể cả
-  read-only), chỉ log "lệnh sẽ đặt". Dùng để kiểm tra tín hiệu/chiến thuật.
+  read-only), chỉ log "lệnh sẽ đặt". Dùng sau data-only để kiểm tra wiring
+  của chiến lược mà chưa đặt lệnh.
 - **live**: đọc key từ biến môi trường `BINANCE_API_KEY` /
   `BINANCE_API_SECRET`. Không hardcode, không ghi vào file, không log.
   Thiếu 1 trong 2 → từ chối khởi động (fail closed).
@@ -73,17 +83,41 @@ Nếu sửa logic chiến thuật, sửa cả hai nơi.
   vị thế không có stop cho tới khi watchdog/systemd dựng lại. Chưa nên
   scale size lớn khi chưa có stop dự phòng trên sàn.
 
-## Chạy thử (dry-run)
+## Rate-limit / IP-ban guard
+
+- Mọi REST public dùng một `requests.Session` và governor chung theo
+  `BINANCE_IP_SCOPE` + endpoint. Bot giữ một `bot.lock` để không có hai bản
+  cùng host cùng đốt request budget.
+- Log mỗi request có `request_id`, endpoint, HTTP status, Binance API code,
+  latency, `X-MBX-USED-WEIGHT-*` và `Retry-After` (body được redact).
+- HTTP **429**, **418**, hoặc API code **-1003** mở circuit persistent trong
+  `binance_circuit.json`, dừng mọi request/trading và **không retry**. Không
+  restart bot liên tục; kiểm tra mọi process dùng chung public IP trước.
+- Lỗi order/private theo từng symbol/action có exponential cooldown
+  (mặc định 30 giây → tối đa 15 phút), nên không lặp lại mỗi 0,5 giây.
+- Nếu `bot.log` có `SAFETY STOP`, hãy lấy dòng `BINANCE HTTP/CCXT` ngay trước
+  đó để biết status/code thực tế; không xoá circuit state để ép chạy lại.
+  Lệnh xem nhanh: `grep -E 'BINANCE (HTTP|CCXT)|SAFETY STOP|CIRCUIT' bot.log`.
+
+## Chạy thử (data-only → dry-run)
 
 ```bash
 pip install -r requirements.txt
 cp config.example.json config.json
-python3 build_universe.py        # tao universe.json (can mang, public API)
 python3 test_binance.py          # smoke test offline, khong can key
-python3 binance_bot.py           # chay dry-run: chi log, khong dat lenh that
+python3 build_universe.py        # tao universe.json (public API, 1 lan)
+# lan dau: sua mode thanh data_only, sau do chay mot minh bot
+python3 binance_bot.py           # chi public data/candles, khong mo vi the
+# sau khi data_only on dinh: sua mode thanh dry_run va restart
+python3 binance_bot.py           # mo phong/log lenh, van khong dat lenh that
 ```
 
 ## Lên live (cần Cường duyệt từng bước)
+
+Chỉ chuyển sang `live` sau khi `data_only` và `dry_run` đã chạy ổn định,
+không có `429`, `418`, `-1003`, WS reconnect storm hoặc lỗi payload. Tham
+chiếu tài liệu chính thức Binance về [USDⓈ-M REST](https://developers.binance.com/docs/derivatives/usds-margined-futures/general-info)
+và [market WebSocket](https://developers.binance.com/docs/derivatives/usds-margined-futures/websocket-market-streams).
 
 1. Trên Binance: tạo API key **chỉ Trade Futures**, **tắt Withdraw**,
    whitelist IP VPS.
