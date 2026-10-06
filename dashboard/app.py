@@ -337,15 +337,27 @@ def binance_equity_realtime():
 @frag
 def live_kpi_frag(where, params):
     d = day_filter()
-    bn = q(f"SELECT {d} AS day, pnl AS net, tag, reason, live, dry "
-           f"FROM binance_trades {where} ORDER BY closed_at", params)
-    kpi_cards("Hieu suat", bn)
-    n = len(bn)
-    n_live = sum(1 for r in bn if r.get("live") and not r.get("dry"))
-    n_dry = sum(1 for r in bn if r.get("dry"))
-    if n:
-        st.caption(f"Trong do: {n_live} lenh LIVE tien that, {n_dry} lenh dry-run.")
-    pnl_charts(daily_df(bn), "Binance LIVE")
+
+    def tag_where(tag):
+        base = where.strip()
+        cond = f"tag = '{tag}'"
+        if not base:
+            return f"WHERE {cond}", params
+        return f"{base} AND {cond}", params
+
+    for tag, title in (("scalp", "⚡ Scalp"), ("grid", "🔲 Grid")):
+        w, p = tag_where(tag)
+        rows = q(f"SELECT {d} AS day, pnl AS net, tag, reason, live, dry "
+                 f"FROM binance_trades {w} ORDER BY closed_at", p)
+        kpi_cards(f"Hieu suat {title}", rows)
+        n = len(rows)
+        n_live = sum(1 for r in rows if r.get("live") and not r.get("dry"))
+        n_dry = sum(1 for r in rows if r.get("dry"))
+        if n:
+            st.caption(f"Trong do: {n_live} lenh LIVE tien that, "
+                       f"{n_dry} lenh dry-run.")
+        pnl_charts(daily_df(rows), f"Binance LIVE {title}")
+        st.divider()
 
     rbn = q("""SELECT closed_at, symbol, side, tag, pnl AS net, reason,
                       live, dry
