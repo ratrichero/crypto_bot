@@ -26,6 +26,9 @@ build_universe.py   Top USDT-M perp theo quote volume 24h -> universe.json.
 strategy.py         Tin hieu scalp + regime (copy y het tu trading-bot/).
 indicators.py       EMA/RSI/ADX/ATR thuan python (copy y het tu trading-bot/).
 config.example.json Mau config day du, co ghi chu tung tham so.
+backtest.py         Historical simulator + public data/funding downloader +
+                    rolling train/test walk-forward.
+test_backtest.py    Regression tests for closed candles, fills, costs and OOS.
 test_binance.py     Smoke test offline.
 ```
 
@@ -134,6 +137,50 @@ Nếu sửa logic chiến thuật, sửa cả hai nơi.
 - Nếu `bot.log` có `SAFETY STOP`, hãy lấy dòng `BINANCE HTTP/CCXT` ngay trước
   đó để biết status/code thực tế; không xoá circuit state để ép chạy lại.
   Lệnh xem nhanh: `grep -E 'BINANCE (HTTP|CCXT)|SAFETY STOP|CIRCUIT' bot.log`.
+
+## P1: backtest / walk-forward (offline, trước Testnet/live)
+
+`backtest.py` dùng Python standard library, không import exchange client và
+không đọc API key. Dữ liệu giá là nến 5m đã đóng; 15m được aggregate từ 5m
+và nến đang hình thành bị loại khỏi regime/EMA/RSI/breakout signal. Có thể tải
+dữ liệu public Binance USD-M rồi chạy đánh giá:
+
+```bash
+# Không cần key; chỉ gọi public market-data endpoint
+python3 backtest.py download --symbol BTCUSDT --days 90 \
+  --output /tmp/btcusdt-5m.jsonl
+python3 backtest.py download-funding --symbol BTCUSDT --days 90 \
+  --output /tmp/btcusdt-funding.jsonl
+
+# OOS là tiêu chí chính; không ghi params tối ưu vào config/live config
+python3 backtest.py walk-forward --data /tmp/btcusdt-5m.jsonl \
+  --funding-data /tmp/btcusdt-funding.jsonl --symbol BTCUSDT \
+  --train-days 30 --test-days 7 --step-days 7 \
+  --json-out /tmp/btcusdt-walk-forward.json
+
+# Một config cố định, hữu ích để kiểm tra baseline/cost model
+python3 backtest.py single --data /tmp/btcusdt-5m.jsonl \
+  --funding-data /tmp/btcusdt-funding.jsonl --symbol BTCUSDT \
+  --json-out /tmp/btcusdt-single.json
+python3 test_backtest.py
+```
+
+Walk-forward chỉ search ba tham số exit/grid nhỏ (`scalp.tp_pct`,
+`scalp.sl_pct`, `grid.step_mult`); leverage, margin, exposure cap và risk
+limits giữ nguyên theo config. Mỗi fold tách train và test theo thời gian,
+parameter chỉ chọn trên train, còn kết quả OOS từng window nằm trong
+`folds_detail`. Report gồm return/P&L, max drawdown, profit factor, win rate,
+trade count, expectancy, taker fees, slippage, funding, exposure, daily-stop,
+grid-basket-stop và ambiguous intrabar events. Khi không truyền
+`--funding-data`, report ghi rõ
+`funding_status=not_supplied` và không giả định funding bằng 0.
+
+OHLC không cho biết thứ tự chính xác khi cùng nến chạm TP và SL. Simulator
+chọn intrabar path bảo thủ (`bullish: open → low → high → close`, `bearish:
+open → high → low → close`) và ưu tiên SL trong trường hợp không xác định.
+OOS synthetic là kiểm tra model/code, không phải bằng chứng strategy có lợi
+nhuận; chỉ xem xét Testnet sau khi OOS trên dữ liệu thật và cost/funding
+đầy đủ được duyệt.
 
 ## Chạy thử (data-only → dry-run)
 
