@@ -386,12 +386,14 @@ def solana_kpi_frag():
                 f'{status}</div></div>', unsafe_allow_html=True)
 
 
-def tab_live(where, params):
+def tab_live_binance(where, params):
     section("📈 Binance Futures — LIVE (tien that)")
     binance_equity_realtime()
     live_kpi_frag(where, params)
     binance_live_positions_block()
-    st.divider()
+
+
+def tab_live_radar():
     solana_kpi_frag()
 
 
@@ -653,18 +655,16 @@ def radar_trades_frag(where, params):
                  "50 lenh radar gan nhat")
 
 
-def tab_paper(where, params):
-    ptab1, ptab2 = st.tabs(["🤖 Bot OKX", "🦅 Radar meme"])
+def tab_paper_okx(where, params):
+    okx_kpi_frag(where, params)
 
-    with ptab1:
-        okx_kpi_frag(where, params)
 
-    with ptab2:
-        section("Radar meme Solana — paper")
-        radar_equity_realtime()
-        radar_kpi_frag(where, params)
-        radar_positions_block()
-        radar_trades_frag(where, params)
+def tab_paper_radar(where, params):
+    section("Radar meme Solana — paper")
+    radar_equity_realtime()
+    radar_kpi_frag(where, params)
+    radar_positions_block()
+    radar_trades_frag(where, params)
 
 
 # ---------------- main ----------------
@@ -688,11 +688,17 @@ def main():
         where = "WHERE closed_at >= now() - make_interval(days => %s)"
         params = (days,)
 
-    tab_live_, tab_paper_ = st.tabs(["🔴 LIVE — Tien that", "📄 PAPER — Chay thu"])
-    with tab_live_:
-        tab_live(where, params)
-    with tab_paper_:
-        tab_paper(where, params)
+    t1, t2, t3, t4 = st.tabs([
+        "🔴 Live Binance", "☀️ Live Radar",
+        "📄 Paper OKX", "🦅 Paper Radar"])
+    with t1:
+        tab_live_binance(where, params)
+    with t2:
+        tab_live_radar()
+    with t3:
+        tab_paper_okx(where, params)
+    with t4:
+        tab_paper_radar(where, params)
 
     st.divider()
     st.markdown('<div class="small-note">Vi the & equity live tu refresh '
