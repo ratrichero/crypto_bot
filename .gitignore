@@ -16,3 +16,6 @@ venv/
 # streamlit / os
 .DS_Store
 .streamlit/
+
+# local secrets (never commit)
+.db_url
