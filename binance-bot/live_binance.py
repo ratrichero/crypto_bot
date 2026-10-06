@@ -143,6 +143,9 @@ class BinanceEngine:
                     "defaultType": "future",
                     "adjustForTimeDifference": True,
                     "recvWindow": int(cfg.get("recv_window_ms", 5000)),
+                    # Tat warning khi fetchOpenOrders khong co symbol
+                    # (ta chu dong chap nhan weight 40)
+                    "fetchOpenOrders": {"warnWithoutSymbol": False},
                 },
             })
             if cfg.get("use_testnet"):
