@@ -51,3 +51,21 @@ CREATE TABLE IF NOT EXISTS equity_snapshots (
     equity  DOUBLE PRECISION,
     PRIMARY KEY (ts, system)
 );
+
+CREATE TABLE IF NOT EXISTS binance_trades (
+    id          BIGINT PRIMARY KEY,          -- id tu binance-bot/trades.jsonl
+    symbol      TEXT NOT NULL,               -- BTCUSDT ...
+    side        TEXT,                        -- long | short
+    tag         TEXT,                        -- scalp | grid
+    entry       DOUBLE PRECISION,
+    exit        DOUBLE PRECISION,
+    notional    DOUBLE PRECISION,
+    pnl         DOUBLE PRECISION,            -- P&L rong (da tru phi o bot)
+    reason      TEXT,                        -- TP | SL | ...
+    closed_at   TIMESTAMPTZ NOT NULL,
+    live        BOOLEAN,                     -- true = tien that
+    dry         BOOLEAN,                     -- true = dry-run
+    close_ord   TEXT                         -- order id dong lenh
+);
+CREATE INDEX IF NOT EXISTS idx_binance_trades_closed ON binance_trades (closed_at);
+CREATE INDEX IF NOT EXISTS idx_binance_trades_tag    ON binance_trades (tag);

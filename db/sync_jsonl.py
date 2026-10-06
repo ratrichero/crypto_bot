@@ -9,6 +9,7 @@ Usage:
     DATABASE_URL=postgres://... python3 sync_jsonl.py \
         --trading-bot ~/workspace/trading-bot \
         --meme-radar  ~/workspace/meme-radar [--interval 60] [--once]
+        [--binance-bot ~/path/to/binance-bot]
 """
 import argparse
 import json
@@ -37,6 +38,12 @@ RADAR_SQL = """INSERT INTO radar_trades
 
 WALLET_SQL = """INSERT INTO wallets (address, label, src) VALUES (%s,%s,%s)
     ON CONFLICT (address) DO UPDATE SET label = EXCLUDED.label, src = EXCLUDED.src"""
+
+BINANCE_SQL = """INSERT INTO binance_trades
+    (id, symbol, side, tag, entry, exit, notional, pnl, reason, closed_at,
+     live, dry, close_ord)
+    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s, to_timestamp(%s), %s,%s,%s)
+    ON CONFLICT (id) DO NOTHING"""
 
 
 def ts():
@@ -135,6 +142,24 @@ def sync_wallets(path, st):
     return len(vals)
 
 
+def sync_binance(path, st):
+    rows, off = tail_new(path, st.get("binance", 0))
+    vals = []
+    for t in rows:
+        if "id" not in t:
+            continue
+        vals.append((int(t["id"]), t.get("symbol"), t.get("side"), t.get("tag"),
+                     t.get("entry"), t.get("exit"),
+                     float(t.get("notional", 0) or 0), t.get("pnl"),
+                     t.get("reason"), t.get("closed_at"),
+                     bool(t.get("live")), bool(t.get("dry")),
+                     t.get("close_ord")))
+    if vals:
+        pg.executemany(BINANCE_SQL, vals)
+    st["binance"] = off
+    return len(vals)
+
+
 def run_once(a, st):
     n1 = sync_okx(os.path.join(a.trading_bot, "trades.jsonl"), st)
     n2 = sync_radar(os.path.join(a.meme_radar, "paper_trades.jsonl"),
@@ -142,10 +167,13 @@ def run_once(a, st):
     n3 = sync_radar(os.path.join(a.meme_radar, "paper_trades_holder.jsonl"),
                     "holder", "radar_holder", st)
     n4 = sync_wallets(os.path.join(a.meme_radar, "wallets.json"), st)
-    total = n1 + n2 + n3
+    n5 = 0
+    if a.binance_bot:
+        n5 = sync_binance(os.path.join(a.binance_bot, "trades.jsonl"), st)
+    total = n1 + n2 + n3 + n5
     if total or n4:
         print(f"[{ts()}] sync: okx +{n1}, radar_scalp +{n2}, "
-              f"radar_holder +{n3}, wallets {n4} vi", flush=True)
+              f"radar_holder +{n3}, binance +{n5}, wallets {n4} vi", flush=True)
     else:
         print(f"[{ts()}] sync: khong co dong moi", flush=True)
     return total
@@ -155,6 +183,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--trading-bot", required=True)
     ap.add_argument("--meme-radar", required=True)
+    ap.add_argument("--binance-bot", default=None,
+                    help="thu muc binance-bot (optional); sync trades.jsonl -> binance_trades")
     ap.add_argument("--interval", type=int, default=60)
     ap.add_argument("--once", action="store_true",
                     help="chay 1 vong roi thoat (dung de test)")

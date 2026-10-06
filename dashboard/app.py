@@ -1,4 +1,4 @@
-"""Dashboard theo doi bot OKX + radar meme Solana. Tieng Viet.
+"""Dashboard theo doi bot Binance LIVE + OKX paper + radar meme Solana. Tieng Viet.
 
 Chay:  DATABASE_URL=postgres://... streamlit run app.py
 Tu refresh 60s. Vi the dang mo doc truc tiep tu state file cua bot.
@@ -15,6 +15,8 @@ import streamlit as st
 st.set_page_config(page_title="Crypto Bots Dashboard", layout="wide")
 
 DB = os.environ.get("DATABASE_URL")
+BINANCE_STATE = os.environ.get("BINANCE_STATE",
+                               "/home/ubuntu/muse_bot/binance-bot/state.json")
 OKX_STATE = os.environ.get("OKX_STATE",
                            os.path.expanduser("~/workspace/trading-bot/state.json"))
 RADAR_STATE = os.environ.get("RADAR_STATE",
@@ -111,6 +113,72 @@ def main():
     where, params = _where(1)
 
     d = day_filter()
+
+    # ================= BINANCE LIVE (tien that) =================
+    st.header("🔴 Binance LIVE — tiền thật")
+    bn = q(f"SELECT {d} AS day, pnl AS net, tag, reason, live, dry "
+           f"FROM binance_trades {where} ORDER BY closed_at", params)
+    pnl, wr, pf, exp, n = metrics(bn)
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("P&L ròng", f"{pnl:+.1f} U")
+    c2.metric("Winrate", f"{wr:.0%}")
+    c3.metric("Profit factor", f"{pf:.2f}")
+    c4.metric("Kỳ vọng/lệnh", f"{exp:+.2f} U")
+    c5.metric("Số lệnh", f"{n}")
+    n_live = sum(1 for r in bn if r.get("live") and not r.get("dry"))
+    n_dry = sum(1 for r in bn if r.get("dry"))
+    if n:
+        st.caption(f"Trong đó: {n_live} lệnh LIVE tiền thật, {n_dry} lệnh dry-run.")
+
+    bnd = daily_df(bn)
+    if not bnd.empty:
+        c1, c2 = st.columns(2)
+        with c1:
+            st.plotly_chart(px.line(bnd, x="day", y="cum",
+                                    title="Binance LIVE — P&L cộng dồn (U)"),
+                            width="stretch")
+        with c2:
+            st.plotly_chart(px.bar(bnd, x="day", y="net",
+                                   title="Binance LIVE — P&L từng ngày (U)"),
+                            width="stretch")
+    else:
+        st.info("Binance LIVE chưa có lệnh đóng trong khoảng đã chọn.")
+
+    try:
+        import json
+        b_st = json.load(open(BINANCE_STATE))
+        bpos = b_st.get("positions", [])
+        st.subheader(f"Vị thế đang mở: {len(bpos)} "
+                     f"(equity {b_st.get('equity', '?')})")
+        if bpos:
+            st.dataframe(pd.DataFrame([{
+                "ID": p.get("id"), "Symbol": p.get("symbol"),
+                "Chiều": p.get("side"), "Loại": p.get("tag"),
+                "Entry": p.get("entry"), "SL": p.get("sl"), "TP": p.get("tp"),
+                "Notional": p.get("notional"),
+            } for p in bpos]), width="stretch")
+    except Exception as e:
+        st.warning(f"Không đọc được {BINANCE_STATE}: {e}")
+
+    st.subheader("50 lệnh Binance gần nhất")
+    rbn = q("""SELECT closed_at, symbol, side, tag, pnl AS net, reason,
+                      live, dry
+               FROM binance_trades ORDER BY closed_at DESC LIMIT 50""")
+    if rbn:
+        dfb = pd.DataFrame(rbn)
+        dfb["closed_at"] = pd.to_datetime(dfb["closed_at"]).dt.tz_convert(TZ)\
+            .dt.strftime("%m-%d %H:%M")
+        dfb["chế độ"] = dfb.apply(
+            lambda r: "LIVE" if (r["live"] and not r["dry"]) else "dry-run",
+            axis=1)
+        st.dataframe(dfb[["closed_at", "symbol", "side", "tag", "net",
+                           "reason", "chế độ"]].rename(columns={
+            "closed_at": "Đóng lúc", "symbol": "Symbol", "side": "Chiều",
+            "tag": "Loại", "net": "P&L ròng (U)", "reason": "Lý do"}),
+            width="stretch")
+
+    st.divider()
+
     okx = q(f"SELECT {d} AS day, (pnl - fee) AS net, tag, reason "
             f"FROM okx_trades {where} ORDER BY closed_at", params)
     scalp = q(f"SELECT {d} AS day, pnl_usd AS net, wallet "
