@@ -19,3 +19,5 @@ venv/
 
 # local secrets (never commit)
 .db_url
+config.live.json
+.solana_key
