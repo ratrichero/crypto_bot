@@ -159,7 +159,12 @@ class BinanceEngine:
             self.log("DRY_RUN set-leverage %s lev=%s cross" %
                      (symbol, self.cfg["leverage"]))
         else:
-            self.ex.set_margin_mode("cross", symbol)
+            try:
+                self.ex.set_margin_mode("cross", symbol)
+            except Exception as e:
+                # -4046 "No need to change margin type": da dung che do -> bo qua
+                if "-4046" not in str(e):
+                    raise
             self.ex.set_leverage(self.cfg["leverage"], symbol)
         self._lev_done.add(symbol)
 
