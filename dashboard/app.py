@@ -472,7 +472,21 @@ def tab_monitor():
             active = False
         with cols[i]:
             if active:
-                st.success(f"✅ {label}")
+                # Kiem tra them halt ben trong cho Binance
+                extra = ""
+                if svc == "muse-binance":
+                    try:
+                        with open(BINANCE_STATE) as f:
+                            bs = json.load(f)
+                        halt = bs.get("halt_reason") or bs.get("halted")
+                        if halt:
+                            st.error(f"🛑 {label}\nHALT: {halt}")
+                            continue
+                        pos = len(bs.get("positions", []))
+                        extra = f" ({pos} vị thế)"
+                    except Exception:
+                        pass
+                st.success(f"✅ {label}{extra}")
             else:
                 st.error(f"❌ {label}")
 
