@@ -15,6 +15,6 @@ push_one() {  # $1 = local, $2 = remote
 }
 
 push_one /home/hatch/workspace/trading-bot/trades.jsonl              "$DST/trading-bot/trades.jsonl"
-push_one /home/hatch/workspace/meme-radar/paper_trades.jsonl         "$DST/meme-radar/paper_trades.jsonl"
-push_one /home/hatch/workspace/meme-radar/paper_trades_holder.jsonl "$DST/meme-radar/paper_trades_holder.jsonl"
-push_one /home/hatch/workspace/meme-radar/wallets.json               "$DST/meme-radar/wallets.json"
+# /home/hatch/workspace/meme-radar/paper_trades.jsonl: doc truc tiep tren VPS, khong day
+# /home/hatch/workspace/meme-radar/paper_trades_holder.jsonl: doc truc tiep tren VPS, khong day
+# /home/hatch/workspace/meme-radar/wallets.json: doc truc tiep tren VPS, khong day
