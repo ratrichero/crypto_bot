@@ -543,11 +543,12 @@ def call_private(
     *args: Any,
     exchange: Any = None,
     request_id: Optional[str] = None,
+    weight: int = 1,
     **kwargs: Any,
 ) -> Any:
     """Rate-limit and classify one ccxt private/public call."""
     rid = request_id or new_request_id()
-    GOVERNOR.acquire(endpoint)
+    GOVERNOR.acquire(endpoint, weight=weight)
     started = time.monotonic()
     try:
         result = fn(*args, **kwargs)

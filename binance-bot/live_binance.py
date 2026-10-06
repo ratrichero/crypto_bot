@@ -99,10 +99,12 @@ class DataOnlyEngine:
 class BinanceEngine:
     """Engine backed by real Binance USDT-M orders (or dry-run logging)."""
 
-    def __init__(self, cfg, state, dry_run=False, log=None):
+    def __init__(self, cfg, state, dry_run=False, log=None, symbols=None):
         self.cfg = cfg
         self.state = state
         self.dry_run = dry_run
+        self._bot_symbols = {str(symbol).upper() for symbol in
+                             (symbols or cfg.get("symbols", []))}
         self.log = log or (lambda m: print(m, flush=True))
         self._pid = state.get("_pid", 0)
         self._client_nonce = state.get("_client_nonce", 0)
@@ -168,11 +170,13 @@ class BinanceEngine:
     # ------------------------------------------------------- request safety
     def _private_call(self, endpoint, fn, *args, **kwargs):
         """Run one ccxt call through the shared IP/end-point governor."""
+        weight = kwargs.pop("_weight", 1)
         return binance_safety.call_private(
             endpoint,
             fn,
             *args,
             exchange=self.ex,
+            weight=weight,
             **kwargs,
         )
 
@@ -209,6 +213,71 @@ class BinanceEngine:
                 self.log("WARNING reconcile clientOrderId %s failed: %s" %
                          (client_order_id, binance_safety.redact_body(exc)))
             return None
+
+    @staticmethod
+    def _order_status(order):
+        """Return a normalized Binance/CCXT order status."""
+        return str((order or {}).get("status")
+                   or (order or {}).get("X") or "").strip().upper()
+
+    @staticmethod
+    def _order_average(order):
+        """Extract an average fill price from raw Binance or CCXT fields."""
+        order = order or {}
+        for key in ("average", "avgPrice", "ap"):
+            try:
+                value = float(order.get(key) or 0)
+            except (TypeError, ValueError):
+                value = 0.0
+            if value > 0:
+                return value
+        try:
+            filled = float(order.get("filled") or order.get("executedQty") or 0)
+            cost = float(order.get("cost") or 0)
+        except (TypeError, ValueError):
+            filled = cost = 0.0
+        if filled > 0 and cost > 0:
+            return cost / filled
+        return None
+
+    def _validate_order_result(self, order, context, expected_qty=None):
+        """Reject a failed/partial result instead of creating false state.
+
+        A GET order response always contains an order id, including for
+        CANCELED, REJECTED and EXPIRED orders. Treating any such response as a
+        successful MARKET fill would create a local position that Binance does
+        not have. A partial MARKET result is also unsafe to model as the
+        requested quantity, so it fails closed and requires reconciliation.
+        """
+        order = order or {}
+        status = self._order_status(order)
+        failed = {"CANCELED", "CANCELLED", "REJECTED", "EXPIRED",
+                  "EXPIRED_IN_MATCH"}
+        partial = {"PARTIALLY_FILLED", "PARTIAL"}
+        try:
+            filled = float(order.get("filled") or order.get("executedQty") or 0)
+            requested = float(expected_qty or order.get("amount")
+                              or order.get("origQty") or 0)
+        except (TypeError, ValueError):
+            filled = requested = 0.0
+        is_partial_qty = (filled > 0 and requested > 0
+                          and filled < requested - max(1e-12, requested * 1e-9))
+        if status in failed and (filled <= 0 or not is_partial_qty):
+            if filled > 0:
+                self.state["halted"] = True
+                self.state["halt_reason"] = (
+                    "partial market order requires exchange reconciliation"
+                )
+            raise RuntimeError("%s returned terminal order status %s"
+                               % (context, status))
+        if status in partial or is_partial_qty:
+            self.state["halted"] = True
+            self.state["halt_reason"] = (
+                "partial market order requires exchange reconciliation"
+            )
+            raise RuntimeError("%s returned partial order status %s; "
+                               "manual reconciliation required"
+                               % (context, status or "quantity"))
 
     def start_user_stream(self):
         """Start private ORDER_TRADE_UPDATE/ACCOUNT_UPDATE listener."""
@@ -262,6 +331,11 @@ class BinanceEngine:
             if order_id is not None:
                 with self._order_condition:
                     self._order_events[str(order_id)] = order
+                    # Do not let an event stream outage turn every historical
+                    # order update into an unbounded process-memory leak.
+                    if len(self._order_events) > 4096:
+                        for _ in range(1024):
+                            self._order_events.pop(next(iter(self._order_events)))
                     self._order_condition.notify_all()
             self.log("USER ORDER event symbol=%s order=%s status=%s exec=%s "
                      "positionSide=%s"
@@ -291,7 +365,9 @@ class BinanceEngine:
                 if remaining <= 0:
                     return None
                 self._order_condition.wait(timeout=remaining)
-            return dict(self._order_events[key])
+            event = dict(self._order_events[key])
+            self._order_events.pop(key, None)
+            return event
 
     def _action_key(self, action, symbol, side=None, tag=None, level=None):
         return ":".join(str(x) for x in (action, symbol, side or "-",
@@ -425,9 +501,11 @@ class BinanceEngine:
                 elif ft in ("MIN_NOTIONAL", "NOTIONAL"):
                     minn = float(f.get("notional", f.get("minNotional", 0)))
             # All current bot orders are MARKET. Binance exposes a separate
-            # MARKET_LOT_SIZE filter; fall back to LOT_SIZE for symbols that
-            # do not publish the market-specific filter.
-            selected = market_lot or lot
+            # MARKET_LOT_SIZE filter; fall back to LOT_SIZE when the market
+            # filter is absent or publishes a zero step size (seen on some
+            # contract metadata snapshots).
+            selected = (market_lot if market_lot and market_lot[0] > 0
+                        else lot)
             if not selected:
                 raise RuntimeError("khong doc duoc LOT_SIZE cho %s" % symbol)
             self._filters[symbol] = (selected[0], selected[1], minn)
@@ -466,6 +544,7 @@ class BinanceEngine:
                 client_algo_id = self._new_client_order_id(
                     pos["symbol"], pos["side"]
                 )[:36]
+                pos["%s_client_algo_id" % label] = client_algo_id
                 params = {
                     "algoType": "CONDITIONAL",
                     "symbol": pos["symbol"],
@@ -480,39 +559,70 @@ class BinanceEngine:
                         "protection_working_type", "MARK_PRICE"
                     ),
                     "clientAlgoId": client_algo_id,
+                    # Current USD-M Algo Order docs specify lowercase string
+                    # values "true"/"false" for this parameter.
                     "priceProtect": (
-                        "TRUE" if self.cfg.get("protection_price_protect", False)
-                        else "FALSE"
+                        "true" if self.cfg.get("protection_price_protect", False)
+                        else "false"
                     ),
                 }
-                response = self._private_call(
-                    "private:trade",
-                    self.ex.fapiPrivatePostAlgoOrder,
-                    params,
-                )
-                algo_id = response.get("algoId")
+                try:
+                    response = self._private_call(
+                        "private:trade",
+                        self.ex.fapiPrivatePostAlgoOrder,
+                        params,
+                    )
+                    algo_id = response.get("algoId")
+                except binance_safety.BinanceSafetyStop:
+                    raise
+                except Exception:
+                    # The POST may have reached Binance before the transport
+                    # failed. Reconcile by clientAlgoId before cleanup; an
+                    # unknown Algo id must never become an invisible orphan.
+                    algo_id = self._find_open_algo_by_client_id(client_algo_id)
+                    if not algo_id:
+                        raise
+                if not algo_id:
+                    # A successful HTTP response without an id is also
+                    # ambiguous; query the idempotency key once.
+                    algo_id = self._find_open_algo_by_client_id(client_algo_id)
                 if not algo_id:
                     raise RuntimeError("Binance algo order missing algoId")
                 orders[label] = algo_id
+                # Persist each id on the position immediately. If creating a
+                # later guard fails, cleanup can be incomplete; retaining the
+                # id prevents an orphaned Algo Order from becoming invisible
+                # to the subsequent fail-closed close path.
+                pos["%s_algo_id" % label] = algo_id
             return orders
         except binance_safety.BinanceSafetyStop:
             raise
         except Exception:
             # If the second protection order fails, remove the first one so
             # the position is not left with only half of its intended guard.
-            for algo_id in orders.values():
+            # Use clientAlgoId too when a POST response was ambiguous.
+            for label in ("sl", "tp"):
+                algo_id = orders.get(label)
+                client_algo_id = pos.get("%s_client_algo_id" % label)
+                if not algo_id and not client_algo_id:
+                    continue
+                identifier = {"symbol": pos["symbol"]}
                 if algo_id:
-                    try:
-                        self._private_call(
-                            "private:trade",
-                            self.ex.fapiPrivateDeleteAlgoOrder,
-                            {"symbol": pos["symbol"], "algoId": algo_id},
-                        )
-                    except binance_safety.BinanceSafetyStop:
-                        raise
-                    except Exception as cancel_error:
-                        self.log("CRITICAL protection cleanup failed algo=%s: %s"
-                                 % (algo_id, binance_safety.redact_body(cancel_error)))
+                    identifier["algoId"] = algo_id
+                else:
+                    identifier["clientAlgoId"] = client_algo_id
+                try:
+                    self._private_call(
+                        "private:trade",
+                        self.ex.fapiPrivateDeleteAlgoOrder,
+                        identifier,
+                    )
+                except binance_safety.BinanceSafetyStop:
+                    raise
+                except Exception as cancel_error:
+                    self.log("CRITICAL protection cleanup failed guard=%s: %s"
+                             % (algo_id or client_algo_id,
+                                binance_safety.redact_body(cancel_error)))
             raise
 
     def _cancel_exchange_protection(self, pos):
@@ -521,23 +631,82 @@ class BinanceEngine:
         if (not self.cfg.get("exchange_protection", False)
                 and not pos.get("sl_algo_id") and not pos.get("tp_algo_id")):
             return
+        absent_ids = []
         for key in ("sl_algo_id", "tp_algo_id"):
+            label = key[:-8]  # sl_algo_id -> sl; tp_algo_id -> tp
             algo_id = pos.get(key)
-            if not algo_id:
+            client_algo_id = pos.get("%s_client_algo_id" % label)
+            if not algo_id and not client_algo_id:
                 continue
+            identifier = {"symbol": pos["symbol"]}
+            if algo_id:
+                identifier["algoId"] = algo_id
+            else:
+                # Binance supports clientAlgoId on Cancel Algo Order; this is
+                # the recovery path when POST succeeded but its response/id
+                # was lost in transit.
+                identifier["clientAlgoId"] = client_algo_id
             try:
                 self._private_call(
                     "private:trade",
                     self.ex.fapiPrivateDeleteAlgoOrder,
-                    {"symbol": pos["symbol"], "algoId": algo_id},
+                    identifier,
                 )
             except binance_safety.BinanceSafetyStop:
                 raise
             except Exception as exc:
-                # An already-triggered/canceled algo order is harmless. Any
-                # other error is logged; the market close remains idempotent.
-                self.log("WARNING cancel protection algo=%s failed: %s"
-                         % (algo_id, binance_safety.redact_body(exc)))
+                message = str(exc).lower()
+                if ("-2011" in message or "-2013" in message
+                        or "not found" in message
+                        or "does not exist" in message):
+                    self.log("INFO protection guard=%s already absent"
+                             % (algo_id or client_algo_id))
+                    absent_ids.append(algo_id or client_algo_id)
+                    continue
+                # Never send a market close while an exchange-side guard may
+                # still be live: a later trigger could open a new Hedge leg.
+                self.log("CRITICAL protection cancel failed guard=%s: %s"
+                         % (algo_id or client_algo_id,
+                            binance_safety.redact_body(exc)))
+                raise RuntimeError(
+                    "exchange protection cancellation uncertain for algo %s"
+                    % (algo_id or client_algo_id)
+                ) from exc
+
+        if absent_ids:
+            # "Algo not found" is also the response when a STOP/TP has
+            # already triggered. Verify the Hedge leg still exists before
+            # sending an opposite-side MARKET order; otherwise that order
+            # would open a new reverse leg in Hedge Mode.
+            try:
+                rows = self._private_call(
+                    "private:account",
+                    self.ex.fetch_positions,
+                    _weight=5,
+                )
+                actual = self._aggregate_positions(rows).get(
+                    (pos["symbol"], pos["side"]), 0.0
+                )
+                expected = float(pos.get("qty", 0) or 0)
+                step = 0.0
+                try:
+                    step = float((self._filters_for(pos["symbol"]) or (0,))[0] or 0)
+                except Exception:
+                    pass
+                tolerance = max(step * 1.1, abs(expected) * 0.001, 1e-10)
+                if actual <= 0 or abs(actual - expected) > tolerance:
+                    raise RuntimeError(
+                        "Hedge position changed while protection was absent "
+                        "(expected=%s actual=%s)" % (expected, actual)
+                    )
+            except binance_safety.BinanceSafetyStop:
+                raise
+            except RuntimeError:
+                raise
+            except Exception as exc:
+                raise RuntimeError(
+                    "cannot verify Hedge position after absent protection"
+                ) from exc
 
     def _set_leverage(self, symbol):
         if symbol in self._lev_done:
@@ -578,6 +747,7 @@ class BinanceEngine:
         return self._private_call(
             "private:account",
             self.ex.fetch_positions,
+            _weight=5,
         )
 
     def get_balance_usdt(self):
@@ -588,6 +758,7 @@ class BinanceEngine:
         bal = self._private_call(
             "private:account",
             self.ex.fetch_balance,
+            _weight=5,
         )
         u = bal.get("USDT", {})
         return {"total": float(u.get("total", 0) or 0),
@@ -626,6 +797,7 @@ class BinanceEngine:
         balance = self._private_call(
             "private:account",
             self.ex.fetch_balance,
+            _weight=5,
         )
         info = balance.get("info") or {}
         for key in ("totalMarginBalance", "marginBalance"):
@@ -746,6 +918,214 @@ class BinanceEngine:
             return False
         return True
 
+    def _reconcile_startup_open_orders(self):
+        """Block resume when a previous normal order is still working."""
+        if self.dry_run:
+            return True
+        query = getattr(self.ex, "fetch_open_orders", None)
+        if query is None:
+            self.state["halted"] = True
+            self.state["halt_reason"] = "open order reconciliation unavailable"
+            self.log("CRITICAL CCXT has no open order query; halt startup")
+            return False
+        try:
+            # Binance charges weight 40 when symbol is omitted for the
+            # all-symbol open-order query.
+            orders = self._private_call("private:order_status", query,
+                                        _weight=40)
+            if orders is None:
+                orders = []
+            if not isinstance(orders, list):
+                raise RuntimeError("unexpected open order response")
+        except binance_safety.BinanceSafetyStop:
+            raise
+        except Exception as exc:
+            self.state["halted"] = True
+            self.state["halt_reason"] = "open order reconciliation unavailable"
+            self.log("CRITICAL open order reconciliation failed: %s" %
+                     binance_safety.redact_body(exc))
+            return False
+
+        bot_symbols = set(getattr(self, "_bot_symbols", set()))
+        working = []
+        for order in orders:
+            if not isinstance(order, dict):
+                continue
+            raw_symbol = (order.get("symbol")
+                          or (order.get("info") or {}).get("symbol")
+                          or "")
+            try:
+                symbol = str(self._raw_symbol(order) or raw_symbol).upper()
+            except Exception:
+                symbol = str(raw_symbol).upper()
+            if "/" in symbol:
+                symbol = symbol.split("/")[0]
+            if not bot_symbols or symbol in bot_symbols:
+                working.append({
+                    "symbol": symbol,
+                    "id": order.get("id") or (order.get("info") or {}).get("orderId"),
+                    "client": order.get("clientOrderId")
+                    or (order.get("info") or {}).get("clientOrderId"),
+                    "status": order.get("status")
+                    or (order.get("info") or {}).get("status"),
+                })
+        if working:
+            self.state["halted"] = True
+            self.state["halt_reason"] = "unmanaged open exchange order"
+            self.log("CRITICAL working exchange orders at startup=%s; "
+                     "cancel/reconcile manually before resume" % working)
+            return False
+        return True
+
+    def _fetch_open_algo_orders(self):
+        """Return normalized open USD-M Algo Orders from the exchange."""
+        query = getattr(self.ex, "fapiPrivateGetOpenAlgoOrders", None)
+        if query is None:
+            raise RuntimeError("CCXT has no open Algo Order query")
+        # Binance charges weight 40 when symbol is omitted; keeping the
+        # all-symbol startup scan in the governor prevents a false local
+        # estimate from hiding the real IP budget.
+        response = self._private_call("private:trade", query, {}, _weight=40)
+        if isinstance(response, list):
+            open_orders = response
+        elif isinstance(response, dict):
+            data = response.get("data")
+            if isinstance(data, dict):
+                open_orders = (data.get("orders") or data.get("list")
+                               or data.get("algoOrders") or [])
+            else:
+                open_orders = (response.get("orders")
+                               or response.get("list")
+                               or data or [])
+            if isinstance(open_orders, dict):
+                open_orders = [open_orders]
+        else:
+            open_orders = []
+        if not isinstance(open_orders, list):
+            raise RuntimeError("unexpected open Algo Order response")
+        return open_orders
+
+    def _find_open_algo_by_client_id(self, client_algo_id):
+        for order in self._fetch_open_algo_orders():
+            if not isinstance(order, dict):
+                continue
+            candidate = (order.get("clientAlgoId")
+                         or order.get("origClientAlgoId")
+                         or (order.get("info") or {}).get("clientAlgoId"))
+            if str(candidate or "") != str(client_algo_id):
+                continue
+            return (order.get("algoId") or order.get("algoOrderId")
+                    or (order.get("info") or {}).get("algoId"))
+        return None
+
+    def _reconcile_exchange_protection(self, position_rows):
+        """Verify persisted Algo guards before allowing a resumed live bot.
+
+        A restart can happen after an Algo Order was accepted but before its
+        id was persisted, or after a local close failed. Never guess which
+        guard belongs to which position and never auto-cancel an unknown guard:
+        query all open Futures Algo Orders and halt on any bot-symbol
+        discrepancy so an operator can reconcile it on Binance first.
+        """
+        if self.dry_run:
+            return True
+        try:
+            open_orders = self._fetch_open_algo_orders()
+        except binance_safety.BinanceSafetyStop:
+            raise
+        except Exception as exc:
+            self.state["halted"] = True
+            self.state["halt_reason"] = (
+                "exchange protection reconciliation unavailable"
+            )
+            self.log("CRITICAL open Algo Order reconciliation failed: %s" %
+                     binance_safety.redact_body(exc))
+            return False
+
+        expected = {}
+        missing_required = []
+        bot_symbols = set(getattr(self, "_bot_symbols", set()))
+        for position in self.state.get("positions", []):
+            symbol = str(position.get("symbol") or "").upper()
+            if not symbol:
+                continue
+            bot_symbols.add(symbol)
+            for label, price_key in (("sl", "sl"), ("tp", "tp")):
+                algo_id = position.get("%s_algo_id" % label)
+                if (self.cfg.get("exchange_protection", False)
+                        and position.get(price_key) is not None and not algo_id):
+                    missing_required.append("%s:%s" %
+                                            (position.get("id"), label))
+                if algo_id:
+                    expected[str(algo_id)] = (position, label)
+
+        exchange_symbols = set()
+        for position in position_rows or []:
+            symbol = self._raw_symbol(position)
+            if symbol:
+                exchange_symbols.add(str(symbol).upper())
+        bot_symbols.update(exchange_symbols)
+        seen = set()
+        unknown = []
+        guard_mismatch = []
+        for order in open_orders:
+            if not isinstance(order, dict):
+                continue
+            info = order.get("info") or {}
+            algo_id = (order.get("algoId") or order.get("algoOrderId")
+                       or order.get("i") or info.get("algoId"))
+            if algo_id is not None:
+                algo_id = str(algo_id)
+                seen.add(algo_id)
+            symbol = str(order.get("symbol") or order.get("s")
+                         or info.get("symbol") or "").upper()
+            if symbol in bot_symbols and algo_id not in expected:
+                unknown.append((symbol, algo_id))
+                continue
+            if algo_id not in expected:
+                continue
+            position, label = expected[algo_id]
+            wanted_symbol = str(position.get("symbol") or "").upper()
+            wanted_side = ("LONG" if position.get("side") == "long"
+                           else "SHORT")
+            wanted_order_side = ("SELL" if position.get("side") == "long"
+                                 else "BUY")
+            order_side = str(order.get("positionSide")
+                             or info.get("positionSide") or "").upper()
+            order_direction = str(order.get("side") or info.get("side")
+                                  or "").upper()
+            order_type = str(order.get("orderType") or order.get("type")
+                             or info.get("orderType") or info.get("type")
+                             or "").upper()
+            quantity = order.get("quantity") or order.get("origQty")
+            try:
+                quantity_mismatch = (
+                    quantity is None
+                    or abs(float(quantity) - float(position.get("qty", 0)))
+                    > max(1e-10, float(position.get("qty", 0)) * 0.001)
+                )
+            except (TypeError, ValueError):
+                quantity_mismatch = True
+            wanted_type = "STOP_MARKET" if label == "sl" else "TAKE_PROFIT_MARKET"
+            if (symbol != wanted_symbol or order_side != wanted_side
+                    or order_direction != wanted_order_side
+                    or order_type != wanted_type or quantity_mismatch):
+                guard_mismatch.append((algo_id, symbol, order_side,
+                                       order_direction, order_type))
+
+        missing = sorted(set(expected) - seen)
+        if missing or unknown or missing_required or guard_mismatch:
+            self.state["halted"] = True
+            self.state["halt_reason"] = (
+                "exchange protection reconciliation mismatch"
+            )
+            self.log("CRITICAL Algo protection mismatch missing=%s "
+                     "missing_required=%s unknown=%s guard_mismatch=%s; "
+                     "halt until manually reconciled"
+                     % (missing, missing_required, unknown, guard_mismatch))
+            return False
+        return True
+
     def _reconcile_startup(self):
         """Remove paper ghosts, then validate aggregate exchange quantities."""
         try:
@@ -754,7 +1134,9 @@ class BinanceEngine:
         except binance_safety.BinanceSafetyStop:
             raise
         except Exception as e:
-            self.log("WARNING khong doc duoc vi the san de doi chieu: %s" % e)
+            self.state["halted"] = True
+            self.state["halt_reason"] = "exchange position reconciliation unavailable"
+            self.log("CRITICAL khong doc duoc vi the san de doi chieu: %s" % e)
             return
         kept = [p for p in self.state["positions"] if p.get("live")]
         pruned = [p for p in self.state["positions"] if not p.get("live")]
@@ -776,6 +1158,8 @@ class BinanceEngine:
             self.state["halted"] = True
             self.state["halt_reason"] = "unmanaged exchange position"
         self.reconcile_positions(force=True, rows=rows)
+        self._reconcile_startup_open_orders()
+        self._reconcile_exchange_protection(rows)
 
     def _place_market(self, symbol, side, qty, position_side,
                       reduce_only=False, ref_price=None):
@@ -798,6 +1182,7 @@ class BinanceEngine:
         client_order_id = self._new_client_order_id(symbol, side)
         params["newClientOrderId"] = client_order_id
         params["newOrderRespType"] = self.cfg.get("new_order_resp_type", "RESULT")
+        self._last_order_response = None
         fn = (self.ex.create_market_buy_order if side == "buy"
               else self.ex.create_market_sell_order)
         try:
@@ -820,15 +1205,31 @@ class BinanceEngine:
             if uncertain:
                 existing = self._find_order_by_client_id(symbol, client_order_id)
                 if existing and existing.get("orderId") is not None:
+                    self._validate_order_result(
+                        existing,
+                        "reconciled order %s" % client_order_id,
+                        expected_qty=qty,
+                    )
                     self.log("ORDER reconciled after transport failure "
                              "clientOrderId=%s orderId=%s"
                              % (client_order_id, existing.get("orderId")))
                     self._last_order_response = existing
                     return existing.get("orderId"), client_order_id
+                # We cannot prove whether Binance accepted the MARKET order.
+                # A cooldown alone would permit another entry while the first
+                # request may still fill; halt until positions/open orders are
+                # reconciled by the next startup/operator check.
+                self.state["halted"] = True
+                self.state["halt_reason"] = (
+                    "ambiguous market order requires reconciliation"
+                )
             raise RuntimeError("dat lenh %s %s that bai: %s"
                                % (symbol, side, e))
+        self._validate_order_result(od, "created order", expected_qty=qty)
         self._last_order_response = od
-        return od.get("id"), od.get("clientOrderId") or client_order_id
+        return (od.get("id") or od.get("orderId"),
+                od.get("clientOrderId") or od.get("origClientOrderId")
+                or client_order_id)
 
     def _fill_price(self, symbol, order_id, ref_price):
         if self.dry_run:
@@ -836,10 +1237,10 @@ class BinanceEngine:
 
         response = self._last_order_response or {}
         self._last_order_response = None
-        if response.get("average") and float(response["average"] or 0) > 0:
-            return float(response["average"])
-        if response.get("avgPrice") and float(response["avgPrice"] or 0) > 0:
-            return float(response["avgPrice"])
+        self._validate_order_result(response, "order %s" % order_id)
+        average = self._order_average(response)
+        if average is not None:
+            return average
 
         # Prefer the ordered private stream. This removes the old six-request
         # polling burst when ORDER_TRADE_UPDATE is healthy.
@@ -849,16 +1250,19 @@ class BinanceEngine:
                 float(self.cfg.get("order_event_timeout_seconds", 8)),
             )
             if event_order:
-                avg = event_order.get("ap") or event_order.get("avgPrice")
-                if avg and float(avg) > 0:
-                    return float(avg)
+                self._validate_order_result(
+                    event_order,
+                    "order event %s" % order_id,
+                )
+                average = self._order_average(event_order)
+                if average is not None:
+                    return average
 
         ccxt_symbol = self._ccxt_symbol(symbol)
         if not ccxt_symbol:
             raise RuntimeError("unknown_symbol: %s" % symbol)
-        px = None
         # REST is now a bounded fallback, not the normal order-status path.
-        for _ in range(2):
+        for attempt in range(2):
             try:
                 od = self._private_call(
                     "private:order_status",
@@ -866,20 +1270,28 @@ class BinanceEngine:
                     order_id,
                     ccxt_symbol,
                 )
-                if od.get("average"):
-                    px = float(od["average"])
-                if od.get("status") == "closed":
+                self._validate_order_result(od, "order poll %s" % order_id)
+                average = self._order_average(od)
+                if average is not None:
+                    return average
+                if self._order_status(od) in ("CLOSED", "FILLED"):
                     break
             except binance_safety.BinanceSafetyStop:
                 raise
+            except RuntimeError:
+                raise
             except Exception as e:
                 self.log("WARNING poll order %s: %s" % (order_id, e))
-            time.sleep(1)
-        if px is None:
-            self.log("WARNING khong lay duoc avgPx cho %s, dung gia ref %s"
-                     % (order_id, ref_price))
-            return ref_price
-        return px
+            if attempt == 0:
+                time.sleep(1)
+        # A reference/mark price is not a fill price. Falling back to it would
+        # create a ghost local position after an accepted-but-unfilled order.
+        self.state["halted"] = True
+        self.state["halt_reason"] = (
+            "order fill reconciliation required"
+        )
+        raise RuntimeError("khong xac dinh duoc gia fill cho order %s; "
+                           "khong ghi state" % order_id)
 
     # ----------------------------------------------------------------- open
     def open(self, symbol, side, notional, price, sl_pct, tp_pct, tag,
@@ -897,6 +1309,8 @@ class BinanceEngine:
         cooldown = self._cooldown_reason(key)
         if cooldown:
             return None, cooldown
+        if self.state.get("halted"):
+            return None, "halted: %s" % self.state.get("halt_reason", "")
         if len(self.state["positions"]) >= self.cfg.get("max_total_positions", 999):
             return None, "max_positions"
         try:
@@ -907,8 +1321,13 @@ class BinanceEngine:
                 return None, "insufficient_margin"
             total_notional = sum(p["notional"]
                                  for p in self.state["positions"])
+            risk_equity = float(
+                self.state.get("mark_equity", self.state.get("equity", 0.0))
+                or self.state.get("equity", 0.0)
+                or 0.0
+            )
             if (total_notional + notional
-                    > self.state["equity"] * self.cfg["risk"]["max_notional_mult"]):
+                    > risk_equity * self.cfg["risk"]["max_notional_mult"]):
                 self._mark_action_failure(key, "exposure_cap")
                 return None, "exposure_cap"
 
@@ -1046,6 +1465,11 @@ class BinanceEngine:
         except binance_safety.BinanceSafetyStop:
             raise
         except Exception as e:
+            # A failed close can leave exchange exposure while local state
+            # still says the position is open. Do not merely cooldown and let
+            # a future risk day resume entries around that unknown exposure.
+            self.state["halted"] = True
+            self.state["halt_reason"] = "close action requires reconciliation"
             self._mark_action_failure(key, e)
             return None
 

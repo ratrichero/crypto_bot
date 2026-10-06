@@ -257,6 +257,183 @@ check("algo protection has no reduceOnly",
       all("reduceOnly" not in p for p in algo_calls))
 check("algo protection rounds trigger to tick",
       algo_calls[0]["triggerPrice"] == "49000.0")
+check("algo protection uses documented boolean string",
+      all(p.get("priceProtect") == "false" for p in algo_calls))
+
+# --- 4c. fail-closed order/protection recovery paths ---
+status_eng = object.__new__(live_binance.BinanceEngine)
+status_eng.dry_run = False
+status_eng.cfg = {"new_order_resp_type": "RESULT"}
+status_eng.state = {"_client_nonce": 0, "halted": False}
+status_eng._client_nonce = 0
+status_eng._last_order_response = None
+status_eng.log = lambda _: None
+status_eng._ccxt_symbol = lambda _: "BTC/USDT:USDT"
+status_eng.ex = type("FakeExchange", (), {
+    "create_market_buy_order": lambda *args: None,
+    "create_market_sell_order": lambda *args: None,
+    "fapiPrivateGetOrder": lambda *args: None,
+})()
+status_calls = []
+def fake_status_private(endpoint, fn, *args):
+    if endpoint == "private:trade":
+        status_calls.append(args)
+        raise TimeoutError("simulated transport timeout")
+    return {"orderId": "9002", "status": "CANCELED",
+            "executedQty": "0", "origQty": "0.02"}
+status_eng._private_call = fake_status_private
+try:
+    status_eng._place_market("BTCUSDT", "buy", 0.02, "LONG", ref_price=50000)
+    status_error = None
+except RuntimeError as exc:
+    status_error = str(exc)
+check("timeout recovery rejects canceled order",
+      status_error is not None and "CANCELED" in status_error)
+check("canceled recovery does not create a second order",
+      len(status_calls) == 1)
+
+fill_eng = object.__new__(live_binance.BinanceEngine)
+fill_eng.dry_run = False
+fill_eng.cfg = {"order_event_timeout_seconds": 0}
+fill_eng.state = {"halted": False}
+fill_eng._last_order_response = {
+    "orderId": "9003", "status": "NEW", "origQty": "0.02",
+    "executedQty": "0",
+}
+fill_eng._user_ws = None
+fill_eng._ccxt_symbol = lambda _: "BTC/USDT:USDT"
+fill_eng.log = lambda _: None
+fill_eng._private_call = lambda *args: {
+    "status": "NEW", "amount": "0.02", "filled": "0"
+}
+old_sleep = live_binance.time.sleep
+live_binance.time.sleep = lambda _: None
+try:
+    fill_eng._fill_price("BTCUSDT", "9003", 50000)
+    fill_error = None
+except RuntimeError as exc:
+    fill_error = str(exc)
+finally:
+    live_binance.time.sleep = old_sleep
+check("unknown market fill does not use reference price",
+      fill_error is not None and fill_eng.state["halted"])
+
+close_eng = object.__new__(live_binance.BinanceEngine)
+close_eng.dry_run = False
+close_eng.cfg = {"exchange_protection": True}
+close_eng.state = fresh_state()
+close_eng._action_failures = {}
+close_eng._action_cooldowns = {}
+close_eng._symbol_cooldowns = {}
+close_eng._cooldown_base = 30.0
+close_eng._cooldown_max = 900.0
+close_eng.log = lambda _: None
+close_eng._filters_for = lambda _: (0.001, 0.001, 5.0)
+close_eng.ex = type("FakeExchange", (), {
+    "fapiPrivateDeleteAlgoOrder": lambda *args: None,
+})()
+close_eng._private_call = lambda *args, **kwargs: (_ for _ in ()).throw(
+    RuntimeError("HTTP 500 protection delete failed"))
+market_close_calls = []
+close_eng._place_market = lambda *args, **kwargs: market_close_calls.append(args)
+close_pos = {"id": 77, "symbol": "BTCUSDT", "side": "long", "qty": 0.02,
+             "entry": 50000.0, "notional": 1000.0, "tag": "scalp",
+             "sl_algo_id": "701", "tp_algo_id": "702"}
+close_eng.state["positions"] = [close_pos]
+check("protection cancel failure blocks market close",
+      close_eng.close(close_pos, 50000.0, "SL") is None
+      and market_close_calls == [])
+check("protection cancel failure keeps local position",
+      close_eng.state["positions"] == [close_pos])
+
+# A missing Algo id is only acceptable when the Hedge position is verified to
+# still exist; otherwise the opposite-side close could reverse the account.
+absent_eng = object.__new__(live_binance.BinanceEngine)
+absent_eng.dry_run = False
+absent_eng.cfg = {"exchange_protection": True}
+absent_eng.state = fresh_state()
+absent_eng._filters_for = lambda _: (0.001, 0.001, 5.0)
+absent_eng._aggregate_positions = lambda rows: {}
+absent_eng.log = lambda _: None
+absent_eng.ex = type("FakeExchange", (), {
+    "fapiPrivateDeleteAlgoOrder": lambda *args: None,
+    "fetch_positions": lambda *args: [],
+})()
+def absent_private(endpoint, fn, *args):
+    if endpoint == "private:trade":
+        raise RuntimeError("-2013 Order does not exist")
+    return []
+absent_eng._private_call = absent_private
+absent_pos = {"symbol": "BTCUSDT", "side": "long", "qty": 0.02,
+              "sl_algo_id": "703"}
+try:
+    absent_eng._cancel_exchange_protection(absent_pos)
+    absent_error = None
+except RuntimeError as exc:
+    absent_error = str(exc)
+check("absent protection with no Hedge leg blocks close",
+      absent_error is not None and "position" in absent_error.lower())
+
+startup_prot = object.__new__(live_binance.BinanceEngine)
+startup_prot.dry_run = False
+startup_prot.cfg = {"exchange_protection": True}
+startup_prot.state = {"positions": [{
+    "id": 78, "symbol": "BTCUSDT", "side": "long", "qty": 0.02,
+    "sl": 49000.0, "tp": 51000.0,
+    "sl_algo_id": "801", "tp_algo_id": "802",
+}], "halted": False}
+startup_prot._bot_symbols = {"BTCUSDT"}
+startup_prot.log = lambda _: None
+startup_prot._raw_symbol = lambda p: (p.get("info") or {}).get("symbol") or p.get("symbol")
+startup_prot.ex = type("FakeExchange", (), {
+    "fapiPrivateGetOpenAlgoOrders": lambda *args: None,
+})()
+startup_prot._private_call = lambda *args, **kwargs: [
+    {"algoId": "801", "symbol": "BTCUSDT", "positionSide": "LONG",
+     "side": "SELL", "orderType": "STOP_MARKET", "quantity": "0.02"},
+    {"algoId": "802", "symbol": "BTCUSDT", "positionSide": "LONG",
+     "side": "SELL", "orderType": "TAKE_PROFIT_MARKET", "quantity": "0.02"},
+]
+check("startup protection reconciliation accepts matching Hedge guards",
+      startup_prot._reconcile_exchange_protection([]))
+startup_prot._private_call = lambda *args, **kwargs: [
+    {"algoId": "801", "symbol": "BTCUSDT", "positionSide": "SHORT",
+     "side": "SELL", "orderType": "STOP_MARKET", "quantity": "0.02"},
+    {"algoId": "802", "symbol": "BTCUSDT", "positionSide": "LONG",
+     "side": "SELL", "orderType": "TAKE_PROFIT_MARKET", "quantity": "0.02"},
+]
+startup_prot.state["halted"] = False
+check("startup protection reconciliation halts wrong Hedge side",
+      not startup_prot._reconcile_exchange_protection([])
+      and startup_prot.state["halted"])
+
+# Keepalive must retry after one minute, not wait another 30-minute cycle.
+class _FakeStopEvent:
+    def __init__(self):
+        self.calls = 0
+        self.stopped = False
+    def wait(self, _seconds):
+        self.calls += 1
+        if self.calls >= 3:
+            self.stopped = True
+            return True
+        return False
+    def is_set(self):
+        return self.stopped
+
+keepalive_calls = []
+keep = binance_user_ws.BinanceUserDataWS(
+    "listen", lambda: "listen", lambda _: None, lambda _: None,
+)
+def renewal_sequence():
+    keepalive_calls.append(1)
+    if len(keepalive_calls) == 1:
+        raise RuntimeError("temporary")
+    return "listen"
+keep.renew = renewal_sequence
+keep._stop = _FakeStopEvent()
+keep._keepalive_loop()
+check("listenKey keepalive retries before expiry", len(keepalive_calls) == 2)
 
 # Failed order actions cool both the action and the symbol.
 fail_st = fresh_state()

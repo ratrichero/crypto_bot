@@ -80,25 +80,28 @@ class BinanceUserDataWS:
 
     def _keepalive_loop(self) -> None:
         # Binance listen keys expire after 60 minutes. Renew at 30 minutes,
-        # then retry a transient keepalive failure after one minute.
+        # then retry transient keepalive failures every minute. Returning to
+        # the 30-minute wait after one failure could let the key expire.
         while not self._stop.wait(30 * 60):
-            try:
-                new_key = self.renew()
-                if new_key and new_key != self.listen_key:
-                    self.listen_key = new_key
-                self.log("USER WS listenKey renewed")
-            except binance_safety.BinanceSafetyStop as exc:
-                self.fatal_error = str(exc)
-                self.log("USER WS safety stop: %s" % self.fatal_error)
-                self.stop()
-                return
-            except Exception as exc:
-                # Do not spin on a keepalive error. The current connection
-                # remains usable while the next scheduled renewal is pending.
-                self.log("USER WS keepalive failed: %s" %
-                         binance_safety.redact_body(exc))
-                if self._stop.wait(60):
+            while not self._stop.is_set():
+                try:
+                    new_key = self.renew()
+                    if new_key and new_key != self.listen_key:
+                        self.listen_key = new_key
+                    self.log("USER WS listenKey renewed")
+                    break
+                except binance_safety.BinanceSafetyStop as exc:
+                    self.fatal_error = str(exc)
+                    self.log("USER WS safety stop: %s" % self.fatal_error)
+                    self.stop()
                     return
+                except Exception as exc:
+                    # Do not spin on a keepalive error, but retry before the
+                    # 60-minute Binance listen-key expiry deadline.
+                    self.log("USER WS keepalive failed; retry in 60s: %s" %
+                             binance_safety.redact_body(exc))
+                    if self._stop.wait(60):
+                        return
 
     def _run(self) -> None:
         while not self._stop.is_set():
