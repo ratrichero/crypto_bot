@@ -90,6 +90,12 @@ DEFAULTS = {
     "daily_stop_pct": 0.20,
     "min_signal_usd": 300,
     "skip_preflight": False,
+    # duong dan signal: de trong -> dung file trong thu muc module.
+    # Khi live_trader chay tren VPS con radar paper chay may khac,
+    # tro 2 truong nay sang thu muc nhan signal forward, vd:
+    # "signals_jsonl": "/home/ubuntu/muse_bot/live-signals/signals.jsonl"
+    "signals_jsonl": "",
+    "alerts_jsonl": "",
     # exit ladder (mirror paper)
     "tp1_pct": 0.50, "tp1_frac": 0.3334,
     "tp2_pct": 1.00, "tp2_frac": 0.3333,
@@ -525,6 +531,15 @@ def save_json(path, obj):
     os.replace(tmp, path)
 
 
+def sig_path(cfg):
+    """Duong dan signals.jsonl (configurable de chay cross-machine)."""
+    return cfg.get("signals_jsonl") or SIG_P
+
+
+def alert_path(cfg):
+    return cfg.get("alerts_jsonl") or ALERT_P
+
+
 def tail_new(path, offset):
     """Doc cac dong moi append tu offset. Tra ve (rows, new_offset)."""
     rows = []
@@ -575,11 +590,11 @@ class LiveTrader:
         # lan chay dau: bat dau tu CUOI file, khong danh tin cu
         if not st:
             try:
-                self.state["sig_offset"] = os.path.getsize(SIG_P)
+                self.state["sig_offset"] = os.path.getsize(sig_path(self.cfg))
             except FileNotFoundError:
                 pass
             try:
-                self.state["alert_offset"] = os.path.getsize(ALERT_P)
+                self.state["alert_offset"] = os.path.getsize(alert_path(self.cfg))
             except FileNotFoundError:
                 pass
         self._price_last = {}
@@ -626,7 +641,7 @@ class LiveTrader:
     # -- signal intake -------------------------------------------------
 
     def ingest_signals(self, now):
-        sigs, off = tail_new(SIG_P, self.state["sig_offset"])
+        sigs, off = tail_new(sig_path(self.cfg), self.state["sig_offset"])
         self.state["sig_offset"] = off
         opened = 0
         for s in sigs:
@@ -687,7 +702,7 @@ class LiveTrader:
     # -- sell-cluster intake --------------------------------------------
 
     def ingest_alerts(self):
-        alerts, off = tail_new(ALERT_P, self.state["alert_offset"])
+        alerts, off = tail_new(alert_path(self.cfg), self.state["alert_offset"])
         self.state["alert_offset"] = off
         for a in alerts:
             if a.get("type") != "sell_cluster":
