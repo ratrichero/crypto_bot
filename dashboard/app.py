@@ -712,7 +712,6 @@ def tab_monitor():
                     st.error(f"Lỗi: {e}")
         else:
             st.success("✅ Không halt")
-            st.info(f"Không đọc được state: {e}")
 
     st.divider()
 
