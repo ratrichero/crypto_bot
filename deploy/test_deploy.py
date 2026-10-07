@@ -682,7 +682,8 @@ def test_migrate_error_blocks_restart():
     commit(tmp, "c1")
     names = ("check_branch", "step_pull", "step_deps", "step_migrate",
              "step_build", "plan_restarts", "start_or_restart", "pm2",
-             "acquire_lock", "health_check", "check_syntax")
+             "acquire_lock", "health_check", "check_syntax",
+             "step_switch_branch")
     saved = {n: getattr(d, n) for n in names}
     restarted = []
     try:
@@ -740,9 +741,128 @@ def test_migrate_error_blocks_restart():
         check("--force: lam lai thu vien/migrate/build + restart moi app",
               seen == {"deps": True, "mig": True, "build": True}
               and plan_args["force"] == {"muse-dashboard"}, (seen, plan_args))
+
+        # --branch: doi nhanh thay cho pull; resume (sau re-exec) khong doi lai
+        calls = []
+        d.step_switch_branch = lambda cfg, b, dry, yes: calls.append(
+            ("switch", b, yes)) or (head, head, True)
+        d.step_pull = lambda cfg, b, dry: calls.append(("pull",)) or \
+            (head, head, False)
+        a = A()
+        a.branch = "feature"
+        a.yes = True
+        with use_root(tmp):
+            rc = d.cmd_deploy(a, cfg)
+        check("--branch: goi step_switch_branch, khong pull lai",
+              calls == [("switch", "feature", True)] and rc == 0, (calls, rc))
+        del calls[:]
+        a.resume_from = head
+        with use_root(tmp):
+            d.cmd_deploy(a, cfg)
+        check("--branch + --resume-from: khong doi nhanh lan 2",
+              calls == [], calls)
     finally:
         for n, f in saved.items():
             setattr(d, n, f)
+        shutil.rmtree(tmp)
+
+
+def test_switch_branch():
+    print("\n[git up --branch: doi nhanh deploy]")
+    tmp = tempfile.mkdtemp()
+    try:
+        dev = os.path.join(tmp, "dev")
+        git_init(dev)
+        write(dev, "deploy/deploy.py", "# v1\n")
+        write(dev, "app.txt", "main\n")
+        commit(dev, "main c1")
+        sh(["git", "checkout", "-q", "-b", "old"], dev)
+        sh(["git", "rm", "-q", "-r", "deploy"], dev)
+        commit(dev, "old: chua co deploy")
+        sh(["git", "checkout", "-q", "main"], dev)
+        sh(["git", "checkout", "-q", "-b", "feature"], dev)
+        write(dev, "app.txt", "feature\n")
+        f1 = commit(dev, "feature c1")
+        sh(["git", "checkout", "-q", "main"], dev)
+        remote = os.path.join(tmp, "remote.git")
+        sh(["git", "clone", "-q", "--bare", dev, remote], tmp)
+        sh(["git", "remote", "add", "origin", remote], dev)
+        sh(["git", "fetch", "-q", "origin"], dev)
+        vps = os.path.join(tmp, "vps")
+        sh(["git", "clone", "-q", "-b", "main", remote, vps], tmp)
+        sh(["git", "config", "user.email", "t@t"], vps)
+        sh(["git", "config", "user.name", "t"], vps)
+        write(vps, "deploy/deploy.local.env", "# rieng VPS\nAPPS=x y\n")
+        m1 = sh(["git", "rev-parse", "HEAD"], vps)
+        cur = lambda: sh(["git", "symbolic-ref", "--short", "HEAD"], vps)
+        with use_root(vps):
+            cfg = d.load_config()
+            try:
+                d.step_switch_branch(cfg, "khong-co", False, True)
+                check("nhanh khong ton tai -> loi", False)
+            except d.DeployError as e:
+                check("nhanh khong ton tai -> loi", "khong co nhanh" in str(e))
+            try:
+                d.step_switch_branch(cfg, "old", False, True)
+                check("nhanh chua co deploy/ -> tu choi", False)
+            except d.DeployError as e:
+                check("nhanh chua co deploy/ -> tu choi",
+                      "chua co bo deploy" in str(e) and cur() == "main")
+            try:
+                d.step_switch_branch(cfg, "--force", False, True)
+                check("ten nhanh dang tuy chon -> tu choi", False)
+            except d.DeployError:
+                check("ten nhanh dang tuy chon -> tu choi", True)
+            try:
+                d.step_switch_branch(cfg, "feature", False, False)
+                check("khong xac nhan (khong tty, khong --yes) -> huy", False)
+            except d.DeployError as e:
+                check("khong xac nhan (khong tty, khong --yes) -> huy",
+                      "huy" in str(e) and cur() == "main")
+            old, new, sw = d.step_switch_branch(cfg, "feature", True, True)
+            check("--dry-run: bao commit moi, khong doi nhanh",
+                  new == f1 and not sw and cur() == "main"
+                  and "DEPLOY_BRANCH" not in open(d.local_env_path()).read())
+            write(vps, "app.txt", "sua tay\n")
+            try:
+                d.step_switch_branch(cfg, "feature", False, True)
+                check("working tree co sua doi -> tu choi", False)
+            except d.DeployError:
+                check("working tree co sua doi -> tu choi", cur() == "main")
+            sh(["git", "checkout", "-q", "app.txt"], vps)
+
+            old, new, sw = d.step_switch_branch(cfg, "feature", False, True)
+            text = open(d.local_env_path()).read()
+            check("doi sang feature: checkout tracking + HEAD moi",
+                  sw and old == m1 and new == f1 and cur() == "feature")
+            check("ghi nho DEPLOY_BRANCH, giu dong cu",
+                  "DEPLOY_BRANCH=feature" in text and "APPS=x y" in text
+                  and "# rieng VPS" in text, text)
+            cfg = d.load_config()
+            check("lan sau check_branch theo nhanh moi",
+                  d.check_branch(cfg) == "feature")
+
+            sh(["git", "checkout", "-q", "main"], dev)
+            write(dev, "app.txt", "main v2\n")
+            m2 = commit(dev, "main c2")
+            sh(["git", "push", "-q", "origin", "main"], dev)
+            old, new, sw = d.step_switch_branch(cfg, "main", False, True)
+            check("quay ve main (nhanh local cu) -> fast-forward toi c2",
+                  sw and new == m2 and cur() == "main"
+                  and d.load_config()["DEPLOY_BRANCH"] == "main")
+            text = open(d.local_env_path()).read()
+            check("DEPLOY_BRANCH khong bi lap dong",
+                  text.count("DEPLOY_BRANCH=") == 1, text)
+
+            sh(["git", "checkout", "-q", "feature"], vps)
+            try:
+                d.check_branch(d.load_config())
+                check("lech DEPLOY_BRANCH -> loi goi y --branch", False)
+            except d.DeployError as e:
+                check("lech DEPLOY_BRANCH -> loi goi y --branch",
+                      "git up --branch main" in str(e)
+                      and "git up --branch feature" in str(e))
+    finally:
         shutil.rmtree(tmp)
 
 
@@ -757,6 +877,7 @@ def main():
     test_migrate_error_blocks_restart()
     test_reflog_real()
     test_step_pull()
+    test_switch_branch()
     test_pm2_list_normalize()
     test_systemd_env_check()
     test_load_apps()
