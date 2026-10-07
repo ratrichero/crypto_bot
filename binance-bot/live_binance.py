@@ -2686,7 +2686,21 @@ class BinanceEngine:
             oid, client_order_id = self._place_market(
                 symbol, bside, qty, ps, ref_price=price
             )
-            entry = self._fill_price(symbol, oid, price)
+            try:
+                entry = self._fill_price(symbol, oid, price)
+            except binance_safety.BinanceSafetyStop:
+                raise
+            except Exception:
+                # Lenh DA duoc san nhan (co orderId) nhung khong doc duoc gia
+                # fill: tra lai theo clientOrderId nhu lenh mo ho de nhan lot
+                # + dat SL/TP, thay vi de vi the tran cho nguoi van hanh.
+                if client_order_id and not self.dry_run:
+                    self._ambiguous_order = {
+                        "symbol": symbol, "client_order_id": client_order_id,
+                        "qty": qty, "reduce_only": False, "ts": time.time(),
+                        "order_id": oid,
+                    }
+                raise
             pos = self._register_lot(symbol, side, qty, entry, notional,
                                      sl_pct, tp_pct, tag, level, oid,
                                      client_order_id)
@@ -2813,7 +2827,8 @@ class BinanceEngine:
                 keep.append(it)              # NEW/PARTIALLY_FILLED: cho
         self.state["ambiguous_orders"] = keep
         if (not keep and self.state.get("halted") and str(
-                self.state.get("halt_reason") or "").startswith("ambiguous ")):
+                self.state.get("halt_reason") or "").startswith(
+                    ("ambiguous ", "order fill reconciliation"))):
             self.state["halted"] = False
             self.state["halt_reason"] = None
             self.log("RECOVERY: da doi chieu xong lenh mo mo ho -> unhalt "

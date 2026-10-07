@@ -1422,6 +1422,32 @@ def test_failed_close_rearms_guards_and_recovers():
           ok and not st.get("halted"), st.get("halt_reason"))
 
 
+def test_unknown_fill_price_is_resolved_later():
+    """San nhan lenh nhung moi nguon gia (response/WS/fetch_order/userTrades)
+    deu loi -> tra lai sau theo clientOrderId, nhan lot + SL/TP, unhalt."""
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    eng._order_average = lambda order: None
+    eng._validate_order_result = lambda *a, **k: None
+    fake.fetch_order = lambda *a, **k: (_ for _ in ()).throw(
+        BinanceError("binance -1001 internal error"))
+    fake.trades_error = BinanceError("binance -1001 internal error")
+    pos, why = eng.open("BTCUSDT", "long", 600.0, 60000, 0.03, 0.005, "grid",
+                        level="b1")
+    check("fill khong ro: halt + luu de tra lai",
+          pos is None and st.get("halt_reason")
+          == "order fill reconciliation required"
+          and len(st.get("ambiguous_orders", [])) == 1, (why, st))
+    del eng._order_average                     # dung lai ham that
+    fake.trades_error = None
+    CLOCK.sleep(31)
+    eng.resolve_ambiguous_orders()
+    lot = st["positions"][0] if st["positions"] else {}
+    check("fill khong ro: nhan lot + du SL/TP, unhalt",
+          lot.get("entry") == 60000.0 and len(guards_of(fake, lot)) == 2
+          and not st.get("halted"), (lot, st.get("halt_reason")))
+
+
 TESTS = [
     test_close_one_of_many_grid_lots,
     test_close_detects_real_partial,
@@ -1478,6 +1504,7 @@ TESTS = [
     test_ambiguous_open_filled_is_adopted_with_guards,
     test_ambiguous_open_never_accepted_expires,
     test_failed_close_rearms_guards_and_recovers,
+    test_unknown_fill_price_is_resolved_later,
 ]
 
 
