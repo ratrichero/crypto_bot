@@ -8,12 +8,18 @@ không sửa, không restart radar.
 
 ```
 radar.py (paper, chay san 24/7)
-   | ghi signals.jsonl (buy) + alerts.jsonl (sell_cluster)
+   | ghi signals.jsonl (buy, kem wallet_price_usd + liquidity_usd)
+   |   + alerts.jsonl (sell_cluster, wallet_sell)
    v
 live_trader.py -- tail file, khong import radar
+   |--- KIEM TRA: mint (authority/Token-2022) -> quote mua -> chong mua duoi
+   |              -> quote thu ban lai (lo khu hoi / honeypot)
    |--- BUY:  Jupiter quote SOL->token -> swap -> sign (solders) -> gui qua Helius RPC
-   |--- SELL: Jupiter quote token->SOL -> swap -> sign -> gui (tung leg)
-   |--- Gia:  Jupiter quote token->USDC (fallback DexScreener)
+   |--- SELL: Jupiter quote token->SOL -> swap -> sign -> gui (tung leg,
+   |          lenh thoat bat buoc that bai -> nang bac slippage/phi)
+   |--- Gia:  Jupiter Price API v3 (1 request/moi vi the), thieu -> quote
+   |          token->USDC (fallback DexScreener)
+   |--- RENT: ban sach -> CloseAccount token account rong -> rent ve vi
    v
 live_positions.json (vi the mo) + live_trades.jsonl (lenh da dong)
 ```
@@ -31,11 +37,12 @@ không đánh theo tín hiệu cũ. Zero thay đổi vào `radar.py`.
 | sau TP2, rớt -30% từ đỉnh | trailing, bán hết |
 | -25% | SL, bán hết |
 | ≥2 ví tracked xả cùng token/30p | smart exit, bán hết |
+| ví nguồn đã bán cộng dồn ≥50% lượng đang giữ | copy exit, bán hết |
 | hết 480 phút, lãi ≥20% | chốt 1/2, giữ 1/2 trailing |
 | hết 480 phút, lãi <20% | bán hết |
 
 Thứ tự ưu tiên khi nhiều điều kiện cùng đúng trong 1 poll:
-trailing → SL → smart exit → time stop (giống paper).
+trailing → SL → smart exit → copy exit → time stop (giống paper).
 
 ## Mô hình an toàn
 
@@ -62,7 +69,10 @@ trailing → SL → smart exit → time stop (giống paper).
 - **Retry**: quote/swap thử lại tối đa `max_swap_retries` lần với
   blockhash mới. Lệnh bán luôn tính theo SỐ DƯ THỰC trên ví nên không
   bao giờ bán trùng 2 lần.
-- Private key KHÔNG BAO GIỜ được log.
+- Private key KHÔNG BAO GIỜ được log. Jupiter API key cũng bị che.
+- **Lọc token trước khi mua** (fail closed, xem mục Nâng cấp 10/2026).
+- **Thoát khẩn cấp**: SL/TRAIL/SMART_EXIT/COPY_EXIT/TIME bán thất bại chắc
+  chắn → vòng sau thử lại ngay với bậc `exit_escalation` kế tiếp.
 
 ## Cách chạy
 
@@ -91,6 +101,46 @@ cp config.live.example.json config.live.json   # sua neu can
       của mình; meme có thể về 0 trong vài phút
 - [ ] Đổi `"mode": "live"` trong `config.live.json` (cần restart)
 
+## Nâng cấp 10/2026 (meme radar 1→6 + paper khả thi)
+
+| # | Tính năng | Config (`config.live.json`) |
+|---|---|---|
+| 1 | Thu hồi rent token account (~0.00204 SOL/token) sau khi bán sạch; rent lần mua đầu được tách khỏi giá vào (`rent_lamports`) | `reclaim_rent`, `reclaim_max_per_loop` |
+| 2 | Lọc token: freeze/mint authority, Token-2022 (phí chuyển > 0, transfer hook, permanent delegate, non-transferable, mặc định frozen, pausable); quote thử bán lại: không có route → `skipped_no_sell_route`, lỗ khứ hồi > 6% → `skipped_round_trip` | `token_safety`, `reject_*`, `max_round_trip_loss_pct` |
+| 3 | Chống mua đuổi: giá mình > giá ví nguồn khớp (tính từ tx) quá 20% → `skipped_chase` | `max_entry_premium_pct` |
+| 4 | Thoát khẩn cấp nâng bậc slippage/impact/phí ưu tiên | `exit_escalation`, `sell_slippage_bps`, `sell_max_price_impact_pct` |
+| 5 | Giá batch qua Jupiter Price API v3 (≤50 token/request) | `price_batch`, `price_fallback_seconds` |
+| 6 | Copy exit theo ví nguồn (alert `wallet_sell` của radar) | `copy_exit`, `copy_exit_min_sold_frac` |
+
+- Bị từ chối trước khi gửi tx → signal đánh dấu `skipped_<lý do>`, KHÔNG
+  retry, không chặn entry; đếm trong `live_state.json` → `entry_rejects`.
+  Lỗi đọc RPC/Jupiter (không phải bằng chứng token xấu) → retry như cũ.
+- Mỗi trade trong `live_trades.jsonl` có thêm: `signal_ts`,
+  `wallet_price_usd`, `entry_premium_pct`, `round_trip_loss_pct`,
+  `liquidity_usd`, `rent_lamports`, `exit_tier_used`.
+- **Jupiter API key**: `lite-api.jup.ag` đang bị giảm rate và sẽ khai tử.
+  Tạo key tại developers.jup.ag → `export JUPITER_API_KEY=...` (hoặc file
+  `.jupiter_key`, chmod 600). Có key → bot tự dùng `https://api.jup.ag`.
+  Không key mà đổi sang `api.jup.ag` → giới hạn 0.5 req/s, đặt
+  `jupiter_min_interval_seconds: 2`.
+- **Radar phải chạy bản mới** để có `wallet_sell`, `wallet_price_usd`,
+  `liquidity_usd`. Radar cũ: copy exit và chống mua đuổi tự bỏ qua (không lỗi).
+- **Dọn account rỗng tồn từ trước**: `python close_empty_accounts.py` (chỉ
+  liệt kê) → kiểm tra → `python close_empty_accounts.py --yes`.
+- **VPS**: `config.live.json` không bị ghi đè khi pull — các key mới lấy
+  mặc định từ `DEFAULTS` trong code. Giá đã gom thành 1 request nên có thể
+  hạ `price_poll_seconds` xuống 5 và `loop_seconds` xuống 3 (cần API key,
+  hoặc giữ nguyên nếu chạy keyless).
+
+**Paper radar (đề xuất Musev)** — `config.json` của radar:
+`min_liquidity_mult` 20 (liquidity < size×20 → `skipped_low_liquidity`
+trong `paper_entries.jsonl`), slippage `min(size/liq×50, 15)%` trừ vào giá
+vào và ra (`final_ret_adj`), `min_exit_volume_mult` 5 (volume 5 phút <
+leg×5 → `exit_constrained`, chờ tối đa `max_exit_waits` 3 vòng rồi thoát
+với slippage 15% → `exit_failed_liquidity`). TP/SL vẫn kích hoạt theo giá
+DexScreener thô (đồng bộ live). `python report.py --sensitivity` phát lại
+lệnh cũ ở các mức thanh khoản giả định.
+
 ## Khác biệt so với paper (có chủ ý)
 
 1. **Size flat $10/lệnh** thay vì tiers theo mcap ($50/$100) — đơn giản
@@ -108,6 +158,8 @@ cp config.live.example.json config.live.json   # sua neu can
 
 - `live_trader.py` — module chính
 - `config.live.example.json` → copy thành `config.live.json`
-- `test_live_trader.py` — test suite offline (mock)
+- `test_live_trader.py`, `test_live_upgrade.py` — test suite offline (mock)
+- `close_empty_accounts.py` — dọn token account rỗng (mặc định chỉ liệt kê)
+- `feasibility.py`, `test_feasibility.py` — kiểm tra khả thi paper
 - `live_positions.json`, `live_state.json`, `live_trades.jsonl`,
   `live_trader.log` — runtime state (tự tạo, không commit)
