@@ -33,13 +33,17 @@ except Exception:  # pragma: no cover - dashboard van chay neu thieu
 st.set_page_config(page_title="Crypto Bots Dashboard", layout="wide")
 
 # ---------------- cau hinh ----------------
+# Goc repo (dashboard/..): moi duong dan mac dinh tinh tu day, khong viet cung
+# /home/ubuntu/muse_bot hay ~/workspace (duong dan cu chi con la phuong an cuoi).
+REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MEME_DIR = os.path.join(REPO_DIR, "meme-radar")
 DB = os.environ.get("DATABASE_URL")
-BINANCE_STATE = os.environ.get("BINANCE_STATE",
-                               "/home/ubuntu/muse_bot/binance-bot/state.json")
+BINANCE_STATE = os.environ.get("BINANCE_STATE") or os.path.join(
+    REPO_DIR, "binance-bot", "state.json")
 BINANCE_DIR = os.environ.get("BINANCE_DIR", os.path.dirname(BINANCE_STATE))
 # File .env chua API key Binance (chi doc, khong commit secret vao code)
-BINANCE_ENV_P = os.environ.get("BINANCE_ENV_P",
-                               "/home/ubuntu/muse_bot/.env")
+BINANCE_ENV_P = os.environ.get("BINANCE_ENV_P") or os.path.join(REPO_DIR,
+                                                                ".env")
 
 
 def _clear_halt_result(max_age=3600):
@@ -56,18 +60,48 @@ def _clear_halt_result(max_age=3600):
         return None
 
 
-OKX_STATE = os.environ.get("OKX_STATE",
-                           os.path.expanduser("~/workspace/trading-bot/state.json"))
-RADAR_STATE = os.environ.get("RADAR_STATE",
-                             os.path.expanduser("~/workspace/meme-radar/radar_state.json"))
-_HK = os.environ.get("HELIUS_KEY_FILE")
-if not _HK:
-    _HK = ("/home/ubuntu/muse_bot/.helius_key"
-           if os.path.exists("/home/ubuntu/muse_bot/.helius_key")
-           else os.path.expanduser("~/workspace/meme-radar/.helius_key"))
-HELIUS_KEY_FILE = _HK
-LIVE_CFG_P = os.environ.get("LIVE_CFG_P",
-                            "/home/ubuntu/muse_bot/meme-radar/config.live.json")
+def first_existing(*paths):
+    """Duong dan dau tien ton tai; khong co thi tra ung vien dau (de hien thi)."""
+    paths = [p for p in paths if p]
+    for p in paths:
+        if os.path.exists(p):
+            return p
+    return paths[0] if paths else ""
+
+
+def resolve_helius_key(env=None, repo=None):
+    """-> (key, nguon). Cung thu tu voi radar.py: env HELIUS_API_KEY -> file
+    env HELIUS_KEY_FILE -> <repo>/meme-radar/.helius_key -> <repo>/.helius_key
+    -> ~/workspace/meme-radar/.helius_key. KHONG bao gio log/in key."""
+    env = os.environ if env is None else env
+    repo = repo or REPO_DIR
+    key = (env.get("HELIUS_API_KEY") or "").strip()
+    if key:
+        return key, "env HELIUS_API_KEY"
+    for path in (env.get("HELIUS_KEY_FILE"),
+                 os.path.join(repo, "meme-radar", ".helius_key"),
+                 os.path.join(repo, ".helius_key"),
+                 os.path.expanduser("~/workspace/meme-radar/.helius_key")):
+        if not path:
+            continue
+        try:
+            with open(path) as f:
+                key = f.read().strip()
+        except (IOError, OSError):
+            continue
+        if key:
+            return key, path
+    return "", ""
+
+
+OKX_STATE = os.environ.get("OKX_STATE") or first_existing(
+    os.path.join(REPO_DIR, "trading-bot", "state.json"),
+    os.path.expanduser("~/workspace/trading-bot/state.json"))
+RADAR_STATE = os.environ.get("RADAR_STATE") or first_existing(
+    os.path.join(REPO_DIR, "meme-radar", "radar_state.json"),
+    os.path.expanduser("~/workspace/meme-radar/radar_state.json"))
+LIVE_CFG_P = os.environ.get("LIVE_CFG_P") or os.path.join(
+    MEME_DIR, "config.live.json")
 # Vi live cua meme-radar/live_trader.py (khop DEFAULTS.wallet_address).
 DEFAULT_SOL_WALLET = "DxYkrsJA6YdS1cqJ9ocPCYRBacd7Xan3DeYWZva89dLd"
 
@@ -93,10 +127,10 @@ def resolve_sol_wallet(env=None, cfg_path=None):
 
 
 SOL_WALLET = resolve_sol_wallet()
-LIVE_POS_P = os.environ.get("LIVE_POS_P",
-                            "/home/ubuntu/muse_bot/meme-radar/live_positions.json")
-LIVE_TRADES_P = os.environ.get("LIVE_TRADES_P",
-                               "/home/ubuntu/muse_bot/meme-radar/live_trades.jsonl")
+LIVE_POS_P = os.environ.get("LIVE_POS_P") or os.path.join(
+    MEME_DIR, "live_positions.json")
+LIVE_TRADES_P = os.environ.get("LIVE_TRADES_P") or os.path.join(
+    MEME_DIR, "live_trades.jsonl")
 SOL_MINT = "So11111111111111111111111111111111111111112"
 
 TZ = "Asia/Ho_Chi_Minh"
@@ -208,11 +242,7 @@ def fmt_ts(dt):
 @st.cache_data(ttl=180)
 def sol_balance():
     """So du SOL cua vi bot; None neu khong doc duoc. Khong bao gio in key."""
-    try:
-        with open(HELIUS_KEY_FILE) as f:
-            key = f.read().strip()
-    except Exception:
-        return None
+    key, _src = resolve_helius_key()
     if not key:
         return None
     try:
@@ -734,7 +764,7 @@ def tab_live_radar(days):
     live_radar_trades_frag(days)
 
 
-RADAR_DIR = os.environ.get("RADAR_DIR", "/home/ubuntu/muse_bot/meme-radar")
+RADAR_DIR = os.environ.get("RADAR_DIR") or MEME_DIR
 
 
 def live_radar_halt_status(base_dir, cfg_path, today=None):
@@ -945,7 +975,7 @@ def tab_monitor():
                 # Kiem tra block cho live-trader
                 if svc == "muse-live-trader":
                     try:
-                        lp = "/home/ubuntu/muse_bot/meme-radar/live_state.json"
+                        lp = os.path.join(MEME_DIR, "live_state.json")
                         with open(lp) as f:
                             ls = json.load(f)
                         if ls.get("entry_blocked"):
@@ -966,7 +996,7 @@ def tab_monitor():
 
     # --- Binance Live ---
     st.markdown("#### 🟡 Binance Futures LIVE")
-    pause_file = "/home/ubuntu/muse_bot/binance-bot/PAUSE"
+    pause_file = os.path.join(BINANCE_DIR, "PAUSE")
     is_paused = os.path.exists(pause_file)
     col1, col2 = st.columns(2)
     with col1:
@@ -1025,7 +1055,7 @@ def tab_monitor():
 
     # --- Radar Live (Solana) ---
     st.markdown("#### ☀️ Radar Live (Solana tiền thật)")
-    radar_pause = "/home/ubuntu/muse_bot/meme-radar/PAUSE"
+    radar_pause = os.path.join(MEME_DIR, "PAUSE")
     radar_paused = os.path.exists(radar_pause)
     rcol1, rcol2 = st.columns(2)
     with rcol1:
@@ -1100,7 +1130,7 @@ def tab_monitor():
 
     # Solana live positions
     try:
-        lp = "/home/ubuntu/muse_bot/meme-radar/live_positions.json"
+        lp = LIVE_POS_P
         with open(lp) as f:
             spos = json.load(f)
         if spos:

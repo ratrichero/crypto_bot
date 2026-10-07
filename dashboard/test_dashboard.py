@@ -353,7 +353,52 @@ def test_monitor_pm2():
               == "[x] hello")
 
 
-TESTS = [test_session_cookie, test_sol_wallet, test_live_radar_halt_status, test_config_helpers,
+def test_helius_key():
+    print("[dashboard: tim key Helius theo goc repo]")
+    ns = load("resolve_helius_key", "first_existing")
+    f = ns["resolve_helius_key"]
+    with tempfile.TemporaryDirectory() as repo:
+        os.makedirs(os.path.join(repo, "meme-radar"))
+        home = os.path.join(repo, "home")
+        os.makedirs(home)
+        old_home = os.environ.get("HOME")
+        os.environ["HOME"] = home             # khong cham ~/workspace that
+        try:
+            check("khong co key o dau -> rong", f(env={}, repo=repo) == ("", ""))
+            kp = os.path.join(repo, "meme-radar", ".helius_key")
+            with open(kp, "w") as fh:
+                fh.write("  HKEY-RADAR \n")
+            check("loi VPS: key o <repo>/meme-radar/.helius_key -> tim thay",
+                  f(env={}, repo=repo) == ("HKEY-RADAR", kp))
+            other = os.path.join(repo, "khac.key")
+            with open(other, "w") as fh:
+                fh.write("HKEY-FILE")
+            check("env HELIUS_KEY_FILE uu tien hon file trong repo",
+                  f(env={"HELIUS_KEY_FILE": other}, repo=repo)[0] == "HKEY-FILE")
+            check("env HELIUS_KEY_FILE tro file khong ton tai -> tim tiep",
+                  f(env={"HELIUS_KEY_FILE": "/khong/co"}, repo=repo)[0]
+                  == "HKEY-RADAR")
+            check("env HELIUS_API_KEY uu tien nhat (giong radar.py)",
+                  f(env={"HELIUS_API_KEY": "HENV", "HELIUS_KEY_FILE": other},
+                    repo=repo) == ("HENV", "env HELIUS_API_KEY"))
+            with open(kp, "w") as fh:
+                fh.write("\n")
+            with open(os.path.join(repo, ".helius_key"), "w") as fh:
+                fh.write("HKEY-ROOT")
+            check("file rong -> bo qua, sang <repo>/.helius_key",
+                  f(env={}, repo=repo)[0] == "HKEY-ROOT")
+        finally:
+            if old_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = old_home
+    code = "\n".join(l for l in SRC.splitlines()
+                     if not l.lstrip().startswith("#"))
+    check("app.py khong con duong dan viet cung /home/ubuntu/muse_bot",
+          "/home/ubuntu/muse_bot" not in code)
+
+
+TESTS = [test_session_cookie, test_helius_key, test_sol_wallet, test_live_radar_halt_status, test_config_helpers,
          test_scanner_tab_levels, test_monitor_pm2]
 
 
