@@ -40,6 +40,10 @@ STATE_P = os.path.join(BASE, "state.json")
 TRADES_P = os.path.join(BASE, "trades.jsonl")
 LOG_P = os.path.join(BASE, "bot.log")
 STOP_P = os.path.join(BASE, "STOP")
+# Dashboard "Xoa halt" tao file nay; bot kiem tra an toan roi go halt trong
+# RAM (dashboard sua thang state.json se bi bot ghi de / de mat lot moi).
+CLEAR_HALT_P = os.path.join(BASE, "CLEAR_HALT")
+CLEAR_HALT_RESULT_P = os.path.join(BASE, "clear_halt_result.json")
 
 FAST_POLL = CFG.get("fast_poll_seconds", 0.5)
 SLOW_EVERY = 10          # slow tasks every N fast loops (~5s)
@@ -323,6 +327,36 @@ def include_position_symbols(st):
         log("WARNING lot dang mo tren symbol ngoai universe: %s -> theo doi "
             "rui ro, khong mo lenh moi" % ", ".join(extra))
     return extra
+
+
+def handle_clear_halt_request(engine, st):
+    """Xu ly yeu cau go halt tu dashboard. Tra ve True neu state doi."""
+    try:
+        os.remove(CLEAR_HALT_P)
+    except FileNotFoundError:
+        return False
+    reason = str(st.get("halt_reason") or "")
+    if not st.get("halted"):
+        ok, msg = True, "khong halt"
+    elif reason.startswith("daily stop") and st.get("daily_stop_day") == utc_day():
+        ok, msg = False, ("daily stop trong ngay - tu go sang ngay UTC moi "
+                          "(go tay se cho giao dich tiep du da cham tran lo)")
+    else:
+        try:
+            ok, msg = engine.try_clear_halt()
+        except binance_safety.BinanceSafetyStop:
+            raise
+        except Exception as e:
+            ok, msg = False, "loi kiem tra: %s" % e
+    log("CLEAR_HALT request: halt='%s' -> %s (%s)"
+        % (reason, "OK" if ok else "TU CHOI", msg))
+    try:
+        with open(CLEAR_HALT_RESULT_P, "w") as f:
+            json.dump({"ts": time.time(), "ok": ok, "halt_reason": reason,
+                       "message": msg}, f)
+    except OSError as e:
+        log("WARNING khong ghi duoc %s: %s" % (CLEAR_HALT_RESULT_P, e))
+    return True
 
 
 def run_risk_controls(engine, st, mark_prices, prices, reconcile_hold):
@@ -1164,6 +1198,14 @@ def main():
                     raise
                 except Exception as e:
                     log(f"recheck_startup_holds loi: {e}")
+            if os.path.exists(CLEAR_HALT_P):
+                try:
+                    if handle_clear_halt_request(engine, st):
+                        dirty = True
+                except binance_safety.BinanceSafetyStop:
+                    raise
+                except Exception as e:
+                    log(f"CLEAR_HALT loi: {e}")
             if MODE == "live" and not engine.reconcile_positions():
                 if not st["halted"]:
                     st["halted"] = True

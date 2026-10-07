@@ -7,6 +7,7 @@ Tu refresh 60s. Vi the dang mo doc truc tiep tu state file cua bot.
 import json
 import os
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -33,9 +34,26 @@ st.set_page_config(page_title="Crypto Bots Dashboard", layout="wide")
 DB = os.environ.get("DATABASE_URL")
 BINANCE_STATE = os.environ.get("BINANCE_STATE",
                                "/home/ubuntu/muse_bot/binance-bot/state.json")
+BINANCE_DIR = os.environ.get("BINANCE_DIR", os.path.dirname(BINANCE_STATE))
 # File .env chua API key Binance (chi doc, khong commit secret vao code)
 BINANCE_ENV_P = os.environ.get("BINANCE_ENV_P",
                                "/home/ubuntu/muse_bot/.env")
+
+
+def _clear_halt_result(max_age=3600):
+    """Ket qua yeu cau 'Xoa halt' bot ghi lai (an sau max_age giay)."""
+    try:
+        with open(os.path.join(BINANCE_DIR, "clear_halt_result.json")) as f:
+            res = json.load(f)
+        ts = float(res.get("ts") or 0)
+        if time.time() - ts > max_age:
+            return None
+        res["when"] = datetime.fromtimestamp(ts, TZINFO).strftime("%H:%M:%S")
+        return res
+    except Exception:
+        return None
+
+
 OKX_STATE = os.environ.get("OKX_STATE",
                            os.path.expanduser("~/workspace/trading-bot/state.json"))
 RADAR_STATE = os.environ.get("RADAR_STATE",
@@ -856,16 +874,29 @@ def tab_monitor():
                 bs = json.load(f)
             if bs.get("halted"):
                 st.error(f"🛑 HALT: {bs.get('halt_reason')}")
-                if st.button("✅ Xóa halt", key="clear_halt_binance"):
-                    bs["halted"] = False
-                    bs["halt_reason"] = None
-                    bs.pop("halted_at", None)
-                    with open(BINANCE_STATE, 'w') as f:
-                        json.dump(bs, f)
-                    st.success("Đã xóa halt")
-                    st.rerun()
+                # KHONG sua thang state.json: bot dang chay giu state trong
+                # RAM se ghi de (halt quay lai) va ban ghi cu co the de mat
+                # lot vua mo. Gui yeu cau, bot tu kiem tra an toan roi go.
+                req_p = os.path.join(BINANCE_DIR, "CLEAR_HALT")
+                if os.path.exists(req_p):
+                    st.info("⏳ Đã gửi yêu cầu xóa halt, bot đang kiểm tra "
+                            "(~10 giây)…")
+                elif st.button("✅ Xóa halt", key="clear_halt_binance"):
+                    try:
+                        with open(req_p, "w") as f:
+                            f.write(datetime.now(TZINFO).isoformat() + "\n")
+                        st.info("Đã gửi yêu cầu - bot sẽ kiểm tra sàn khớp "
+                                "state + đủ SL/TP rồi mới gỡ halt.")
+                    except Exception as e:
+                        st.error(f"Lỗi: {e}")
             else:
                 st.success("✅ Không halt")
+            res = _clear_halt_result()
+            if res:
+                msg = (f"Yêu cầu xóa halt lúc {res['when']}: "
+                       f"{res.get('message', '')}")
+                (st.success if res.get("ok") else st.warning)(
+                    ("✅ " if res.get("ok") else "⛔ Bot từ chối - ") + msg)
         except Exception as e:
             st.info(f"Không đọc được state: {e}")
 

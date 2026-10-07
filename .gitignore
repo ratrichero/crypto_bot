@@ -27,6 +27,8 @@ config.live.json
 # Binance bot runtime guards
 binance-bot/*.lock
 binance-bot/binance_circuit.json
+binance-bot/CLEAR_HALT
+binance-bot/clear_halt_result.json
 # Config runtime cache + ket qua scanner (sinh khi chay)
 binance-bot/runtime_config.cache.json
 binance-bot/runtime_config.cache.json.tmp

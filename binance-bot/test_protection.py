@@ -1605,6 +1605,59 @@ def test_stuck_partial_halt_recovers_on_reconcile():
           ok and not st.get("halted"), st.get("halt_reason"))
 
 
+def test_clear_halt_request_checks_safety():
+    """Dashboard 'Xoa halt' -> file CLEAR_HALT; bot chi go khi an toan va go
+    trong RAM (khong bi ghi de)."""
+    import tempfile
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    bot_state(st)
+    lot = open_lot(eng, "long", 60000)
+    tmp = tempfile.mkdtemp()
+    saved = (binance_bot.CLEAR_HALT_P, binance_bot.CLEAR_HALT_RESULT_P)
+    binance_bot.CLEAR_HALT_P = os.path.join(tmp, "CLEAR_HALT")
+    binance_bot.CLEAR_HALT_RESULT_P = os.path.join(tmp, "res.json")
+
+    def request():
+        open(binance_bot.CLEAR_HALT_P, "w").write("x")
+        changed = binance_bot.handle_clear_halt_request(eng, st)
+        res = json.load(open(binance_bot.CLEAR_HALT_RESULT_P))
+        return changed, res
+    try:
+        check("clear halt: khong co file -> khong lam gi",
+              binance_bot.handle_clear_halt_request(eng, st) is False)
+        st.update(halted=True, halt_reason="manual test halt")
+        sl_id = lot.pop("sl_algo_id")
+        _, res = request()
+        check("clear halt: lot thieu SL -> tu choi, van halt, xoa file yeu cau",
+              not res["ok"] and st.get("halted")
+              and not os.path.exists(binance_bot.CLEAR_HALT_P), res)
+        lot["sl_algo_id"] = sl_id
+        st["ambiguous_orders"] = [{"symbol": "BTCUSDT"}]
+        _, res = request()
+        check("clear halt: con lenh cho doi chieu -> tu choi",
+              not res["ok"] and st.get("halted"), res)
+        st["ambiguous_orders"] = []
+        fake.positions[("BTCUSDT", "long")] += 0.01
+        _, res = request()
+        check("clear halt: san lech state -> tu choi",
+              not res["ok"] and st.get("halted"), res)
+        fake.positions[("BTCUSDT", "long")] -= 0.01
+        st.update(halt_reason="daily stop -5.00%",
+                  daily_stop_day=binance_bot.utc_day())
+        _, res = request()
+        check("clear halt: daily stop trong ngay -> tu choi",
+              not res["ok"] and st.get("halted"), res)
+        st.update(halt_reason="manual test halt")
+        changed, res = request()
+        check("clear halt: an toan -> go halt trong state cua bot",
+              changed and res["ok"] and not st.get("halted")
+              and st.get("halt_reason") is None, (res, st.get("halt_reason")))
+    finally:
+        binance_bot.CLEAR_HALT_P, binance_bot.CLEAR_HALT_RESULT_P = saved
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 # ===================================================================
 # Kiem soat rui ro LUON chay (halt chi chan mo lenh moi)
 # ===================================================================
@@ -1751,6 +1804,7 @@ TESTS = [
     test_validate_reads_ws_cumulative_fields,
     test_terminal_partial_open_is_adopted_and_unhalted,
     test_stuck_partial_halt_recovers_on_reconcile,
+    test_clear_halt_request_checks_safety,
     test_basket_runs_during_reconcile_hold,
     test_basket_evaluates_risk_halted_symbol_with_lots,
     test_grid_total_stop_across_symbols,

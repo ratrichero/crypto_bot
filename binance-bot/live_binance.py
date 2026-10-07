@@ -2218,6 +2218,43 @@ class BinanceEngine(EntryOrdersMixin):
             self._reconcile_exchange_protection(rows)
         return not self.state.get("halted")
 
+    def try_clear_halt(self):
+        """Go halt THEO YEU CAU nguoi van hanh (dashboard / file CLEAR_HALT).
+
+        Chi go khi kiem tra lai thay an toan: khong con lenh mo cho doi
+        chieu, san khop state (reconcile force, gom ca buffer thanh ly), moi
+        lot live du SL/TP, startup hold da het nguyen nhan. Tra ve (ok, msg).
+        Go trong RAM cua bot -> lan save ke tiep ghi xuong state.json (khac
+        voi viec dashboard sua thang file, bi bot ghi de)."""
+        if not self.state.get("halted"):
+            return True, "khong halt"
+        reason = str(self.state.get("halt_reason") or "")
+        pending = self.state.get("ambiguous_orders") or []
+        if pending:
+            return False, ("con %d lenh mo cho doi chieu (%s)"
+                           % (len(pending), ", ".join(
+                               str(it.get("symbol")) for it in pending)))
+        if reason in self._STARTUP_HOLDS:
+            if not self.recheck_startup_holds(force=True):
+                return False, ("doi chieu khoi dong van loi: %s"
+                               % self.state.get("halt_reason"))
+        if not self.reconcile_positions(force=True):
+            return False, ("doi chieu vi the khong dat: %s"
+                           % (self.state.get("halt_reason") or "loi doc san"))
+        missing = ["#%s %s thieu %s" % (p.get("id"), p.get("symbol"),
+                                         "/".join(self._missing_guards(p)))
+                   for p in self.state.get("positions", [])
+                   if p.get("live") and self._missing_guards(p)]
+        if missing:
+            return False, "lot chua du SL/TP: " + "; ".join(missing)
+        if self.state.get("halted"):
+            self.state["halted"] = False
+            self.state["halt_reason"] = None
+            self.state.pop("halted_at", None)
+        self.log("MANUAL CLEAR HALT: '%s' -> unhalt (san khop state, du SL/TP, "
+                 "khong con lenh cho doi chieu)" % reason)
+        return True, "da go halt '%s'" % reason
+
     def _fetch_open_algo_orders(self, symbol=None):
         """Return normalized open USD-M Algo Orders from the exchange."""
         query = getattr(self.ex, "fapiPrivateGetOpenAlgoOrders", None)
