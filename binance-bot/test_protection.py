@@ -1010,6 +1010,57 @@ def test_detect_real_exit_old_lot_and_busy_symbol():
           and recs[0]["estimated"] is False, recs)
 
 
+# ===================================================================
+# Reconcile hold: van dat SL/TP thieu, khong dong cuong buc
+# ===================================================================
+def _hold(st):
+    st["halted"] = True
+    st["halt_reason"] = "exchange position reconciliation mismatch"
+
+
+def test_hold_still_rearms_missing_sl():
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    fake.post_failures = [BinanceError("binance -1001 internal error")] * 2
+    lot = open_lot(eng, "long", 60000, level="b1")
+    check("hold: lot mo ra thieu SL", lot["protection_status"] == "retrying"
+          and not lot.get("sl_algo_id"), lot)
+    _hold(st)
+    CLOCK.sleep(11)
+    changed = binance_bot.protect_during_hold(eng)
+    check("hold: SL/TP duoc dat lai du dang reconcile hold",
+          changed and lot.get("sl_algo_id") and lot.get("tp_algo_id")
+          and lot["protection_status"] == "armed"
+          and len(guards_of(fake, lot)) == 2, (lot, eng.logs[-3:]))
+
+
+def test_hold_never_force_closes_without_sl():
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    fake.post_failures = [BinanceError("binance -1001 internal error")] * 60
+    lot = open_lot(eng, "long", 60000, level="b1")
+    fake.post_failures = [BinanceError("binance -1001 internal error")] * 60
+    _hold(st)
+    for _ in range(15):
+        CLOCK.sleep(10)
+        binance_bot.protect_during_hold(eng)
+    crit = [m for m in eng.logs if "reconcile hold" in m and "CRITICAL" in m]
+    check("hold: qua deadline KHONG dong lot (state lech san)",
+          len(st["positions"]) == 1
+          and fake.positions.get(("BTCUSDT", "long")) == 0.01
+          and not eng.drain_close_records(), st["positions"])
+    check("hold: CRITICAL log 1 lan, van tiep tuc thu dat SL",
+          len(crit) == 1 and fake.calls.count("post_algo") > 5,
+          (crit, fake.calls.count("post_algo")))
+    # het hold -> hanh vi cu: dong lot khong SL qua deadline
+    st["halted"] = False
+    st["halt_reason"] = ""
+    retry(eng, 10)
+    recs = eng.drain_close_records()
+    check("het hold: lot khong SL qua deadline bi dong nhu cu",
+          st["positions"] == [] and len(recs) == 1, recs)
+
+
 TESTS = [
     test_close_one_of_many_grid_lots,
     test_close_detects_real_partial,
@@ -1050,6 +1101,8 @@ TESTS = [
     test_fee_fallback_estimated,
     test_real_fees_detect_group_close_prorated,
     test_detect_real_exit_old_lot_and_busy_symbol,
+    test_hold_still_rearms_missing_sl,
+    test_hold_never_force_closes_without_sl,
 ]
 
 

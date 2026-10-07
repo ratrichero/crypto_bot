@@ -2466,8 +2466,12 @@ class BinanceEngine:
                         "/".join(l.upper() for l in self._missing_guards(pos)),
                         pos["protection_error"], delay))
 
-    def retry_protection(self):
+    def retry_protection(self, arm_only=False):
         """Arm every missing guard; returns True when state changed.
+
+        arm_only=True (bot dang reconcile hold - state lech san): CHI dat
+        chan thieu (lenh dong-only trong Hedge Mode, luon giam rui ro), KHONG
+        dong cuong buc theo deadline vi qty local co the sai.
 
         Covers new lots whose first attempt failed, guards reported lost by
         sync_exchange_protection (cancelled/expired/rejected on Binance),
@@ -2502,7 +2506,16 @@ class BinanceEngine:
                 self._schedule_protection_retry(pos, delay=0)
                 changed = True
             deadline = pos.get("protection_deadline")
-            if "sl" in missing and deadline and now >= deadline:
+            if ("sl" in missing and deadline and now >= deadline
+                    and arm_only):
+                if not pos.get("_hold_sl_warned"):
+                    self.log("CRITICAL PROTECTION #%s %s thieu SL qua deadline "
+                             "trong luc reconcile hold -> KHONG tu dong (state "
+                             "lech san), tiep tuc thu dat SL; can kiem tra tay"
+                             % (pos["id"], pos["symbol"]))
+                    pos["_hold_sl_warned"] = True
+                    changed = True
+            elif "sl" in missing and deadline and now >= deadline:
                 self.log("CRITICAL PROTECTION #%s %s khong dat duoc SL sau "
                          "deadline -> dong vi the" % (pos["id"], pos["symbol"]))
                 rec = None
@@ -2529,6 +2542,7 @@ class BinanceEngine:
                 pos.pop("protection_retry_at", None)
                 pos.pop("protection_deadline", None)
                 pos.pop("protection_error", None)
+                pos.pop("_hold_sl_warned", None)
                 self.log("PROTECTION #%s %s du SL/TP tren san (sl=%s tp=%s)"
                          % (pos["id"], pos["symbol"], pos.get("sl_algo_id"),
                             pos.get("tp_algo_id")))

@@ -423,6 +423,17 @@ def manage_grid(engine, st, symbol, price):
     return changed
 
 
+def protect_during_hold(engine):
+    """Reconcile hold: chi dat lai SL/TP thieu (khong dong, khong don)."""
+    try:
+        return bool(engine.retry_protection(arm_only=True))
+    except binance_safety.BinanceSafetyStop:
+        raise
+    except Exception as e:
+        log(f"retry_protection (hold) loi: {e}")
+        return False
+
+
 def main():
     # One process per host/IP.  This lock is held for the lifetime of main.
     lock_handle = acquire_instance_lock()
@@ -660,6 +671,11 @@ def main():
                  "unmanaged ", "position ")
             )
             if not DATA_ONLY:
+                if reconcile_hold:
+                    # State lech san: khong mo/dong/don lenh, nhung lot thieu
+                    # SL/TP van phai duoc dat chan (dong-only, giam rui ro).
+                    if protect_during_hold(engine):
+                        dirty = True
                 if not reconcile_hold:
                     if manage_grid_risk(engine, st, mark_prices):
                         dirty = True
