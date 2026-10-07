@@ -5,6 +5,10 @@
 Dung CHUNG logic voi bot live:
 - scanner.compute_metrics / scanner.judge (cung nguong `scanner.*`);
 - range_grid.build_range / lot_exits / check_break / plan_slots.
+- trend_filter.bias (loc chieu xu huong BTC + tung symbol, task 34) va tran
+  lot cung chieu grid.max_same_side - chi khi cfg co muc "trend" (config
+  .example.json co san); so sanh: --set trend.market_filter=false
+  --set trend.symbol_filter=false --set grid.max_same_side=0.
 
 Lenh:
   download       tai nen 5m nhieu symbol vao --data-dir (SYMBOL-5m.jsonl)
@@ -28,6 +32,11 @@ Gia dinh (ghi ro trong report):
 - Scanner: moi `rescan_minutes` (mac dinh 60, live 15), chi dung nen 1h
   / 15m DA DONG truoc thoi diem quet; can du `min_h1` nen 1h (mac dinh
   498 = nhu live) -> ~21 ngay dau chi de lam nong chi bao.
+- Loc xu huong: bias tinh 1 lan/gio tu nen 1h DA DONG (gia = gia dong nen
+  gio truoc; live tinh lai moi 5 phut voi gia hien tai). Market symbol
+  (BTCUSDT) lay tu --data-dir ke ca khi khong nam trong --symbols (khong
+  giao dich no); khong co file -> tat lop BTC (ghi trong assumptions).
+  Chua du ~56 nen 1h -> chan nhu live (fail-closed).
 - Khong tinh funding. Khong goi API xac thuc.
 """
 from __future__ import annotations
@@ -50,6 +59,7 @@ if BASE not in sys.path:
 import backtest as bt1  # noqa: E402
 import range_grid  # noqa: E402
 import scanner  # noqa: E402
+import trend_filter  # noqa: E402
 
 BAR_MS = 5 * 60 * 1000
 M15_MS = 15 * 60 * 1000
@@ -172,6 +182,34 @@ def scan_all(data: Dict[str, List[dict]], rescan_minutes: int,
     return out
 
 
+# ---------------------------------------------------------------- trend
+_TREND_CACHE: Dict[tuple, Dict[int, str]] = {}
+
+
+def trend_series(bars: Sequence[dict], tcfg: dict, market: bool
+                 ) -> Dict[int, str]:
+    """{gio_bat_dau: bias} - bias ap dung trong gio do, tinh tu toi da 98
+    nen 1h DA DONG truoc gio do (nhu live lay 99 nen, bo nen dang chay).
+    Memo theo (du lieu, tham so) vi walk-forward tao nhieu PortfolioSim."""
+    keys = ("ema_period", "slope_bars", "slope_min_atr", "market_move_hours",
+            "market_move_pct")
+    ck = (bars[0]["ts"], bars[-1]["ts"], len(bars), id(bars), market,
+          tuple(tcfg[k] for k in keys))
+    if ck in _TREND_CACHE:
+        return _TREND_CACHE[ck]
+    h1 = Agg(bars, H1_MS).completed
+    out: Dict[int, str] = {}
+    lim = trend_filter.KLINE_LIMIT - 1
+    for k in range(len(h1)):
+        win = h1[max(0, k + 1 - lim):k + 1]
+        b = trend_filter.bias(win + [win[-1]], win[-1]["c"], tcfg,
+                              market=market)
+        if b is not None:
+            out[h1[k]["ts"] + H1_MS] = b["bias"]
+    _TREND_CACHE[ck] = out
+    return out
+
+
 # ------------------------------------------------------------ simulator
 def _day(ts: int) -> int:
     return ts // DAY_MS
@@ -191,7 +229,8 @@ class PortfolioSim:
                  initial: Optional[float] = None,
                  fixed: Optional[Dict[str, dict]] = None,
                  fill_through: float = 0.0002,
-                 rescan_minutes: int = 60):
+                 rescan_minutes: int = 60,
+                 market_bars: Optional[List[dict]] = None):
         if entry_mode not in ("limit", "market"):
             raise ValueError("entry_mode phai la limit|market")
         self.data, self.scans, self.cfg = data, scans, cfg
@@ -229,7 +268,8 @@ class PortfolioSim:
                          "orders_cancelled": 0, "market_entries": 0,
                          "basket_stops": 0, "total_stops": 0,
                          "daily_stops": 0, "breaks": 0, "derisk": 0,
-                         "ranges_built": 0, "slot_denied": 0}
+                         "ranges_built": 0, "slot_denied": 0,
+                         "trend_denied": 0, "side_cap_denied": 0}
         self.sym: Dict[str, dict] = {
             s: {"rng": None, "broken": False, "risk_halted": False,
                 "scan": None, "pending": {}, "last": None}
@@ -240,6 +280,34 @@ class PortfolioSim:
                     self.sym[s]["rng"] = rng
                     self.counters["ranges_built"] += 1
         self.allowed: List[str] = list(fixed) if fixed else []
+        # Loc chieu xu huong + tran cung chieu (task 34). Study (fixed) =
+        # kiem chung scanner co lap -> khong ap.
+        self.side_cap = 0 if fixed else int(self.g.get("max_same_side")
+                                            or 0)
+        self.trend = None
+        self.trend_bias: Dict[str, Dict[int, str]] = {}
+        self.trend_note = "tat (cfg khong co muc trend)"
+        if not fixed and isinstance(cfg.get("trend"), dict):
+            t = trend_filter.tcfg(cfg)
+            mkt = str(t.get("market_symbol") or "BTCUSDT").upper()
+            layers = []
+            if t["market_filter"]:
+                mb = data.get(mkt) or market_bars
+                if mb:
+                    self.trend_bias[mkt] = trend_series(mb, t, True)
+                    layers.append(mkt)
+                else:
+                    t = dict(t, market_filter=False)
+                    layers.append("%s: khong co du lieu -> tat" % mkt)
+            if t["symbol_filter"]:
+                for s_, bars in data.items():
+                    if s_ not in self.trend_bias:
+                        self.trend_bias[s_] = trend_series(bars, t,
+                                                           s_ == mkt)
+                layers.append("tung symbol")
+            if t["market_filter"] or t["symbol_filter"]:
+                self.trend = dict(t, market_symbol=mkt)
+            self.trend_note = ", ".join(layers) or "tat"
         self.halted_day: Optional[int] = None
         self.day: Optional[int] = None
         self.day_start_equity = self.initial
@@ -270,6 +338,27 @@ class PortfolioSim:
                   for p in self.positions)
         return (cur + self._pending_notional() + extra
                 <= self.max_notional_mult * max(self.mark_equity(), 0) + 1e-9)
+
+    def _trend_blocked(self, sym: str, side: str, ts: int) -> bool:
+        t = self.trend
+        if not t:
+            return False
+        hour = ts - ts % H1_MS
+        layers = []
+        if t["market_filter"]:
+            layers.append(t["market_symbol"])
+        if t["symbol_filter"]:
+            layers.append(sym)
+        for s_ in layers:
+            b = self.trend_bias.get(s_, {}).get(hour)
+            if b is None or trend_filter.blocked_side(b) == side:
+                return True          # thieu du lieu -> chan (nhu live)
+        return False
+
+    def _side_count(self, side: str) -> int:
+        return (sum(1 for p in self.positions if p["side"] == side)
+                + sum(1 for s in self.sym.values()
+                      for o in s["pending"].values() if o["side"] == side))
 
     def _blocked(self, sym: str, ts: int) -> bool:
         s = self.sym[sym]
@@ -399,6 +488,12 @@ class PortfolioSim:
                     cands.append({"key": key, "side": o["side"],
                                   "price": o["price"],
                                   "dist": abs(o["price"] / price - 1)})
+            if self.trend:
+                n0 = len(cands)
+                cands = [c for c in cands
+                         if not self._trend_blocked(sym, c["side"], ts)]
+                if len(cands) < n0:
+                    self.counters["trend_denied"] += 1
             rows.append({"symbol": sym, "score": (s["scan"] or {}).get(
                 "score", 0), "lots": len(self._lots(sym)),
                 "candidates": cands, "pending": set(s["pending"])})
@@ -406,7 +501,19 @@ class PortfolioSim:
         total = len(self.positions) + sum(
             len(self.sym[x]["pending"]) for x in self.sym
             if x not in {r["symbol"] for r in rows})
-        chosen = set(range_grid.plan_slots(rows, self.g, total))
+        side_room = None
+        if self.side_cap > 0:
+            planned = {r["symbol"] for r in rows}
+            side_room = {}
+            for sd in ("long", "short"):
+                used = (sum(1 for p in self.positions if p["side"] == sd)
+                        + sum(1 for x, s_ in self.sym.items()
+                              if x not in planned
+                              for o in s_["pending"].values()
+                              if o["side"] == sd))
+                side_room[sd] = max(0, self.side_cap - used)
+        chosen = set(range_grid.plan_slots(rows, self.g, total,
+                                           side_room=side_room))
         for r in rows:
             sym = r["symbol"]
             s = self.sym[sym]
@@ -445,6 +552,15 @@ class PortfolioSim:
         s = self.sym[sym]
         taken = {p["key"] for p in self._lots(sym)} | denied
         for lv in range_grid.market_triggers(s["rng"], price, taken):
+            if self._trend_blocked(sym, lv["side"], ts):
+                denied.add(lv["key"])
+                self.counters["trend_denied"] += 1
+                continue
+            if (self.side_cap > 0
+                    and self._side_count(lv["side"]) >= self.side_cap):
+                denied.add(lv["key"])
+                self.counters["side_cap_denied"] += 1
+                continue
             if not self._market_slot_ok(sym):
                 denied.add(lv["key"])
                 self.counters["slot_denied"] += 1
@@ -649,7 +765,9 @@ class PortfolioSim:
                 "slippage": self.slip, "fill_through": self.fill_through,
                 "lot_notional": self.notional,
                 "intrabar": "bullish O-L-H-C, bearish O-H-L-C, SL first",
-                "funding": "not_modeled"},
+                "funding": "not_modeled",
+                "trend_filter": self.trend_note,
+                "max_same_side": self.side_cap or "tat"},
         })
         return res
 
@@ -782,7 +900,8 @@ def walk_forward(data: Dict[str, List[dict]],
                  space: Optional[Dict[str, Sequence[float]]] = None,
                  entry_mode: str = "limit", fill_through: float = 0.0002,
                  start_ms: Optional[int] = None,
-                 rescan_minutes: int = 60, log=print) -> dict:
+                 rescan_minutes: int = 60, log=print,
+                 market_bars: Optional[List[dict]] = None) -> dict:
     space = space or DEFAULT_SPACE
     cands = candidate_cfgs(base, space)
     first_scan = min((min(v) for v in scans.values() if v), default=None)
@@ -794,7 +913,7 @@ def walk_forward(data: Dict[str, List[dict]],
     st = int((step_days or test_days) * DAY_MS)
     folds = []
     kw = dict(entry_mode=entry_mode, fill_through=fill_through,
-              rescan_minutes=rescan_minutes)
+              rescan_minutes=rescan_minutes, market_bars=market_bars)
     while t + tr + te <= last:
         best = None
         for params, cfg in cands:
@@ -922,6 +1041,24 @@ def _dump(obj: dict, path: Optional[str]) -> None:
         print("Da ghi %s" % path)
 
 
+def market_bars_for(cfg: dict, data_dir: str,
+                    data: Dict[str, List[dict]]) -> Optional[List[dict]]:
+    """Nen market symbol (BTCUSDT) cho lop loc BTC khi no khong nam trong
+    --symbols (khong giao dich, chi tinh xu huong)."""
+    if not isinstance(cfg.get("trend"), dict):
+        return None
+    t = trend_filter.tcfg(cfg)
+    mkt = str(t.get("market_symbol") or "BTCUSDT").upper()
+    if not t["market_filter"] or mkt in data:
+        return None
+    if not os.path.exists(data_path(data_dir, mkt)):
+        print("CANH BAO: khong co %s trong %s -> backtest tat lop loc BTC "
+              "(tai bang: download --symbols %s)" % (
+                  os.path.basename(data_path(data_dir, mkt)), data_dir, mkt))
+        return None
+    return bt1.load_bars(data_path(data_dir, mkt))
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     a = build_parser().parse_args(argv)
     if a.cmd == "download":
@@ -956,16 +1093,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                          indent=1, ensure_ascii=False))
         _dump(res, a.json_out)
         return 0
+    mbars = market_bars_for(cfg, a.data_dir, data)
     if a.cmd == "run":
         res = PortfolioSim(data, scans, cfg, a.entry, start, end,
                            fill_through=a.fill_through,
-                           rescan_minutes=a.rescan_minutes).run()
+                           rescan_minutes=a.rescan_minutes,
+                           market_bars=mbars).run()
         print(json.dumps(res, indent=1, ensure_ascii=False))
         _dump(res, a.json_out)
         return 0
     res = walk_forward(data, scans, cfg, a.train_days, a.test_days,
                        a.step_days, parse_space(a.space), a.entry,
-                       a.fill_through, start, a.rescan_minutes)
+                       a.fill_through, start, a.rescan_minutes,
+                       market_bars=mbars)
     print(json.dumps({k: v for k, v in res.items() if k != "folds"},
                      indent=1, ensure_ascii=False))
     _dump(res, a.json_out)

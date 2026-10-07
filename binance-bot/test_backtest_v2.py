@@ -417,5 +417,78 @@ try:
 finally:
     bt.scanner.judge = _judge
 
+# ------------------------------------- task 34: loc xu huong + tran chieu
+def ramp(n, start, step):
+    rows, p = [], start
+    for _ in range(n):
+        q = p * (1 + step)
+        rows.append((p, max(p, q) * 1.0005, min(p, q) * 0.9995, q))
+        p = q
+    return rows
+
+
+H = bt.H1_MS
+btc_down = mk(ramp(12 * 24 * 5, 100.0, -0.0002))      # ~ -0.24%/h, 5 ngay
+flat_rows = [(100, 100.3, 99.7, 100 + (0.2 if i % 2 else -0.2))
+             for i in range(12 * 24 * 5)]
+tcfg = dict(bt.trend_filter.DEFAULTS)
+ser = bt.trend_series(btc_down, tcfg, True)
+hours = sorted(ser)
+check("trend_series: chi co bias sau khi du nen (warmup ~56h)",
+      hours and hours[0] >= 56 * H, hours[:1])
+check("trend_series: BTC troi giam -> down", ser[hours[-1]] == "down",
+      ser[hours[-1]])
+check("trend_series: memo (walk-forward goi lai khong tinh lai)",
+      bt.trend_series(btc_down, tcfg, True) is ser)
+cfg_t = dict(CFG, grid=dict(G), trend={})
+ps = bt.PortfolioSim({"A": mk(flat_rows)}, {}, cfg_t, "market",
+                     market_bars=btc_down)
+late = hours[-1] + 5 * bt.BAR_MS
+check("sim trend: BTC giam -> chan long tren A, short van duoc",
+      ps._trend_blocked("A", "long", late)
+      and not ps._trend_blocked("A", "short", late), ps.trend_note)
+check("sim trend: warmup (chua co bias) -> chan ca 2 phia nhu live",
+      ps._trend_blocked("A", "short", 10 * H))
+ps = bt.PortfolioSim({"A": mk(flat_rows)}, {}, cfg_t, "market")
+check("sim trend: khong co nen BTC -> tat lop BTC, ghi ro",
+      "khong co du lieu" in ps.trend_note and ps.trend
+      and not ps.trend["market_filter"]
+      and not ps._trend_blocked("A", "long", late), ps.trend_note)
+ps = bt.PortfolioSim({"A": mk(flat_rows)}, {}, dict(CFG, grid=dict(G)),
+                     "market", market_bars=btc_down)
+check("sim trend: cfg khong co muc trend -> tat (tuong thich)",
+      ps.trend is None and not ps._trend_blocked("A", "long", late))
+ps = bt.PortfolioSim({"A": mk(flat_rows)}, {}, dict(
+    cfg_t, grid=dict(G, max_same_side=1)), "market", market_bars=btc_down,
+    fixed={"A": rg.build_range(M, G, 0)})
+check("study (fixed) khong ap loc xu huong / tran chieu",
+      ps.trend is None and ps.side_cap == 0)
+check("sim trend: assumptions ghi trang thai loc",
+      "trend_filter" in bt.PortfolioSim(
+          {"A": mk(flat_rows)}, {}, cfg_t, "market",
+          market_bars=btc_down).result()["assumptions"])
+
+cfg_c = dict(CFG, grid=dict(G, max_same_side=1))
+ps = bt.PortfolioSim({"A": mk(flat_rows), "B": mk(flat_rows)}, {}, cfg_c,
+                     "market")
+ps.allowed = ["A", "B"]
+for s_ in ("A", "B"):
+    ps.sym[s_]["rng"] = rg.build_range(M, cfg_c["grid"], 0)
+    ps.sym[s_]["last"] = 98.9
+ps._market_entries_at("A", 98.9, 0, set())
+ps._market_entries_at("B", 98.9, 0, set())
+check("sim tran chieu (market): long thu 2 (symbol khac) bi chan",
+      [p["side"] for p in ps.positions] == ["long"]
+      and ps.counters["side_cap_denied"] >= 1, (ps.positions, ps.counters))
+ps = bt.PortfolioSim({"A": mk(flat_rows), "B": mk(flat_rows)}, {}, cfg_c,
+                     "limit")
+ps.allowed = ["A", "B"]
+for s_ in ("A", "B"):
+    ps.sym[s_]["rng"] = rg.build_range(M, cfg_c["grid"], 0)
+ps._plan_limits(0, {"A": 100.0, "B": 100.0})
+sides = [o["side"] for x in ps.sym.values() for o in x["pending"].values()]
+check("sim tran chieu (limit): lenh cho <= 1 long + <= 1 short",
+      sides.count("long") == 1 and sides.count("short") == 1, sides)
+
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
 sys.exit(1 if FAIL else 0)
