@@ -269,8 +269,93 @@ def test_session_cookie():
           "st.context.cookies" in SRC and "bc.session_user" in SRC)
 
 
+
+def test_monitor_pm2():
+    print("== Monitor: pm2 / systemd ==")
+    ns = load("PM2_BIN", "process_manager", "parse_pm2_jlist", "tail_lines",
+              "service_states", "service_logs")
+    pm = ns["process_manager"]
+    check("env PROCESS_MANAGER ghi de", pm({"PROCESS_MANAGER": "systemd",
+                                           "DEPLOY_APP": "x"}) == "systemd")
+    check("chay duoi deploy/pm2 -> pm2", pm({"DEPLOY_APP": "muse-dashboard"})
+          == "pm2" and pm({"pm_id": "3"}) == "pm2")
+    check("mac dinh systemd", pm({}) == "systemd")
+
+    with tempfile.TemporaryDirectory() as d:
+        out_log = os.path.join(d, "out.log")
+        err_log = os.path.join(d, "err.log")
+        with open(out_log, "w") as f:
+            f.write("".join("dong %d\n" % i for i in range(30)))
+        with open(err_log, "w") as f:
+            f.write("Traceback loi\n")
+        data = [
+            {"name": "pm2-logrotate", "pid": 9,
+             "pm2_env": {"pmx_module": True, "status": "online"}},
+            {"name": "muse-binance", "pid": 11, "pm2_env": {
+                "status": "online", "restart_time": 2,
+                "pm_out_log_path": out_log, "pm_err_log_path": err_log}},
+            {"name": "muse-radar", "pid": 0, "pm2_env": {
+                "status": "waiting restart", "exit_code": 0,
+                "stop_exit_codes": [0, 78]}},
+            {"name": "muse-live-trader", "pid": 0, "pm2_env": {
+                "status": "errored", "exit_code": 1}},
+        ]
+        raw = "[PM2][WARN] In-memory PM2 is out-of-date\n" + json.dumps(data)
+        procs = ns["parse_pm2_jlist"](raw)
+        check("jlist: bo canh bao + module", set(procs) == {
+            "muse-binance", "muse-radar", "muse-live-trader"}, procs)
+        check("jlist: exit 0 'waiting restart' -> stopped",
+              procs["muse-radar"]["status"] == "stopped")
+        check("jlist: output rac -> {}", ns["parse_pm2_jlist"]("loi") == {})
+
+        class R:
+            def __init__(self, out):
+                self.stdout = out
+
+        calls = []
+
+        def runner(cmd, **kw):
+            calls.append(cmd)
+            return R(raw)
+        names = ["muse-binance", "muse-radar", "muse-live-trader",
+                 "muse-dashboard"]
+        st = ns["service_states"](names, "pm2", runner=runner)
+        check("pm2: online", st["muse-binance"][0] is True)
+        check("pm2: stopped/errored/khong co -> khong chay + ly do",
+              st["muse-radar"] == (False, "pm2 stopped (exit 0)")
+              and "errored" in st["muse-live-trader"][1]
+              and st["muse-dashboard"] == (False, "chua co trong pm2"), st)
+        check("pm2: goi jlist 1 lan cho moi service", len(calls) == 1)
+
+        def boom(cmd, **kw):
+            raise OSError("khong co pm2")
+        st = ns["service_states"](["muse-binance"], "pm2", runner=boom)
+        check("pm2 loi -> khong chay, khong crash",
+              st["muse-binance"][0] is False and "pm2" in
+              st["muse-binance"][1])
+
+        logs = ns["service_logs"]("muse-binance", "pm2", 20, runner=runner)
+        check("pm2 log: 20 dong cuoi stdout + stderr",
+              logs.startswith("dong 10") and "dong 29" in logs
+              and "--- stderr ---\nTraceback loi" in logs, logs[:80])
+
+        def sysd(cmd, **kw):
+            if cmd[0] == "systemctl":
+                return R("active\n" if cmd[2] == "muse-binance"
+                         else "inactive\n")
+            return R("Oct 06 22:23:14 ip-1 python[123]: [x] hello\n")
+        st = ns["service_states"](["muse-binance", "muse-radar"], "systemd",
+                                  runner=sysd)
+        check("systemd van chay nhu cu", st["muse-binance"][0] is True
+              and st["muse-radar"] == (False, "systemd inactive"))
+        check("systemd log: cat tien to journal",
+              ns["service_logs"]("muse-binance", "systemd", runner=sysd)
+              == "[x] hello")
+
+
 TESTS = [test_session_cookie, test_sol_wallet, test_live_radar_halt_status, test_config_helpers,
-         test_scanner_tab_levels]
+         test_scanner_tab_levels, test_monitor_pm2]
+
 
 if __name__ == "__main__":
     for t in TESTS:

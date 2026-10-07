@@ -783,10 +783,132 @@ def live_radar_halt_status(base_dir, cfg_path, today=None):
                         f"(từ {ls.get('block_since') or '?'} UTC)"))
     return out
 
+PM2_BIN = os.environ.get("PM2_BIN", "pm2")
+
+
+def process_manager(env=None):
+    """'pm2' | 'systemd' - bot chay bang gi (de doc trang thai/log).
+
+    Env PROCESS_MANAGER ghi de; mac dinh: dashboard chay duoi pm2 (deploy/
+    ecosystem dat DEPLOY_APP, pm2 dat pm_id) -> pm2, nguoc lai systemd."""
+    env = os.environ if env is None else env
+    pm = (env.get("PROCESS_MANAGER") or "").strip().lower()
+    if pm in ("pm2", "systemd"):
+        return pm
+    return "pm2" if (env.get("DEPLOY_APP") or "pm_id" in env) else "systemd"
+
+
+def parse_pm2_jlist(out):
+    """Output `pm2 jlist` -> {ten: {status, out_log, err_log, restarts,
+    uptime_ms, exit_code}}. Bo module pm2 va dong canh bao truoc JSON."""
+    lines = (out or "").splitlines()
+    for i, line in enumerate(lines):
+        if not line.lstrip().startswith("["):
+            continue
+        try:
+            data = json.loads("\n".join(lines[i:]))
+        except ValueError:
+            continue
+        if not isinstance(data, list):
+            continue
+        res = {}
+        for p in data:
+            env = p.get("pm2_env") or {}
+            if env.get("pmx_module"):
+                continue
+            status = env.get("status")
+            # pm2 gan 'waiting restart' ca khi exit code thuoc stop_exit_codes
+            # (bot tu dung, KHONG restart that)
+            if status == "waiting restart" and not p.get("pid") and \
+                    env.get("exit_code") in (env.get("stop_exit_codes") or []):
+                status = "stopped"
+            res[p.get("name")] = {
+                "status": status,
+                "out_log": env.get("pm_out_log_path"),
+                "err_log": env.get("pm_err_log_path"),
+                "restarts": env.get("restart_time", 0),
+                "uptime_ms": env.get("pm_uptime"),
+                "exit_code": env.get("exit_code"),
+            }
+        return res
+    return {}
+
+
+def tail_lines(path, n=20):
+    """n dong cuoi file (doc toi da 64KB cuoi)."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 64 * 1024))
+            return f.read().decode("utf-8", "replace").splitlines()[-n:]
+    except (OSError, TypeError):
+        return []
+
+
+def service_states(names, manager, runner=None):
+    """{ten: (dang_chay, mo_ta)} theo pm2 hoac systemd."""
+    import subprocess
+    runner = runner or subprocess.run
+    res = {}
+    if manager == "pm2":
+        try:
+            r = runner([PM2_BIN, "jlist"], capture_output=True, text=True,
+                       timeout=15)
+            procs = parse_pm2_jlist(r.stdout)
+        except Exception as e:
+            return {n: (False, "khong goi duoc pm2: %s" % e) for n in names}
+        for n in names:
+            p = procs.get(n)
+            if not p:
+                res[n] = (False, "chua co trong pm2")
+            elif p["status"] == "online":
+                res[n] = (True, "pm2 online, %s lan restart" % p["restarts"])
+            else:
+                res[n] = (False, "pm2 %s%s" % (
+                    p["status"], "" if p["exit_code"] is None
+                    else " (exit %s)" % p["exit_code"]))
+        return res
+    for n in names:
+        try:
+            r = runner(["systemctl", "is-active", n], capture_output=True,
+                       text=True, timeout=5)
+            state = r.stdout.strip()
+        except Exception as e:
+            state = "loi: %s" % e
+        res[n] = (state == "active", "systemd %s" % state)
+    return res
+
+
+def service_logs(name, manager, n=20, runner=None):
+    """Log moi nhat cua service (pm2: file log; systemd: journalctl)."""
+    import subprocess
+    runner = runner or subprocess.run
+    if manager == "pm2":
+        r = runner([PM2_BIN, "jlist"], capture_output=True, text=True,
+                   timeout=15)
+        p = parse_pm2_jlist(r.stdout).get(name) or {}
+        out = tail_lines(p.get("out_log"), n)
+        err = tail_lines(p.get("err_log"), max(5, n // 2))
+        if p.get("err_log") and p.get("err_log") == p.get("out_log"):
+            err = []
+        text = "\n".join(out)
+        if err:
+            text += "\n--- stderr ---\n" + "\n".join(err)
+        return text.strip()
+    r = runner(["journalctl", "-u", name, "--since", "10 min ago",
+                "--no-pager", "-n", str(n)],
+               capture_output=True, text=True, timeout=10)
+    lines = []
+    for line in (r.stdout or "").strip().split("\n")[-n:]:
+        # Cat bo phan dau "Oct 06 22:23:14 ip-... python[xxx]: "
+        if "python[" in line:
+            line = line.split("python[", 1)[1].split("]: ", 1)[-1]
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
 def tab_monitor():
     """Tab giam sat he thong real: status service + log realtime."""
-    import subprocess
-
     st.subheader("🖥️ Giám sát hệ thống REAL")
 
     services = {
@@ -797,16 +919,13 @@ def tab_monitor():
     }
 
     # Status services
+    manager = process_manager()
     st.markdown("### Trạng thái service")
+    st.caption("Quản lý bằng %s" % manager)
+    states = service_states(list(services), manager)
     cols = st.columns(len(services))
     for i, (svc, label) in enumerate(services.items()):
-        try:
-            r = subprocess.run(
-                ["systemctl", "is-active", svc],
-                capture_output=True, text=True, timeout=5)
-            active = r.stdout.strip() == "active"
-        except Exception:
-            active = False
+        active, detail = states.get(svc, (False, ""))
         with cols[i]:
             if active:
                 # Kiem tra them halt ben trong cho Binance
@@ -838,7 +957,7 @@ def tab_monitor():
                         pass
                 st.success(f"✅ {label}{extra}")
             else:
-                st.error(f"❌ {label}")
+                st.error(f"❌ {label}\n{detail}")
 
     st.divider()
 
@@ -948,22 +1067,11 @@ def tab_monitor():
         format_func=lambda x: services[x])
 
     try:
-        r = subprocess.run(
-            ["journalctl", "-u", svc_choice, "--since", "10 min ago",
-             "--no-pager", "-n", "20"],
-            capture_output=True, text=True, timeout=10)
-        logs = r.stdout.strip()
+        logs = service_logs(svc_choice, manager, 20)
         if logs:
-            # Chi lay phan message, bo timestamp systemd
-            lines = []
-            for line in logs.split("\n")[-20:]:
-                # Cat bo phan dau "Oct 06 22:23:14 ip-... python[xxx]: "
-                if "python[" in line:
-                    line = line.split("python[", 1)[1].split("]: ", 1)[-1]
-                lines.append(line)
-            st.code("\n".join(lines), language="text")
+            st.code(logs, language="text")
         else:
-            st.info("Chưa có log trong 10 phút qua.")
+            st.info("Chưa có log.")
     except Exception as e:
         st.error(f"Không đọc được log: {e}")
 
