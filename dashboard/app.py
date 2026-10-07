@@ -614,6 +614,19 @@ def tab_monitor():
                         extra = f" ({pos} vị thế)"
                     except Exception:
                         pass
+                # Kiem tra block cho live-trader
+                if svc == "muse-live-trader":
+                    try:
+                        lp = "/home/ubuntu/muse_bot/meme-radar/live_state.json"
+                        with open(lp) as f:
+                            ls = json.load(f)
+                        if ls.get("entry_blocked"):
+                            reason = ls.get("block_reason", "unknown")
+                            since = ls.get("block_since", "")
+                            st.warning(f"⚠️ {label}\nBLOCKED: {reason}\nTừ: {since}")
+                            continue
+                    except Exception:
+                        pass
                 st.success(f"✅ {label}{extra}")
             else:
                 st.error(f"❌ {label}")

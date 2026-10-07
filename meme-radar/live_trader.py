@@ -1055,12 +1055,26 @@ class LiveTrader:
         self.state["unmanaged_tokens"] = unmanaged[-100:]
         pending_uncertain = bool(pending)
         self.entry_blocked = bool(unmanaged or pending_uncertain)
+        # Ghi ly do block de dashboard hien thi
+        block_reasons = []
         if pending_uncertain:
+            block_reasons.append("pending BUY chua reconcile")
             log("CRITICAL pending BUY intent chua reconcile xong -> block entry")
         if unmanaged:
+            block_reasons.append(f"unmanaged tokens: {len(unmanaged)}")
             log(f"CRITICAL unmanaged token(s) tren vi: "
                 f"{', '.join(x[:10] + '...' for x in unmanaged)} -> block entry")
-        if changed:
+        self.state["entry_blocked"] = self.entry_blocked
+        self.state["block_reason"] = "; ".join(block_reasons) if block_reasons else None
+        self.state["block_since"] = self.state.get("block_since") if self.entry_blocked else None
+        if self.entry_blocked and not self.state.get("block_since"):
+            import time as _t
+            self.state["block_since"] = _t.strftime("%Y-%m-%d %H:%M:%S", _t.gmtime())
+        # Luon save khi trang thai block thay doi
+        if changed or self.state.get("entry_blocked") != self.entry_blocked:
+            self.save()
+        elif self.entry_blocked:
+            # Cap nhat block status ngay ca khi khong co thay doi khac
             self.save()
         return not self.entry_blocked
 
