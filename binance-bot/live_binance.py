@@ -1871,6 +1871,18 @@ class BinanceEngine:
                      (len(missing), missing))
             self._protection_sync_due = True
             missing = []  # resolved by sync, not a startup halt
+        if missing_required:
+            # A lot without a guard id is re-armed by retry_protection (a lot
+            # missing its SL is closed after the deadline). Halting here would
+            # block retry_protection itself (reconcile hold) and leave the
+            # lot unguarded indefinitely.
+            self.log("WARNING lot thieu guard khi khoi dong: %s -> "
+                     "retry_protection dat lai" % missing_required)
+            for position in self.state.get("positions", []):
+                if self._missing_guards(position):
+                    position["protection_status"] = "retrying"
+                    position["protection_retry_at"] = 0
+            missing_required = []
         if missing or unknown or missing_required or guard_mismatch:
             self.state["halted"] = True
             self.state["halt_reason"] = (

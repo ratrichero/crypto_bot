@@ -801,6 +801,25 @@ def test_startup_orphans_cancelled_instead_of_halt():
           (st2.get("halt_reason"), fake.open_algos(), eng2.logs[-5:]))
 
 
+def test_startup_lot_without_guard_is_rearmed_not_halted():
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    lot = open_lot(eng, "long", 60000, level="b1")
+    fake.fapiPrivateDeleteAlgoOrder({"algoId": lot["tp_algo_id"]})
+    restored = copy.deepcopy(st["positions"])
+    restored[0]["tp_algo_id"] = None                  # state lost the id
+    restored[0]["tp_client_algo_id"] = None
+    eng2, st2 = make_engine(fake)
+    st2["positions"] = restored
+    eng2._reconcile_startup()
+    check("startup thieu guard: khong halt", not st2.get("halted"),
+          st2.get("halt_reason"))
+    eng2.retry_protection()
+    check("startup thieu guard: retry dat lai TP",
+          st2["positions"][0]["protection_status"] == "armed"
+          and len(fake.open_algos()) == 2, fake.open_algos())
+
+
 TESTS = [
     test_close_one_of_many_grid_lots,
     test_close_detects_real_partial,
@@ -832,6 +851,7 @@ TESTS = [
     test_orphans_keep_foreign_and_unmanaged_leg,
     test_orphan_after_exchange_tp_never_hits_new_lot,
     test_startup_orphans_cancelled_instead_of_halt,
+    test_startup_lot_without_guard_is_rearmed_not_halted,
 ]
 
 
