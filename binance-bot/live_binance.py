@@ -270,6 +270,128 @@ class BinanceEngine:
     def _fees(self, notional):
         return notional * self.cfg["fee_rate"]
 
+    _USD_ASSETS = ("USDT", "USDC", "BUSD", "FDUSD")
+
+    def _order_fill_summary(self, symbol, order_id):
+        """Fill THAT cua 1 order tu userTrades (source of truth).
+
+        Loc theo orderId, KHONG truyen since: ccxt tu dat endTime =
+        since + 7 ngay khi since cu hon 7 ngay (lot mo lau) -> mat trade
+        dong. Order o day luon vua khop nen nam trong 7 ngay mac dinh.
+
+        Tra ve {"qty", "avg", "commission"} hoac None khi khong doc duoc,
+        khong co trade, hoac phi tra bang tai san khong phai USD (vd BNB) ->
+        caller dung phi uoc tinh va danh dau fee_estimated.
+        """
+        if self.dry_run or not order_id:
+            return None
+        try:
+            ccxt_symbol = self._ccxt_symbol(symbol) or symbol
+            trades = self._private_call(
+                "private:account", self.ex.fetch_my_trades, ccxt_symbol,
+                None, 100, {"orderId": str(order_id)}, _weight=5) or []
+        except binance_safety.BinanceSafetyStop:
+            raise
+        except Exception as exc:
+            self.log("WARNING userTrades order %s %s: %s" %
+                     (symbol, order_id, binance_safety.redact_body(exc)))
+            return None
+        qty = cost = commission = 0.0
+        for trade in trades:
+            info = trade.get("info") or {}
+            if str(trade.get("order") or info.get("orderId") or "") != str(
+                    order_id):
+                continue
+            fee = trade.get("fee") or {}
+            asset = str(fee.get("currency") or info.get("commissionAsset")
+                        or "").upper()
+            try:
+                q = float(trade.get("amount") or info.get("qty") or 0)
+                px = float(trade.get("price") or info.get("price") or 0)
+                c = float(fee.get("cost") if fee.get("cost") is not None
+                          else info.get("commission") or 0)
+            except (TypeError, ValueError):
+                return None
+            if c and asset not in self._USD_ASSETS:
+                self.log("WARNING order %s %s: phi tra bang %s -> dung phi "
+                         "uoc tinh" % (symbol, order_id, asset or "?"))
+                return None
+            qty += q
+            cost += q * px
+            commission += abs(c)
+        if qty <= 0:
+            return None
+        return {"qty": qty, "avg": cost / qty, "commission": commission}
+
+    def _book_exit(self, pos, exit_px, close_order_id=None, order_qty=None):
+        """Tinh so khi dong 1 lot; MOI duong dong (bot/algo/san) dung chung.
+
+        pnl (record) = gop - phi dong THAT - phi mo THAT (khop
+        binance_trades.pnl 'P&L rong'). Phi lay tu userTrades; khong doc duoc
+        -> fee_rate x notional thuc te, fee_estimated=True. Lenh dong chung
+        nhieu lot (order_qty > lot) -> chia phi theo ty le qty.
+        """
+        side = pos.get("side")
+        lot_qty = float(pos.get("qty", 0) or 0)
+        entry = float(pos.get("entry", 0) or 0)
+        gross = ((exit_px - entry) if side == "long" else (entry - exit_px)) \
+            * lot_qty
+        summary = self._order_fill_summary(pos.get("symbol"), close_order_id)
+        if summary is not None:
+            share = 1.0
+            filled = summary["qty"]
+            if filled > 0 and filled > lot_qty:
+                share = lot_qty / filled
+            fee_exit = summary["commission"] * share
+            exit_estimated = False
+        else:
+            fee_exit = self._fees(abs(exit_px) * lot_qty)
+            exit_estimated = not self.dry_run
+        fee_entry = float(pos.get("fee_entry", 0) or 0)
+        return {
+            "gross": gross, "fee_entry": fee_entry, "fee_exit": fee_exit,
+            "net": gross - fee_exit - fee_entry,
+            # phi mo da tru vao equity luc mo -> equity chi cong phan nay
+            "equity_delta": gross - fee_exit,
+            "fee_estimated": bool(exit_estimated
+                                  or pos.get("fee_entry_estimated")),
+        }
+
+    def _apply_booking(self, booking):
+        st = self.state
+        st["equity"] = float(st.get("equity", 0) or 0) + booking["equity_delta"]
+        stats = st["stats"]
+        stats["fees"] = float(stats.get("fees", 0) or 0) + booking["fee_exit"]
+        stats["trades"] = int(stats.get("trades", 0) or 0) + 1
+        if booking["net"] > 0:
+            stats["wins"] = int(stats.get("wins", 0) or 0) + 1
+        else:
+            stats["losses"] = int(stats.get("losses", 0) or 0) + 1
+
+    @staticmethod
+    def _booking_fields(booking):
+        return {
+            "pnl": round(booking["net"], 4),
+            "pnl_gross": round(booking["gross"], 4),
+            "fee_entry": round(booking["fee_entry"], 6),
+            "fee_exit": round(booking["fee_exit"], 6),
+            "fee_estimated": booking["fee_estimated"],
+        }
+
+    def _record_entry_fee(self, pos):
+        """Thay phi mo uoc tinh bang commission that (goi SAU khi dat TP/SL
+        de khong lam cham bao ve lot)."""
+        summary = self._order_fill_summary(pos.get("symbol"), pos.get("ord_id"))
+        if summary is None:
+            pos["fee_entry_estimated"] = True
+            return
+        delta = summary["commission"] - float(pos.get("fee_entry", 0) or 0)
+        pos["fee_entry"] = summary["commission"]
+        pos.pop("fee_entry_estimated", None)
+        self.state["equity"] = float(self.state.get("equity", 0) or 0) - delta
+        stats = self.state["stats"]
+        stats["fees"] = float(stats.get("fees", 0) or 0) + delta
+
     def used_margin(self):
         return sum(p["notional"] / self.cfg["leverage"]
                    for p in self.state["positions"])
@@ -1263,35 +1385,24 @@ class BinanceEngine:
                 exit_px = actual_exit
             elif exit_px is None:
                 exit_px = mark if mark else entry
-            if side == "long":
-                pnl = (exit_px - entry) * local_qty
-            else:
-                pnl = (entry - exit_px) * local_qty
-            fee = self._fees(pos.get("notional", 0) or 0)
-            net = pnl - fee
+            booking = self._book_exit(dict(pos, qty=local_qty), exit_px,
+                                      close_order if actual_exit else None)
+            self._apply_booking(booking)
+            net = booking["net"]
             reason = self._exit_reason_from_price(pos, exit_px,
                                                   fired == "EXCHANGE")
-            self.state["equity"] = float(self.state.get("equity", 0) or 0) + net
-            self.state["stats"]["fees"] = float(
-                self.state["stats"].get("fees", 0) or 0) + fee
-            self.state["stats"]["trades"] = int(
-                self.state["stats"].get("trades", 0) or 0) + 1
-            if net > 0:
-                self.state["stats"]["wins"] = int(
-                    self.state["stats"].get("wins", 0) or 0) + 1
-            else:
-                self.state["stats"]["losses"] = int(
-                    self.state["stats"].get("losses", 0) or 0) + 1
             rec = {
                 "id": pos["id"], "symbol": symbol, "side": side,
                 "tag": pos.get("tag"), "entry": round(entry, 6),
                 "exit": round(exit_px, 6),
                 "notional": round(float(pos.get("notional", 0) or 0), 2),
-                "pnl": round(net, 2), "reason": reason,
+                "reason": reason,
                 "closed_at": int(now),
                 "live": True, "dry": self.dry_run,
                 "estimated": fired != "EXCHANGE", "exit_fired": fired,
+                "exit_source": "exchange_detect",
                 "close_ord": close_order,
+                **self._booking_fields(booking),
             }
             self.state["positions"] = [p for p in self.state["positions"]
                                        if p.get("id") != pos["id"]]
@@ -1520,24 +1631,16 @@ class BinanceEngine:
         if estimated:
             exit_px = float(pos.get(label) or pos.get("entry"))
         entry = float(pos.get("entry", 0) or 0)
-        pnl = ((exit_px - entry) if side == "long" else (entry - exit_px)) \
-            * lot_qty
-        fee = self._fees(pos.get("notional", 0) or 0)
-        net = pnl - fee
-        self.state["equity"] = float(self.state.get("equity", 0) or 0) + net
-        stats = self.state["stats"]
-        stats["fees"] = float(stats.get("fees", 0) or 0) + fee
-        stats["trades"] = int(stats.get("trades", 0) or 0) + 1
-        if net > 0:
-            stats["wins"] = int(stats.get("wins", 0) or 0) + 1
-        else:
-            stats["losses"] = int(stats.get("losses", 0) or 0) + 1
+        booking = self._book_exit(pos, exit_px, outcome.get("order_id"))
+        self._apply_booking(booking)
+        net = booking["net"]
         rec = {
             "id": pos["id"], "symbol": symbol, "side": side,
             "tag": pos.get("tag"), "entry": round(entry, 6),
             "exit": round(exit_px, 6),
             "notional": round(float(pos.get("notional", 0) or 0), 2),
-            "pnl": round(net, 2), "reason": label.upper(),
+            **self._booking_fields(booking),
+            "reason": label.upper(),
             "closed_at": int(time.time()), "live": True, "dry": self.dry_run,
             "close_ord": (str(outcome["order_id"]) if outcome.get("order_id")
                           else None),
@@ -2256,7 +2359,7 @@ class BinanceEngine:
             else:
                 sl = entry * (1 + sl_pct) if sl_pct else None
                 tp = entry * (1 - tp_pct) if tp_pct else None
-            fee = self._fees(notional)
+            fee = self._fees(qty * entry)   # thay bang phi that ben duoi
             pos = {
                 "id": self._next_id(),
                 "symbol": symbol, "side": side, "qty": qty, "entry": entry,
@@ -2278,6 +2381,8 @@ class BinanceEngine:
                     # Chan da dat thanh cong duoc GIU; chi chan thieu duoc
                     # retry (retry_protection). Thieu SL qua deadline -> dong.
                     self._schedule_protection_retry(pos, protection_error)
+            if not self.dry_run:
+                self._record_entry_fee(pos)
             self._mark_action_success(key)
             self.log("%s OPEN #%d %s %s entry=%s sl=%s tp=%s ord=%s "
                      "protection=%s"
@@ -2427,19 +2532,6 @@ class BinanceEngine:
                 symbol, bside, qty, ps, reduce_only=True, ref_price=price
             )
             ex = self._fill_price(symbol, oid, price)
-            if side == "long":
-                pnl = (ex - pos["entry"]) * pos["qty"]
-            else:
-                pnl = (pos["entry"] - ex) * pos["qty"]
-            fee = self._fees(pos["notional"])
-            net = pnl - fee
-            self.state["equity"] += net
-            self.state["stats"]["fees"] += fee
-            self.state["stats"]["trades"] += 1
-            if net > 0:
-                self.state["stats"]["wins"] += 1
-            else:
-                self.state["stats"]["losses"] += 1
             # Verify vi the da dong that tren san truoc khi xoa khoi state.
             # Neu partial fill -> giu lai de retry, khong danh dau da dong.
             if not self.dry_run:
@@ -2463,14 +2555,19 @@ class BinanceEngine:
                     self.log("WARNING close #%s: san con %s < cac lot khac %s; "
                              "reconcile/sync se doi chieu" %
                              (pos["id"], actual, remaining_expected))
+            booking = self._book_exit(pos, ex, oid)
+            self._apply_booking(booking)
+            net = booking["net"]
             rec = {
                 "id": pos["id"], "symbol": symbol, "side": side,
                 "tag": pos["tag"], "entry": round(pos["entry"], 6),
                 "exit": round(ex, 6), "notional": round(pos["notional"], 2),
-                "pnl": round(net, 2), "reason": reason,
+                "reason": reason,
                 "closed_at": int(time.time()),
                 "live": True, "dry": self.dry_run, "close_ord": oid,
                 "close_client_order_id": client_order_id,
+                "exit_source": "bot", "estimated": False,
+                **self._booking_fields(booking),
             }
             self.state["positions"] = [p for p in self.state["positions"]
                                         if p["id"] != pos["id"]]

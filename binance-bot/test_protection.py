@@ -78,6 +78,9 @@ class FakeBinance:
         self.post_failures = []      # queued exceptions for POST algoOrder
         self.positions_override = None
         self.calls = []
+        self.fee_rate = 0.0004       # commission THAT (khac cfg fee_rate)
+        self.fee_asset = "USDT"
+        self.trades_error = None     # exception cho fetch_my_trades
 
     # ---------------------------------------------------------- helpers
     def _id(self):
@@ -109,7 +112,11 @@ class FakeBinance:
             "id": str(self._id()), "order": str(oid), "symbol": symbol,
             "side": side, "price": price, "amount": qty,
             "timestamp": int(CLOCK.now * 1000),
-            "info": {"positionSide": position_side, "orderId": str(oid)},
+            "fee": {"cost": qty * price * self.fee_rate,
+                    "currency": self.fee_asset},
+            "info": {"positionSide": position_side, "orderId": str(oid),
+                     "commission": str(qty * price * self.fee_rate),
+                     "commissionAsset": self.fee_asset},
         })
         return order
 
@@ -161,7 +168,12 @@ class FakeBinance:
     def fetch_my_trades(self, symbol=None, since=None, limit=None,
                         params=None):
         self.calls.append("fetch_my_trades")
+        if self.trades_error is not None:
+            raise self.trades_error
         rows = [t for t in self.trades if t["symbol"] == symbol]
+        oid = (params or {}).get("orderId")
+        if oid is not None:
+            rows = [t for t in rows if t["order"] == str(oid)]
         if since is not None:
             rows = [t for t in rows if t["timestamp"] >= since]
         return copy.deepcopy(rows[-(limit or 500):])
@@ -880,6 +892,90 @@ def test_close_with_sibling_never_sweeps():
           (fake.calls, fake.positions))
 
 
+# ===================================================================
+# Phi + PnL lay tu userTrades (source of truth) cho moi duong dong
+# ===================================================================
+def _approx(a, b, eps=1e-6):
+    return abs(a - b) < eps
+
+
+def test_real_fees_bot_close():
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    eq0 = st["equity"]
+    a = open_lot(eng, "long", 60000)            # qty 0.01
+    check("fee: phi mo = commission that (0.04%)",
+          _approx(a["fee_entry"], 0.01 * 60000 * 0.0004)
+          and "fee_entry_estimated" not in a, a.get("fee_entry"))
+    fake.prices["BTCUSDT"] = 60300
+    rec = eng.close(a, 60300, "TP")
+    fe, fx = 0.24, 0.01 * 60300 * 0.0004
+    check("fee: record co phi dong that + phi mo",
+          _approx(rec["fee_entry"], fe) and _approx(rec["fee_exit"], fx)
+          and rec["fee_estimated"] is False, rec)
+    check("fee: pnl = gop - phi mo - phi dong",
+          _approx(rec["pnl_gross"], 3.0) and _approx(rec["pnl"], 3.0 - fe - fx),
+          rec)
+    check("fee: equity/stats khop phi that (khong tru phi mo 2 lan)",
+          _approx(st["equity"], eq0 + 3.0 - fe - fx)
+          and _approx(st["stats"]["fees"], fe + fx),
+          (st["equity"], st["stats"]))
+    check("fee: exit_source=bot", rec.get("exit_source") == "bot")
+
+
+def test_real_fees_exchange_tp():
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    a = open_lot(eng, "long", 60000, level="b1")
+    fake.fire(a["tp_algo_id"], price=60300)
+    recs = sync(eng)
+    rec = recs[0] if recs else {}
+    fx = 0.01 * 60300 * 0.0004
+    check("fee: TP san khop -> pnl tru ca 2 phi that",
+          len(recs) == 1 and _approx(rec.get("pnl", 0), 3.0 - 0.24 - fx)
+          and rec.get("fee_estimated") is False, recs)
+
+
+def test_fee_fallback_estimated():
+    fake = FakeBinance()
+    fake.fee_asset = "BNB"
+    eng, st = make_engine(fake)
+    a = open_lot(eng, "long", 60000)
+    check("fee BNB: phi mo danh dau uoc tinh",
+          a.get("fee_entry_estimated") is True
+          and _approx(a["fee_entry"], 600 * CFG["fee_rate"]), a)
+    fake.prices["BTCUSDT"] = 60300
+    rec = eng.close(a, 60300, "TP")
+    check("fee BNB: record fee_estimated, phi = fee_rate x notional thoat",
+          rec["fee_estimated"] is True
+          and _approx(rec["fee_exit"], 0.01 * 60300 * CFG["fee_rate"]), rec)
+    fake2 = FakeBinance()
+    eng2, st2 = make_engine(fake2)
+    b = open_lot(eng2, "long", 60000)
+    fake2.trades_error = BinanceError("binance -1001 internal error")
+    fake2.prices["BTCUSDT"] = 60300
+    rec2 = eng2.close(b, 60300, "TP")
+    check("fee: userTrades loi khong chan close, danh dau uoc tinh",
+          rec2 is not None and rec2["fee_estimated"] is True
+          and not st2.get("halted"), (rec2, st2.get("halt_reason")))
+
+
+def test_real_fees_detect_group_close_prorated():
+    fake = FakeBinance()
+    eng, st = make_engine(fake, protection=False)
+    open_lot(eng, "long", 60000, level="b1")
+    open_lot(eng, "long", 60000, level="b2")
+    CLOCK.sleep(300)
+    manual_close(fake, "long", 0.02, 60300)      # 1 lenh dong ca leg
+    detect_round(eng, {"BTCUSDT": 60300})
+    recs = detect_round(eng, {"BTCUSDT": 60300})
+    fx_each = 0.02 * 60300 * 0.0004 / 2
+    check("fee detect: 2 lot ghi nhan, phi lenh chung chia theo qty",
+          len(recs) == 2 and all(_approx(r["fee_exit"], fx_each)
+                                 and r["fee_estimated"] is False
+                                 for r in recs), recs)
+
+
 TESTS = [
     test_close_one_of_many_grid_lots,
     test_close_detects_real_partial,
@@ -915,6 +1011,10 @@ TESTS = [
     test_close_exact_qty_leaves_no_dust,
     test_close_last_lot_sweeps_old_dust_only,
     test_close_with_sibling_never_sweeps,
+    test_real_fees_bot_close,
+    test_real_fees_exchange_tp,
+    test_fee_fallback_estimated,
+    test_real_fees_detect_group_close_prorated,
 ]
 
 
