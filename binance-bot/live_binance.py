@@ -328,9 +328,10 @@ class BinanceEngine:
         since + 7 ngay khi since cu hon 7 ngay (lot mo lau) -> mat trade
         dong. Order o day luon vua khop nen nam trong 7 ngay mac dinh.
 
-        Tra ve {"qty", "avg", "commission"} hoac None khi khong doc duoc,
-        khong co trade, hoac phi tra bang tai san khong phai USD (vd BNB) ->
-        caller dung phi uoc tinh va danh dau fee_estimated.
+        Tra ve {"qty", "avg", "commission"} hoac None khi khong doc duoc /
+        khong co trade. Phi tra bang tai san khong phai USD (vd BNB) ->
+        commission=None (gia/qty van dung) -> caller dung phi uoc tinh va
+        danh dau fee_estimated.
         """
         if self.dry_run or not order_id:
             return None
@@ -346,6 +347,7 @@ class BinanceEngine:
                      (symbol, order_id, binance_safety.redact_body(exc)))
             return None
         qty = cost = commission = 0.0
+        fee_unknown = False
         for trade in trades:
             info = trade.get("info") or {}
             if str(trade.get("order") or info.get("orderId") or "") != str(
@@ -362,15 +364,17 @@ class BinanceEngine:
             except (TypeError, ValueError):
                 return None
             if c and asset not in self._USD_ASSETS:
-                self.log("WARNING order %s %s: phi tra bang %s -> dung phi "
-                         "uoc tinh" % (symbol, order_id, asset or "?"))
-                return None
+                if not fee_unknown:
+                    self.log("WARNING order %s %s: phi tra bang %s -> dung "
+                             "phi uoc tinh" % (symbol, order_id, asset or "?"))
+                fee_unknown = True
             qty += q
             cost += q * px
             commission += abs(c)
         if qty <= 0:
             return None
-        return {"qty": qty, "avg": cost / qty, "commission": commission}
+        return {"qty": qty, "avg": cost / qty,
+                "commission": None if fee_unknown else commission}
 
     def _book_exit(self, pos, exit_px, close_order_id=None, order_qty=None):
         """Tinh so khi dong 1 lot; MOI duong dong (bot/algo/san) dung chung.
@@ -391,7 +395,7 @@ class BinanceEngine:
                 booked = self._booked_close_orders = set()
             booked.add(str(close_order_id))
         summary = self._order_fill_summary(pos.get("symbol"), close_order_id)
-        if summary is not None:
+        if summary is not None and summary["commission"] is not None:
             share = 1.0
             filled = summary["qty"]
             if filled > 0 and filled > lot_qty:
@@ -436,7 +440,7 @@ class BinanceEngine:
         """Thay phi mo uoc tinh bang commission that (goi SAU khi dat TP/SL
         de khong lam cham bao ve lot)."""
         summary = self._order_fill_summary(pos.get("symbol"), pos.get("ord_id"))
-        if summary is None:
+        if summary is None or summary["commission"] is None:
             pos["fee_entry_estimated"] = True
             return
         delta = summary["commission"] - float(pos.get("fee_entry", 0) or 0)
@@ -2580,6 +2584,14 @@ class BinanceEngine:
                 self.log("WARNING poll order %s: %s" % (order_id, e))
             if attempt == 0:
                 time.sleep(1)
+        # Nguon su that cuoi: userTrades cua chinh order (lenh MARKET da khop
+        # co trade du order response/WS/fetch_order thieu avgPrice). Neu bo
+        # qua, vi the da khop tren san se khong duoc ghi va khong co SL/TP.
+        summary = self._order_fill_summary(symbol, order_id)
+        if summary is not None and summary.get("avg"):
+            self.log("WARNING order %s: lay gia fill tu userTrades %.8f"
+                     % (order_id, summary["avg"]))
+            return summary["avg"]
         # A reference/mark price is not a fill price. Falling back to it would
         # create a ghost local position after an accepted-but-unfilled order.
         self.state["halted"] = True

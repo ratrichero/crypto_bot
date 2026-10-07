@@ -1292,6 +1292,31 @@ def test_basket_stop_retries_unclosed_lots():
           and grid.get("risk_halted"), (st["positions"], grid))
 
 
+def test_fill_price_falls_back_to_user_trades():
+    """Lenh MARKET da khop nhung response/fetch_order thieu avgPrice: lay gia
+    tu userTrades thay vi halt va bo vi the tran (khong SL/TP) tren san."""
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    real_fill = fake._fill
+
+    def fill_no_avg(*a, **k):
+        order = real_fill(*a, **k)
+        order["average"] = None
+        order["status"] = "open"            # response chua bao FILLED
+        return order
+    fake._fill = fill_no_avg
+    fake.fetch_order = lambda *a, **k: (_ for _ in ()).throw(
+        BinanceError("binance -1001 internal error"))
+    eng._order_average = lambda order: None
+    eng._validate_order_result = lambda *a, **k: None
+    pos, why = eng.open("BTCUSDT", "long", 600.0, 60000, 0.03, 0.005, "grid")
+    check("fill fallback: lot duoc ghi voi gia tu userTrades, khong halt",
+          pos is not None and pos["entry"] == 60000.0
+          and not st.get("halted"), (why, st.get("halt_reason")))
+    check("fill fallback: lot co du SL/TP tren san",
+          pos is not None and len(guards_of(fake, pos)) == 2)
+
+
 TESTS = [
     test_close_one_of_many_grid_lots,
     test_close_detects_real_partial,
@@ -1344,6 +1369,7 @@ TESTS = [
     test_daily_stop_retries_unclosed_lots,
     test_daily_stop_no_stale_or_manual_resume_closes,
     test_basket_stop_retries_unclosed_lots,
+    test_fill_price_falls_back_to_user_trades,
 ]
 
 
