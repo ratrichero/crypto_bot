@@ -39,11 +39,13 @@ class DBLink:
         self._conn = None
         self.log = log
         self._last_fail = 0.0
+        self.last_error: Optional[str] = None
 
     def get(self):
         if self._conn is not None and not getattr(self._conn, "closed", False):
             return self._conn
         if self._connect is None and not self.url:
+            self.last_error = "không có DATABASE_URL trong env của bot"
             return None
         if time.time() - self._last_fail < 30:
             return None                  # khong spam ket noi khi DB chet
@@ -56,11 +58,24 @@ class DBLink:
                 self._conn = psycopg.connect(
                     self.url, autocommit=True, connect_timeout=5,
                     options="-c statement_timeout=5000")
+            self.last_error = None
             return self._conn
         except Exception as e:
             self._last_fail = time.time()
+            self.last_error = str(e)[:300] or e.__class__.__name__
             self.log("DB warning: khong ket noi duoc (%s)" % str(e)[:200])
             return None
+
+    def status(self) -> str:
+        """'ok' | 'chua ket noi' | mo ta loi (cho state.json -> dashboard)."""
+        if self._conn is not None and not getattr(self._conn, "closed",
+                                                  False):
+            return "ok"
+        if self._connect is None and not self.url:
+            return "lỗi: không có DATABASE_URL trong env của bot"
+        if self.last_error:
+            return "lỗi: %s" % self.last_error
+        return "chưa kết nối"
 
     def reset(self):
         try:
@@ -237,8 +252,16 @@ class RuntimeConfig:
         try:
             latest = bot_config.latest_version(conn, self.bot)
             if latest is None:
-                if (self.version is None and (force or now - self._last_seed_try
-                                              >= self.seed_retry_seconds)):
+                # DB chua co version nao -> seed tu config DANG chay, KE CA
+                # khi cache con so version cu (DB moi / doi DB / DB chet luc
+                # start). Truoc day chi seed khi version None -> bot nghi
+                # minh o version cu, dashboard mai 'Chua co version'.
+                if force or now - self._last_seed_try >= self.seed_retry_seconds:
+                    if self.version is not None and not self._seed_error:
+                        self.log("CONFIG DB chua co version nao nhung bot dang "
+                                 "o version %s (nguon %s) -> seed lai tu "
+                                 "config dang chay" % (self.version,
+                                                       self.source))
                     return self._seed_from_running()
                 return False
             if latest == self.version:
@@ -266,4 +289,6 @@ class RuntimeConfig:
 
     def status(self) -> dict:
         return {"version": self.version, "source": self.source,
-                "error": self.last_error}
+                "error": self.last_error or self._seed_error,
+                "db": self.db.status() if hasattr(self.db, "status")
+                else None}

@@ -384,6 +384,48 @@ if pgserver is not None:
     check("DB song lai -> poll seed + ap dung version", rt6.poll() is True
           and rt6.source == "db" and rt6.version is not None, rt6.status())
 
+    # Task 35 (VPS): cache con SO VERSION cu (DB cu / DB moi trong / DB chet
+    # luc start) -> truoc day poll() chi seed khi version None -> dashboard
+    # mai 'Chua co version config nao'.
+    state7 = {"up": False}
+
+    def connect7():
+        if not state7["up"]:
+            raise OSError("db down")
+        return psycopg.connect(srv2.get_uri(), autocommit=True)
+    c7 = os.path.join(tmp2, "c7.json")
+    good7 = dict(good, **{"grid.max_positions": 4})
+    json.dump({"version": 3, "config": good7}, open(c7, "w"))
+    clock7 = [0.0]
+    link7 = rc.DBLink(connect=connect7, log=logs.append)
+    rt7 = rc.RuntimeConfig(copy.deepcopy(file_cfg), bot="binance_t7",
+                           db=link7, log=logs.append, cache_path=c7,
+                           clock=lambda: clock7[0])
+    rt7.start()
+    check("cache version 3 + DB chet -> chay cache v3",
+          rt7.source == "cache" and rt7.version == 3, rt7.status())
+    st7 = rt7.status()
+    check("status() bao loi DB (cho state.json -> dashboard)",
+          st7.get("db") and "db down" in st7["db"], st7)
+    state7["up"] = True
+    link7._last_fail = 0.0
+    clock7[0] += 61
+    ok7 = rt7.poll()
+    with psycopg.connect(srv2.get_uri(), autocommit=True) as c:
+        row7 = bc.load_version(c, "binance_t7")
+    check("DB song lai, DB chua co version -> seed du cache co version cu",
+          ok7 is True and row7 is not None and rt7.version == row7["version"]
+          and rt7.source == "db"
+          and row7["config"]["grid.max_positions"] == 4, (rt7.status(),
+                                                          row7))
+    check("status() DB ok sau khi ket noi", rt7.status()["db"] == "ok",
+          rt7.status())
+    link8 = rc.DBLink(url="", log=logs.append)
+    check("khong co DATABASE_URL -> status bao ro",
+          "DATABASE_URL" in (rc.RuntimeConfig({}, db=link8,
+                                              log=logs.append).status()
+                             .get("db") or ""))
+
     # ---- scanner DB
     bc.insert_scan(conn, {"symbol": "BTCUSDT", "ts": 1e9, "passed": False,
                           "score": 10, "metrics": {}, "reasons": ["cu"]})
