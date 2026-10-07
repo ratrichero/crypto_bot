@@ -544,7 +544,7 @@ def live_radar_positions_block():
 
 @frag
 def live_radar_trades_frag(days):
-    trades = filter_live_trades(load_live_trades(), days)
+    trades = filter_live_trades(load_live_trades(), days, live_only=True)
     rows = []
     for t in sorted(trades, key=lambda x: x.get("closed_at") or 0,
                     reverse=True)[:50]:
