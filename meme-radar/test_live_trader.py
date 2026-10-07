@@ -322,6 +322,7 @@ def _dry_trader(tmpd, price_map):
     rpc = FakeRpc()
     tr = lt.LiveTrader(cfg, jup=jup, rpc=rpc)
     tr.swapper = lt.Swapper(rpc, jup, None, cfg, dry_run=True)
+    tr._clock = lambda: 0.0  # dong ho co dinh: test bien tuoi signal on dinh
     return tr, jup
 
 
