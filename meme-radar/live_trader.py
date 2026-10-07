@@ -1056,8 +1056,7 @@ class LiveTrader:
             and mint != SOL_MINT
         }
         log(f"RECONCILE wallet: {len(self.onchain_tokens)} non-stable token "
-            f"balances, tracked={len(self.positions)}, "
-            f"occupancy={len(self.onchain_tokens | {p.get('token') for p in self.positions})}")
+            f"balances, tracked={len(self.positions)}")
         changed = False
         unmanaged = []
         pending = self.state.setdefault("pending_buys", {})
@@ -1131,6 +1130,10 @@ class LiveTrader:
                 f"entry~{entry} (khong mua lai)")
         self.unmanaged_tokens = set(unmanaged)
         self.state["unmanaged_tokens"] = unmanaged[-100:]
+        ignored = (self.onchain_tokens - local_tokens) - self.unmanaged_tokens
+        log(f"RECONCILE occupancy={self._occupied_token_count()}/"
+            f"{self.cfg['max_positions']} (bo qua {len(ignored)} token "
+            f"airdrop/dust khong co signal)")
         pending_uncertain = bool(pending)
         self.entry_blocked = bool(unmanaged or pending_uncertain)
         # Ghi ly do block de dashboard hien thi
@@ -1195,11 +1198,15 @@ class LiveTrader:
     # -- signal intake -------------------------------------------------
 
     def _occupied_token_count(self):
+        """So slot dang chiem = vi the dang quan ly + token bot tung mua
+        nhung mat track (unmanaged). Token la tren vi khong co trong signal
+        history (airdrop/spam/dust) KHONG tinh — neu khong vi meme bi airdrop
+        rac se day slot va bot am tham ngung mua."""
         tracked = {
             p.get("token") for p in self.positions
             if p.get("remaining", 1.0) > 0
         }
-        return len(tracked | set(self.onchain_tokens))
+        return len(tracked | set(self.unmanaged_tokens))
 
     def _attempt_signal(self, s, now):
         tid = str(s.get("tid") or "")

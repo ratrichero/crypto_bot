@@ -685,6 +685,64 @@ def test_rpc_error_redacted():
         check("log file khong chua key", "TOPSECRET" not in content)
 
 
+
+# ---- capacity khong tinh airdrop ----
+
+def test_capacity_ignores_airdrops():
+    print("== 12 token airdrop tren vi khong chiem slot ==")
+    with isolated() as tmpd:
+        tr, _ = _dry_trader(tmpd, {"NEWTOK": 0.001})
+        tr.onchain_tokens = {f"AIRDROP{i}" for i in range(12)}
+        tr.unmanaged_tokens = set()
+        check("occupancy = 0", tr._occupied_token_count() == 0)
+        tr.unmanaged_tokens = {"LOST1"}
+        tr.positions = [mkpos()]
+        check("occupancy = vi the + unmanaged = 2", tr._occupied_token_count() == 2)
+        tr.positions, tr.unmanaged_tokens = [], set()
+        with open(lt.SIG_P, "a") as f:
+            f.write(json.dumps(_sig("tid_cap", "NEWTOK", ts=1000)) + "\n")
+        tr.run_once(now=1000)
+        check("van mua duoc khi vi day airdrop",
+              any(p["token"] == "NEWTOK" for p in tr.positions))
+
+
+
+class BalRpc:
+    """RPC gia: chi tra token balances cho reconcile live."""
+
+    def __init__(self, balances):
+        self.balances = balances
+
+    def get_token_balances(self, owner):
+        return dict(self.balances)
+
+
+class LiveSwapperStub:
+    def __init__(self, rpc):
+        self.rpc = rpc
+        self.pubkey = "PUB"
+
+
+def _live_trader_stub(tmpd, balances, price_map=None):
+    tr, _ = _dry_trader(tmpd, price_map or {})
+    tr.dry = False
+    tr.swapper = LiveSwapperStub(BalRpc(balances))
+    return tr
+
+
+def test_reconcile_live_airdrops():
+    print("== reconcile live: airdrop khong block, khong chiem slot ==")
+    with isolated() as tmpd:
+        bal = {f"AIR{i}": {"amount": 5, "decimals": 6} for i in range(15)}
+        bal["MINT"] = {"amount": 10_000_000, "decimals": 6}
+        tr = _live_trader_stub(tmpd, bal)
+        tr.positions = [mkpos()]
+        ok = tr.reconcile_onchain(now=1000, force=True)
+        check("khong block entry", ok is True and tr.entry_blocked is False)
+        check("occupancy = 1", tr._occupied_token_count() == 1,
+              str(tr._occupied_token_count()))
+
+
 if __name__ == "__main__":
     test_exit_tp_ladder()
     test_exit_sl()
@@ -715,5 +773,7 @@ if __name__ == "__main__":
     test_retry_stops_when_stale()
     test_redact_secrets()
     test_rpc_error_redacted()
+    test_capacity_ignores_airdrops()
+    test_reconcile_live_airdrops()
     print(f"\n{PASS} pass, {FAIL} fail")
     sys.exit(1 if FAIL else 0)
