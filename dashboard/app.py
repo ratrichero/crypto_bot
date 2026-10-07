@@ -1038,17 +1038,21 @@ def radar_equity_realtime():
     st.caption("Tự refresh 15s · P&L thực từ lệnh đã đóng + realized (không tính unrealized ảo theo giá live).")
 
 
+# okx_trades.pnl da tru phi DONG o bot (paper_engine/live_okx: net = pnl -
+# fee_exit; phi MO tru vao equity luc open, khong nam trong pnl). Cot fee do
+# sync_jsonl ghi = phi mo + phi dong (2 x 0.05% x notional). Vi vay P&L rong
+# = pnl - fee/2 (chi tru them phi mo); "pnl - fee" truoc day tru phi dong 2 lan.
 @frag
 def okx_kpi_frag(where, params):
     d = day_filter()
-    okx = q(f"SELECT {d} AS day, (pnl - fee) AS net, tag, reason "
+    okx = q(f"SELECT {d} AS day, (pnl - COALESCE(fee, 0) / 2.0) AS net, tag, reason "
             f"FROM okx_trades {where} ORDER BY closed_at", params)
     section("Bot OKX — paper trade")
     kpi_cards("Hieu suat", okx)
     pnl_charts(daily_df(okx), "OKX paper")
     okx_positions_block()
     rokx = q(f"""SELECT closed_at, inst AS symbol, side, tag,
-                        (pnl - fee) AS net, reason
+                        (pnl - COALESCE(fee, 0) / 2.0) AS net, reason
                  FROM okx_trades {where}
                  ORDER BY closed_at DESC LIMIT 50""", params)
     trades_table(rokx,
