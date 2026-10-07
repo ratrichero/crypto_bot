@@ -40,6 +40,36 @@ class DBLink:
         self.log = log
         self._last_fail = 0.0
         self.last_error: Optional[str] = None
+        # Neon endpoint "-pooler" (PgBouncer) TU CHOI tham so startup
+        # options=-c statement_timeout ("unsupported startup parameter in
+        # options") -> moi ket noi cua bot that bai trong khi dashboard (khong
+        # dung options) van chay. Pooler -> bo options ngay tu dau.
+        self._use_options = "-pooler" not in (self.url or "")
+
+    # libpq: connect_timeout + TCP keepalive -> socket chet bao loi trong
+    # ~1 phut thay vi treo vong lap bot (thay cho statement_timeout khi
+    # pooler khong cho dat).
+    CONNECT_KW = {"autocommit": True, "connect_timeout": 5, "keepalives": 1,
+                  "keepalives_idle": 30, "keepalives_interval": 10,
+                  "keepalives_count": 3}
+
+    def _open(self):
+        import psycopg
+        if self._use_options:
+            try:
+                return psycopg.connect(
+                    self.url, options="-c statement_timeout=5000",
+                    **self.CONNECT_KW)
+            except Exception as e:
+                if "unsupported startup parameter" not in str(e):
+                    raise
+                self._use_options = False
+                self.log("DB: pooler tu choi statement_timeout trong startup "
+                         "-> ket noi lai khong kem options (van co "
+                         "connect_timeout + TCP keepalive)")
+        # Pooler (transaction mode): tat auto-prepare cua psycopg cho chac.
+        return psycopg.connect(self.url, prepare_threshold=None,
+                               **self.CONNECT_KW)
 
     def get(self):
         if self._conn is not None and not getattr(self._conn, "closed", False):
@@ -53,17 +83,16 @@ class DBLink:
             if self._connect is not None:
                 self._conn = self._connect()
             else:
-                import psycopg
-                # timeout ngan: vong lap bot khong duoc treo vi DB
-                self._conn = psycopg.connect(
-                    self.url, autocommit=True, connect_timeout=5,
-                    options="-c statement_timeout=5000")
+                self._conn = self._open()
             self.last_error = None
             return self._conn
         except Exception as e:
             self._last_fail = time.time()
-            self.last_error = str(e)[:300] or e.__class__.__name__
-            self.log("DB warning: khong ket noi duoc (%s)" % str(e)[:200])
+            # psycopg gom loi MOI dia chi (IPv6 roi IPv4): giu du de thay
+            # loi that (dong dau thuong chi la IPv6 'Network is unreachable').
+            self.last_error = str(e)[:1500] or e.__class__.__name__
+            self.log("DB warning: khong ket noi duoc (%s)"
+                     % " | ".join(str(e).split("\n"))[:1000])
             return None
 
     def status(self) -> str:

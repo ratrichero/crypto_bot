@@ -58,6 +58,71 @@ _, err = bc.validate(dict(d, **{"khong.ton.tai": 1}))
 check("khoa la bi tu choi", err and "không tồn tại" in err[0], err)
 _, err = bc.validate(dict(d, **{"scanner.mode": "yolo"}))
 check("enum sai bi chan", err, err)
+# ---- task 35: Neon -pooler tu choi options=-c statement_timeout
+import runtime_config as rc0  # noqa: E402
+
+
+class FakePsycopg:
+    def __init__(self, reject_options=True, err=None):
+        self.calls, self.reject, self.err = [], reject_options, err
+
+    def connect(self, url, **kw):
+        self.calls.append(kw)
+        if self.err:
+            raise Exception(self.err)
+        if self.reject and "options" in kw:
+            raise Exception(
+                'connection failed: connection to server at "2406::1", port '
+                '5432 failed: Network is unreachable\nMultiple connection '
+                'attempts failed. All failures were:\n- host: x-pooler: '
+                'ERROR:  unsupported startup parameter in options: '
+                'statement_timeout. Please use unpooled connection or remove '
+                'this parameter from the startup package.')
+        return type("C", (), {"closed": False})()
+
+
+_saved_pg = sys.modules.get("psycopg")
+try:
+    fp = FakePsycopg()
+    sys.modules["psycopg"] = fp
+    lg = []
+    link = rc0.DBLink(url="postgresql://u:p@ep-x.aws.neon.tech/db", log=lg.append)
+    conn0 = link.get()
+    check("pooler tu choi options (URL khong co -pooler) -> thu lai khong "
+          "options, ket noi duoc", conn0 is not None and len(fp.calls) == 2
+          and "options" in fp.calls[0] and "options" not in fp.calls[1]
+          and fp.calls[1]["connect_timeout"] == 5
+          and fp.calls[1]["keepalives"] == 1 and link.status() == "ok"
+          and any("pooler" in m for m in lg), (fp.calls, lg))
+    link._conn = None
+    link.get()
+    check("lan ket noi sau khong gui options nua", len(fp.calls) == 3
+          and "options" not in fp.calls[2])
+    fp2 = FakePsycopg()
+    sys.modules["psycopg"] = fp2
+    rc0.DBLink(url="postgresql://u:p@ep-x-pooler.c-4.aws.neon.tech/db",
+               log=lg.append).get()
+    check("URL -pooler -> khong gui options ngay tu dau, tat auto-prepare",
+          len(fp2.calls) == 1 and "options" not in fp2.calls[0]
+          and "prepare_threshold" in fp2.calls[0]
+          and fp2.calls[0]["prepare_threshold"] is None, fp2.calls)
+    fp3 = FakePsycopg(reject_options=False)
+    sys.modules["psycopg"] = fp3
+    rc0.DBLink(url="postgresql://u:p@localhost/db", log=lg.append).get()
+    check("Postgres thuong -> van dat statement_timeout qua options",
+          fp3.calls[0].get("options") == "-c statement_timeout=5000")
+    long_err = "dong IPv6\n" + "x" * 600 + "\nLOI THAT O CUOI"
+    sys.modules["psycopg"] = FakePsycopg(err=long_err)
+    l4 = rc0.DBLink(url="postgresql://u:p@localhost/db", log=lg.append)
+    l4.get()
+    check("loi dai: status giu du (khong cat mat loi IPv4 o cuoi)",
+          "LOI THAT O CUOI" in l4.status(), l4.status()[-80:])
+finally:
+    if _saved_pg is not None:
+        sys.modules["psycopg"] = _saved_pg
+    else:
+        sys.modules.pop("psycopg", None)
+
 # ---- task 34: mac dinh chong om nhieu lot cung chieu + canh bao
 check("default D: scanner filter, max_positions 3, max_same_side 2, "
       "loc xu huong bat", d["scanner.mode"] == "filter"
