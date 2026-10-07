@@ -405,6 +405,36 @@ def test_detect_cancels_leftover_guards():
           fake.open_algos())
 
 
+# ===================================================================
+# 5. detect_exchange_closed: reason drives the scalp SL cooldown
+# ===================================================================
+def test_detect_reason_from_real_fill():
+    fake = FakeBinance()
+    eng, st = make_engine(fake, protection=False)
+    lot = open_lot(eng, "long", 60000, tag="scalp", sl_pct=0.004,
+                   tp_pct=0.01)
+    CLOCK.sleep(300)
+    manual_close(fake, "long", lot["qty"], lot["sl"] - 5)   # SL slipped
+    recs = confirm_detect(eng)
+    check("reason: fill that qua SL -> 'SL' (kich hoat cooldown scalp)",
+          recs and recs[0]["reason"] == "SL", recs)
+    check("log: fill that khong ghi [estimated]",
+          any("[exchange fill]" in m for m in eng.logs)
+          and not any("[estimated]" in m for m in eng.logs))
+
+
+def test_detect_reason_unknown_when_estimated():
+    fake = FakeBinance()
+    eng, st = make_engine(fake, protection=False)
+    open_lot(eng, "long", 60000, tag="scalp", sl_pct=0.004, tp_pct=0.01)
+    CLOCK.sleep(300)
+    fake.positions.clear()                # gone, but no trade visible
+    recs = confirm_detect(eng)
+    check("reason: gia uoc tinh -> CLOSED_ON_EXCHANGE",
+          recs and recs[0]["reason"] == "CLOSED_ON_EXCHANGE"
+          and recs[0]["estimated"] is True, recs)
+
+
 TESTS = [
     test_close_one_of_many_grid_lots,
     test_close_detects_real_partial,
@@ -416,6 +446,8 @@ TESTS = [
     test_detect_price_grid_lots_get_their_own_fill,
     test_detect_price_one_order_closing_whole_leg,
     test_detect_cancels_leftover_guards,
+    test_detect_reason_from_real_fill,
+    test_detect_reason_unknown_when_estimated,
 ]
 
 

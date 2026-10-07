@@ -1187,6 +1187,8 @@ class BinanceEngine:
                 pnl = (entry - exit_px) * local_qty
             fee = self._fees(pos.get("notional", 0) or 0)
             net = pnl - fee
+            reason = self._exit_reason_from_price(pos, exit_px,
+                                                  fired == "EXCHANGE")
             self.state["equity"] = float(self.state.get("equity", 0) or 0) + net
             self.state["stats"]["fees"] = float(
                 self.state["stats"].get("fees", 0) or 0) + fee
@@ -1203,7 +1205,7 @@ class BinanceEngine:
                 "tag": pos.get("tag"), "entry": round(entry, 6),
                 "exit": round(exit_px, 6),
                 "notional": round(float(pos.get("notional", 0) or 0), 2),
-                "pnl": round(net, 2), "reason": "CLOSED_ON_EXCHANGE",
+                "pnl": round(net, 2), "reason": reason,
                 "closed_at": int(now),
                 "live": True, "dry": self.dry_run,
                 "estimated": fired != "EXCHANGE", "exit_fired": fired,
@@ -1215,12 +1217,37 @@ class BinanceEngine:
             # van treo va co the dong nham lot moi cung leg -> huy ngay.
             self._cancel_leftover_guards(pos)
             self._db_insert_trade(rec)
-            self.log("EXCHANGE_CLOSE #%s %s %s: khong con tren san, uoc tinh "
-                     "dong @%s (%s) pnl=%+.2f [estimated]"
+            self.log("EXCHANGE_CLOSE #%s %s %s: khong con tren san, dong "
+                     "@%s (%s) reason=%s pnl=%+.2f [%s]"
                      % (pos["id"], symbol, side, round(exit_px, 6), fired,
-                        net))
+                        reason, net,
+                        "exchange fill" if fired == "EXCHANGE"
+                        else "estimated"))
             recs.append(rec)
         return recs
+
+    @staticmethod
+    def _exit_reason_from_price(pos, exit_px, real_fill):
+        """'SL'/'TP' only when a REAL fill is at/through that trigger.
+
+        The scalp cooldown keys on reason == 'SL'; an estimated price must
+        never claim a specific trigger.
+        """
+        if not real_fill or not exit_px:
+            return "CLOSED_ON_EXCHANGE"
+        sl, tp = pos.get("sl"), pos.get("tp")
+        slack = 0.001
+        if pos.get("side") == "long":
+            if sl and exit_px <= sl * (1 + slack):
+                return "SL"
+            if tp and exit_px >= tp * (1 - slack):
+                return "TP"
+        else:
+            if sl and exit_px >= sl * (1 - slack):
+                return "SL"
+            if tp and exit_px <= tp * (1 + slack):
+                return "TP"
+        return "CLOSED_ON_EXCHANGE"
 
     def _exchange_exit_from_trades(self, pos, used_orders, group_qty):
         """Average exit price of the exchange fill that closed ``pos``.
