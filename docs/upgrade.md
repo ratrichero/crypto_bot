@@ -363,8 +363,9 @@ Thiết kế ở `docs/grid-v2-design.md`. Commit: bot/DB `869aba8`, dashboard `
 | Grid | `grid.tp_pct` | **1%** (0 = 1 step như cũ) | lot mới |
 | Grid | `grid.sl_pct` (trước hard-code) | 3% | lot mới |
 | Grid | `grid.max_symbols` | 0 = không giới hạn | ngay; chỉ chặn symbol chưa có lot |
-| Grid | tầng, độ giãn, `range_steps` | như cũ | lần dựng lưới kế tiếp |
-| Rủi ro | daily / basket / trần tổng grid | 10% / 2% / **10%** | ngay |
+| Grid | tầng, độ giãn, `range_steps` | 2 tầng/phía, step 1–1.5% (từ mục 10.6) | lần dựng lưới kế tiếp |
+| Grid | `grid.max_positions` | 3 (từ mục 10.6) | ngay |
+| Rủi ro | daily / basket / trần tổng grid | 10% / **3%** / **10%** | ngay |
 | Scanner | `scanner.mode` | `observe` | ngay |
 
 Net mỗi lot ước tính ở mặc định ($1000, TP 1%): **≈ $8.8** khi vào market
@@ -467,11 +468,10 @@ python backtest_v2.py walk-forward --data-dir /tmp/bt5m --scan-cache /tmp/scan.j
   vào `--scan-cache` để dùng lại giữa các lệnh.
 - Tốc độ: 10 symbol × 30 ngày ≈ 1 giây/lần mô phỏng.
 - **Phát hiện từ dữ liệu tổng hợp, cần kiểm lại bằng dữ liệu thật:**
-  - Basket 2% với lot $1000 / equity $1000 và 4 lot/symbol nghĩa là giá đi
-    ngược chỉ khoảng 0.5% là basket cắt. Trong study, tỷ lệ cửa sổ dính
-    basket của nhóm ĐẠT rất cao.
-  - Nếu backtest thật cũng vậy, nên thử 1 trong 3 hướng (đều chỉnh được trên
-    dashboard): basket 3–4%, `max_lots_per_symbol` 2–3, hoặc lot nhỏ hơn.
+  - Với setting cũ (basket 2%, lot $1000 / equity $1000, step 0.4%, 4
+    lot/symbol), giá đi ngược khoảng 1.5% so với anchor là basket cắt 3 lot.
+    Trong study, tỷ lệ cửa sổ dính basket của nhóm ĐẠT rất cao.
+  - Đã đổi mặc định theo hướng lưới thưa, ít lot: xem mục 10.6.
 
 ### 10.2 G4 — range grid 2 chiều (`grid.engine = range`)
 
@@ -567,4 +567,49 @@ python backtest_v2.py walk-forward --data-dir /tmp/bt5m --scan-cache /tmp/scan.j
     được làm mới khoảng 2.5 phút/lần. Scanner dùng nến 15m đã đóng nên vẫn đủ.
 - Khuyến nghị: chạy `study` trên 60 symbol trước. Coin vốn hoá nhỏ đi ngang
   "đẹp" nhưng hay có râu dài, dễ chạm SL biên.
+
+### 10.6 Mặc định mới cho vốn ~$1000 (lưới thưa)
+
+Lot $1000 bằng 100% vốn, nên lưới 0.4% với 4–5 tầng quá sát: giá đi ngược
+khoảng 1.5% (dao động bình thường trong ngày) là basket 2% cắt 3 lot. Mặc định
+mới:
+
+| Tham số | Cũ | Mới |
+|---|---|---|
+| `grid.step_min` / `grid.step_max` | 0.4% / 0.8% | **1.0% / 1.5%** |
+| `grid.step_pct` (khi chưa có ATR, chỉ trong file) | 0.5% | **1.0%** |
+| `grid.levels_each_side` | 5 | **2** |
+| `grid.max_lots_per_symbol` (range) | 4 | **2** |
+| `grid.max_positions` | 7 | **3** |
+| `risk.grid_basket_max_loss_pct` | 2% | **3%** |
+| `grid.tp_pct`, `grid.sl_pct`, lot | 1%, 3%, $1000 | giữ nguyên |
+
+Ước tính tay (không phải backtest), equity $1000, vào và ra market, phí cả
+vòng khoảng 0.12%:
+
+| Setting | Giá ngược bao nhiêu thì cắt | Lỗ thật | Lãi/TP | Số TP cần để gỡ |
+|---|---|---|---|---|
+| Cũ: step 0.4%, 4 lot, basket 2% | −1.5% (3 lot) | ≈ $24 | ≈ $8.8 | 2.7 |
+| Mới: step 1%, 2 lot, basket 3% | −3.0% (2 lot) | ≈ $33 | ≈ $8.8 | 3.7 |
+
+- Basket chỉ tính lỗ theo giá, chưa tính phí, nên lỗ thật luôn cao hơn ngưỡng.
+- Tổng vị thế grid tối đa giảm từ khoảng 7 lần vốn xuống 3 lần. Daily stop 10%
+  tương ứng khoảng 3 lần basket trong một ngày.
+- Step 1% ≈ TP 1%: TP của lot dưới rơi đúng vào tầng trên, kiểu grid chuẩn.
+  Với `step_mult` 0.8, step chỉ vượt 1% khi ATR 15m > 1.25% giá.
+- Range grid cần biên rộng hơn 2 lần step mới có tầng. Ví dụ biên 2.5–4%
+  thường chỉ có 1 tầng mỗi phía. Nếu muốn nhiều tầng hơn thì nâng
+  `scanner.range_min_pct`.
+- Lệnh vào thưa hơn nhiều, có thể chỉ vài lệnh mỗi ngày trên mỗi coin.
+
+**VPS đang chạy không tự đổi theo.** Seed chỉ chạy khi DB chưa có version
+(lấy từ `config.json` cộng default schema). Trên VPS cần làm một trong hai:
+
+- Sửa các giá trị trong bảng trên ở dashboard, tab **Cấu hình**, rồi lưu. Bot
+  áp dụng trong khoảng 10 giây, không cần restart.
+- Hoặc dùng `--set` trong `backtest_v2.py` để so cũ và mới trước khi sửa:
+  `--set grid.step_min=0.01 --set grid.step_max=0.015 --set grid.levels_each_side=2 --set grid.max_lots_per_symbol=2 --set grid.max_positions=3 --set risk.grid_basket_max_loss_pct=0.03`.
+
+Step và số tầng có hiệu lực ở lần dựng lưới kế tiếp, tức khi symbol đã flat.
+`max_positions` và basket có hiệu lực ngay. Lot đang mở giữ nguyên SL/TP cũ.
 

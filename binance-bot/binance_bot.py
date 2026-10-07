@@ -638,7 +638,7 @@ def range_slot_ok(st, symbol, pending=None):
         return False
     n_sym = sum(1 for p in lots if p.get("symbol") == symbol) \
         + pending.get(symbol, 0)
-    if n_sym >= int(g.get("max_lots_per_symbol") or 4):
+    if n_sym >= int(g.get("max_lots_per_symbol") or 2):
         return False
     limit = int(g.get("max_symbols") or 0)
     busy = {p.get("symbol") for p in lots} | {k for k, v in pending.items()

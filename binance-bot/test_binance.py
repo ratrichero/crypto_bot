@@ -80,7 +80,7 @@ check("exchange protection disabled by default",
 check("daily stop starts at 10 percent",
       CFG.get("risk", {}).get("daily_max_loss_pct") == 0.1)
 check("grid basket stop configured",
-      CFG.get("risk", {}).get("grid_basket_max_loss_pct") == 0.02)
+      CFG.get("risk", {}).get("grid_basket_max_loss_pct") == 0.03)
 check("grid opens at most one level per cycle",
       CFG.get("grid", {}).get("max_entries_per_cycle") == 1)
 check("liquidation buffer configured",

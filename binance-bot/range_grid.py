@@ -19,12 +19,12 @@ from __future__ import annotations
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 DEFAULTS = {
-    "levels_each_side": 5, "step_pct": 0.005, "step_min": 0.004,
-    "step_max": 0.008, "step_mult": 0.8, "tp_pct": 0.01, "sl_pct": 0.03,
+    "levels_each_side": 2, "step_pct": 0.01, "step_min": 0.01,
+    "step_max": 0.015, "step_mult": 0.8, "tp_pct": 0.01, "sl_pct": 0.03,
     "boundary_sl_buffer": 0.005, "break_buffer": 0.003,
     "trend_exit_adx": 25.0, "derisk_on_trend": False,
-    "derisk_loss_pct": 0.01, "max_symbols": 0, "max_lots_per_symbol": 4,
-    "max_positions": 7, "limit_min_gap_pct": 0.0005,
+    "derisk_loss_pct": 0.01, "max_symbols": 0, "max_lots_per_symbol": 2,
+    "max_positions": 3, "limit_min_gap_pct": 0.0005,
 }
 
 
