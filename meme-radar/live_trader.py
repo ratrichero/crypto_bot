@@ -23,6 +23,7 @@ Chay:  .venv/bin/python live_trader.py   (doc config.live.json)
 """
 import base64
 import json
+import math
 import os
 import sys
 import time
@@ -35,11 +36,14 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 
 SOL_MINT = "So11111111111111111111111111111111111111112"
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+USDT_MINT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+STABLE_MINTS = {USDC_MINT, USDT_MINT}
 TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
 
 SIG_P = os.path.join(BASE, "signals.jsonl")
 ALERT_P = os.path.join(BASE, "alerts.jsonl")
+SELL_P = os.path.join(BASE, "sells.jsonl")
 POS_P = os.path.join(BASE, "live_positions.json")
 STATE_P = os.path.join(BASE, "live_state.json")
 TRADES_P = os.path.join(BASE, "live_trades.jsonl")
@@ -79,12 +83,17 @@ DEFAULTS = {
     "jupiter_base": "https://lite-api.jup.ag",
     "trade_size_usd": 10.0,
     "max_positions": 10,
-    "slippage_bps": 100,
+    "slippage_bps": 100,  # buy
+    "sell_slippage_bps": 300,  # sell: wider for volatile meme exits
     "priority_fee_lamports": 20000,
     "max_price_impact_pct": 5.0,
+    "sell_max_price_impact_pct": 10.0,
     "price_poll_seconds": 20,
     "loop_seconds": 10,
-    "confirm_timeout_seconds": 30,
+    "confirm_timeout_seconds": 90,
+    "confirm_poll_seconds": 2,
+    "buy_balance_verify_attempts": 4,
+    "buy_balance_verify_seconds": 2,
     "max_swap_retries": 3,
     "fee_buffer_sol": 0.02,
     "daily_stop_pct": 0.20,
@@ -96,6 +105,11 @@ DEFAULTS = {
     # "signals_jsonl": "/home/ubuntu/muse_bot/live-signals/signals.jsonl"
     "signals_jsonl": "",
     "alerts_jsonl": "",
+    "sells_jsonl": "",
+    "reconcile_interval_seconds": 60,
+    "signal_retry_seconds": 30,
+    "max_signal_retry_seconds": 900,
+    "recover_unmanaged_tokens": True,
     # exit ladder (mirror paper)
     "tp1_pct": 0.50, "tp1_frac": 0.3334,
     "tp2_pct": 1.00, "tp2_frac": 0.3333,
@@ -260,7 +274,7 @@ class RpcClient:
         return d["result"]
 
     def get_balance_lamports(self, pubkey):
-        return int(self.call("getBalance", [pubkey])["value"])
+        return int(self.call("getBalance", [pubkey, {"commitment": "confirmed"}])["value"])
 
     def get_mint_decimals(self, mint):
         if mint in self._decimals_cache:
@@ -271,30 +285,62 @@ class RpcClient:
         self._decimals_cache[mint] = dec
         return dec
 
-    def get_token_balance_base(self, owner, mint):
-        """Tra ve (base_units:int, decimals:int|None). 0 neu khong co account.
-        Query ca Token program chuan va Token-2022 (nhieu meme moi dung 2022)."""
-        total = 0
-        dec = None
-        for prog in (TOKEN_PROGRAM, TOKEN_2022_PROGRAM):
+    def _token_account_rows(self, owner):
+        """Read both SPL Token programs; never silently omit Token-2022."""
+        rows = []
+        query_errors = []
+        for program in (TOKEN_PROGRAM, TOKEN_2022_PROGRAM):
             try:
                 res = self.call(
                     "getTokenAccountsByOwner",
-                    [owner, {"programId": prog},
-                     {"encoding": "jsonParsed"}])
-            except Exception:
+                    [owner, {"programId": program}, {
+                        "encoding": "jsonParsed", "commitment": "confirmed",
+                    }],
+                )
+                rows.extend(res.get("value", []))
+            except Exception as e:
+                query_errors.append(f"{program[:8]}: {e}")
+        if query_errors:
+            raise RpcError("token account scan incomplete: "
+                           + "; ".join(query_errors)[:300])
+        return rows
+
+    @staticmethod
+    def _token_info(item):
+        return item["account"]["data"]["parsed"]["info"]
+
+    def get_token_balance_base(self, owner, mint):
+        """Return (base_units, decimals), including Token-2022 accounts."""
+        total = 0
+        dec = None
+        for item in self._token_account_rows(owner):
+            info = self._token_info(item)
+            if info.get("mint") != mint:
                 continue
-            for item in res.get("value", []):
-                try:
-                    pinfo = item["account"]["data"]["parsed"]["info"]
-                except (KeyError, TypeError):
-                    continue
-                if pinfo.get("mint") != mint:
-                    continue
-                tinfo = pinfo["tokenAmount"]
-                total += int(tinfo["amount"])
-                dec = tinfo["decimals"]
+            token_amount = info["tokenAmount"]
+            total += int(token_amount["amount"])
+            dec = int(token_amount["decimals"])
         return total, dec
+
+    def get_token_balances(self, owner):
+        """Return all non-zero SPL and Token-2022 balances by mint."""
+        balances = {}
+        for item in self._token_account_rows(owner):
+            try:
+                info = self._token_info(item)
+                token_amount = info["tokenAmount"]
+                amount = int(token_amount["amount"])
+                if amount <= 0:
+                    continue
+                mint = info["mint"]
+                dec = int(token_amount["decimals"])
+                balances[mint] = {
+                    "amount": balances.get(mint, {}).get("amount", 0) + amount,
+                    "decimals": dec,
+                }
+            except (KeyError, TypeError, ValueError):
+                continue
+        return balances
 
     def send_transaction(self, b64tx, skip_preflight=False):
         return self.call("sendTransaction", [b64tx, {
@@ -324,6 +370,10 @@ class NoRoute(Exception):
 
 class SwapError(Exception):
     pass
+
+
+class SwapUncertain(SwapError):
+    """A transaction may have landed; never blindly retry this operation."""
 
 
 class JupiterClient:
@@ -414,37 +464,94 @@ class Swapper:
         return self.rpc.send_transaction(raw_b64, self.cfg["skip_preflight"])
 
     def _confirm(self, sig):
-        deadline = time.time() + self.cfg["confirm_timeout_seconds"]
+        deadline = time.time() + float(self.cfg.get("confirm_timeout_seconds", 90))
+        poll_seconds = float(self.cfg.get("confirm_poll_seconds", 2))
         while time.time() < deadline:
             st = self.rpc.get_sig_status(sig)
             if st in ("confirmed", "finalized"):
                 return True
             if st == "failed":
                 raise SwapError(f"tx failed on-chain: {sig[:12]}")
-            time.sleep(2)
-        # Timeout: fallback kiem tra truc tiep via getTransaction
-        # (RPC co the lag, tx da thanh cong nhung status chua cap nhat)
+            time.sleep(min(poll_seconds, max(0, deadline - time.time())))
+        # Some RPC providers lag getSignatureStatuses while the transaction
+        # is already available in history. This is only a status fallback;
+        # BUY still requires token-balance delta verification afterwards.
         try:
             tx = self.rpc.call(
                 "getTransaction",
                 [sig, {"encoding": "json",
-                       "maxSupportedTransactionVersion": 0}])
+                       "maxSupportedTransactionVersion": 0}],
+            )
             if tx and tx.get("meta") and tx["meta"].get("err") is None:
                 log(f"confirm fallback: tx {sig[:12]}... thanh cong "
-                    f"(getTransaction), chap nhan")
+                    "(getTransaction), tiep tuc verify balance")
                 return True
         except Exception as e:
             log(f"confirm fallback loi: {e}")
         return False
 
-    def _quote_swap(self, in_mint, out_mint, amount_base):
+    def _wait_for_buy_delta(self, mint, before_base):
+        """Verify a submitted BUY by token balance, even if status RPC lags."""
+        attempts = max(1, int(self.cfg.get("buy_balance_verify_attempts", 4)))
+        delay = float(self.cfg.get("buy_balance_verify_seconds", 2))
+        last_error = None
+        last_dec = None
+        for i in range(attempts):
+            try:
+                after_base, dec = self.rpc.get_token_balance_base(
+                    self.pubkey, mint)
+                last_dec = dec if dec is not None else last_dec
+                delta = after_base - before_base
+                if delta > 0:
+                    return delta, last_dec, None
+            except Exception as e:
+                last_error = e
+            if i + 1 < attempts:
+                time.sleep(delay)
+        return 0, last_dec, last_error
+
+    def _buy_result(self, sig, symbol, size_usd, sol_usd, bal_before,
+                    token_delta, dec):
+        if dec is None or token_delta <= 0:
+            raise SwapUncertain(
+                f"BUY {symbol} verify khong co token delta hop le")
+        try:
+            bal_after = self.rpc.get_balance_lamports(self.pubkey)
+            spent_usd = max(bal_before - bal_after, 0) / 1e9 * sol_usd
+        except Exception as e:
+            # Token delta is the authoritative execution proof; SOL P&L is
+            # only accounting, so retain a conservative cost fallback.
+            spent_usd = size_usd
+            log(f"BUY {symbol}: khong doc duoc SOL balance sau tx ({e}); "
+                f"dung cost=${size_usd:.2f}")
+        if spent_usd <= 0:
+            spent_usd = size_usd
+        entry_usd = spent_usd / (token_delta / (10 ** dec))
+        log(f"LIVE BUY {symbol} OK nhan {token_delta/(10**dec):.4f} token "
+            f"@{entry_usd:.8f} tx={(sig or 'unknown')[:12]}...")
+        return {"tokens_base": token_delta, "decimals": dec,
+                "cost_usd": round(spent_usd, 4), "entry_usd": entry_usd,
+                "tx": sig, "dry": False}
+
+    def _quote_swap(self, in_mint, out_mint, amount_base,
+                    slippage_bps=None, max_price_impact_pct=None):
+        slippage_bps = (self.cfg["slippage_bps"] if slippage_bps is None
+                        else slippage_bps)
+        max_price_impact_pct = (
+            self.cfg["max_price_impact_pct"]
+            if max_price_impact_pct is None else max_price_impact_pct)
         last = None
         for _ in range(self.cfg["max_swap_retries"]):
             try:
                 q = self.jup.quote(in_mint, out_mint, amount_base,
-                                   self.cfg["slippage_bps"])
-            except NoRoute:
-                raise
+                                   slippage_bps)
+            except NoRoute as e:
+                # Route availability can be transient, especially on meme
+                # exits. Re-quote instead of turning a no-route into an
+                # uncertain on-chain operation.
+                last = e
+                time.sleep(1)
+                continue
             except Exception as e:
                 last = e
                 time.sleep(1)
@@ -453,17 +560,28 @@ class Swapper:
                 pi = float(q.get("priceImpactPct") or 0)
             except (TypeError, ValueError):
                 pi = 0
-            if pi > self.cfg["max_price_impact_pct"]:
+            if pi > max_price_impact_pct:
                 raise SwapError(f"price impact {pi}% > max "
-                                f"{self.cfg['max_price_impact_pct']}% -> skip")
-            txb64 = self.jup.swap_tx(q, self.pubkey, self._priority_fee())
+                                f"{max_price_impact_pct}% -> skip")
+            try:
+                txb64 = self.jup.swap_tx(q, self.pubkey, self._priority_fee())
+            except Exception as e:
+                last = e
+                time.sleep(1)
+                continue
             return q, txb64
         raise SwapError(f"quote/swap failed sau {self.cfg['max_swap_retries']} "
                         f"lan thu: {last}")
 
     def execute_buy(self, mint, size_usd, symbol="?"):
         """Mua token bang SOL tri gia size_usd. Tra ve dict ket qua."""
-        sol_usd = self.jup.sol_price_usd()
+        try:
+            sol_usd = self.jup.sol_price_usd()
+            if not sol_usd or sol_usd <= 0:
+                raise ValueError("SOL price khong hop le")
+        except Exception as e:
+            # No transaction has been submitted yet, so the signal may retry.
+            raise SwapError(f"khong lay duoc SOL price truoc BUY: {e}")
         lamports = usd_to_lamports(size_usd, sol_usd)
         if self.dry:
             q = self.jup.quote(SOL_MINT, mint, lamports,
@@ -476,29 +594,77 @@ class Swapper:
             return {"tokens_base": int(q["outAmount"]), "decimals": dec,
                     "cost_usd": size_usd, "entry_usd": price, "tx": None,
                     "dry": True}
-        bal = self.rpc.get_balance_lamports(self.pubkey)
+        try:
+            bal = self.rpc.get_balance_lamports(self.pubkey)
+        except Exception as e:
+            raise SwapError(f"khong doc duoc SOL balance truoc BUY: {e}")
         need = lamports + int(self.cfg["fee_buffer_sol"] * 1_000_000_000)
         if bal < need:
             raise SwapError(
                 f"insufficient SOL: co {bal/1e9:.4f}, can "
                 f"{need/1e9:.4f} (goc + fee buffer)")
         bal_before = bal
+        try:
+            tokens_before, dec_before = self.rpc.get_token_balance_base(
+                self.pubkey, mint)
+        except Exception as e:
+            # Still before quote/sign/send: retry instead of calling this
+            # uncertain or placing a second transaction.
+            raise SwapError(
+                f"khong doc duoc token balance truoc BUY {symbol}: {e}")
         q, txb64 = self._quote_swap(SOL_MINT, mint, lamports)
-        sig = self._sign_and_send(txb64)
+        try:
+            sig = self._sign_and_send(txb64)
+        except Exception as e:
+            # sendTransaction can time out after the validator accepted it.
+            # Verify the token delta before deciding that BUY failed.
+            delta, dec, verify_error = self._wait_for_buy_delta(
+                mint, tokens_before)
+            if delta > 0:
+                log(f"LIVE BUY {symbol} send exception nhung token da ve "
+                    "vi -> coi la thanh cong")
+                return self._buy_result(
+                    None, symbol, size_usd, sol_usd, bal_before, delta,
+                    dec if dec is not None else dec_before)
+            if verify_error:
+                raise SwapUncertain(
+                    f"BUY {symbol} send exception + verify loi: {verify_error}")
+            raise SwapUncertain(
+                f"BUY {symbol} send exception, khong thay token: {e}")
         log(f"LIVE BUY {symbol} tx={sig[:12]}... cho confirm")
-        if not self._confirm(sig):
-            raise SwapError(f"buy unconfirmed: {sig[:12]} (kiem tra tay)")
-        bal_after = self.rpc.get_balance_lamports(self.pubkey)
-        spent_usd = max(bal_before - bal_after, 0) / 1e9 * sol_usd
-        tokens_base, dec = self.rpc.get_token_balance_base(self.pubkey, mint)
-        if tokens_base <= 0:
-            raise SwapError("buy confirmed nhung khong thay token ve vi")
-        entry_usd = spent_usd / (tokens_base / (10 ** dec))
-        log(f"LIVE BUY {symbol} OK nhan {tokens_base/(10**dec):.4f} token "
-            f"@{entry_usd:.8f} tx={sig[:12]}...")
-        return {"tokens_base": tokens_base, "decimals": dec,
-                "cost_usd": round(spent_usd, 4), "entry_usd": entry_usd,
-                "tx": sig, "dry": False}
+
+        confirm_error = None
+        status_unknown = False
+        try:
+            confirmed = self._confirm(sig)
+        except SwapError as e:
+            # A known on-chain failure is retryable, but still verify first:
+            # RPC/provider responses can disagree with token state.
+            confirmed = False
+            confirm_error = e
+        except Exception as e:
+            confirmed = False
+            confirm_error = e
+            status_unknown = True
+
+        delta, dec, verify_error = self._wait_for_buy_delta(
+            mint, tokens_before)
+        if delta > 0:
+            if not confirmed:
+                log(f"LIVE BUY {symbol}: status chua chac/timeout nhung "
+                    "token delta da xac nhan")
+            return self._buy_result(
+                sig, symbol, size_usd, sol_usd, bal_before, delta,
+                dec if dec is not None else dec_before)
+        if verify_error:
+            raise SwapUncertain(
+                f"BUY {symbol} status={confirm_error or 'timeout'}; "
+                f"verify token loi: {verify_error}")
+        if confirm_error is not None and not status_unknown:
+            raise confirm_error
+        raise SwapUncertain(
+            f"BUY {symbol} unconfirmed/unknown {sig[:12]} (da verify, "
+            "khong thay token)")
 
     def execute_sell(self, mint, frac, symbol="?"):
         """Ban frac so token DANG CO tren vi. Tra ve dict ket qua."""
@@ -507,34 +673,62 @@ class Swapper:
             log(f"DRY_RUN SELL {symbol} {frac:.0%} (mo phong, khong gui tx)")
             return {"sold_base": 0, "proceeds_usd": 0.0, "tx": None,
                     "dry": True, "simulated": True}
-        bal_base, dec = self.rpc.get_token_balance_base(self.pubkey, mint)
-        if bal_base <= 0 or not dec:
+        try:
+            bal_base, dec = self.rpc.get_token_balance_base(self.pubkey, mint)
+        except Exception as e:
+            raise SwapError(f"khong doc duoc token balance truoc SELL: {e}")
+        if bal_base <= 0 or dec is None:
             return {"sold_base": 0, "proceeds_usd": 0.0, "tx": None,
                     "dry": False, "note": "empty"}
         amount = bal_base if frac >= 0.999 else int(bal_base * frac)
         if amount <= 0:
             return {"sold_base": 0, "proceeds_usd": 0.0, "tx": None,
                     "dry": False, "note": "dust"}
-        sol_usd = self.jup.sol_price_usd()
-        sol_before = self.rpc.get_balance_lamports(self.pubkey)
-        q, txb64 = self._quote_swap(mint, SOL_MINT, amount)
+        try:
+            sol_usd = self.jup.sol_price_usd()
+            sol_before = self.rpc.get_balance_lamports(self.pubkey)
+        except Exception as e:
+            raise SwapError(f"khong lay duoc gia/balance truoc SELL: {e}")
+        sell_slippage = int(self.cfg.get(
+            "sell_slippage_bps", self.cfg["slippage_bps"]))
+        sell_impact = float(self.cfg.get(
+            "sell_max_price_impact_pct", self.cfg["max_price_impact_pct"]))
+        q, txb64 = self._quote_swap(
+            mint, SOL_MINT, amount,
+            slippage_bps=sell_slippage,
+            max_price_impact_pct=sell_impact,
+        )
         sig = self._sign_and_send(txb64)
-        log(f"LIVE SELL {symbol} {frac:.0%} tx={sig[:12]}... cho confirm")
-        if not self._confirm(sig):
-            # Khong xoa so sach voij vang: de poll sau tu kiem tra lai.
-            # Tinh theo so du hien tai nen khong bi ban trung.
-            nb, _ = self.rpc.get_token_balance_base(self.pubkey, mint)
+        log(f"LIVE SELL {symbol} {frac:.0%} tx={sig[:12]}... cho confirm "
+            f"(slippage={sell_slippage}bps, impact<={sell_impact:g}%)")
+        confirmed = self._confirm(sig)
+        if not confirmed:
+            # Do not retry blindly: inspect the actual token balance first.
+            try:
+                nb, _ = self.rpc.get_token_balance_base(self.pubkey, mint)
+            except Exception as e:
+                raise SwapUncertain(
+                    f"SELL {symbol} timeout, khong doc duoc balance: {e}")
             if nb < bal_base * 0.9:
                 est = int(q.get("otherAmountThreshold", 0)) / 1e9 * sol_usd
                 log(f"LIVE SELL {symbol} timeout nhung token da di "
                     f"-> tinh theo threshold ~${est:.2f} (CANH BAO)")
                 return {"sold_base": bal_base - nb, "proceeds_usd": round(est, 4),
                         "tx": sig, "dry": False, "unconfirmed": True}
-            raise SwapError(f"sell unconfirmed: {sig[:12]} (se thu lai)")
-        sol_after = self.rpc.get_balance_lamports(self.pubkey)
+            raise SwapUncertain(f"sell unconfirmed: {sig[:12]} (se reconcile)")
+        try:
+            sol_after = self.rpc.get_balance_lamports(self.pubkey)
+            nb, _ = self.rpc.get_token_balance_base(self.pubkey, mint)
+        except Exception as e:
+            raise SwapUncertain(
+                f"SELL {symbol} da confirm nhung khong doc duoc balance: {e}")
+        sold_base = max(bal_base - nb, 0)
+        if sold_base <= 0:
+            raise SwapUncertain(
+                f"SELL {symbol} da confirm nhung token balance khong giam")
         proceeds_usd = max(sol_after - sol_before, 0) / 1e9 * sol_usd
         log(f"LIVE SELL {symbol} OK +${proceeds_usd:.2f} tx={sig[:12]}...")
-        return {"sold_base": amount, "proceeds_usd": round(proceeds_usd, 4),
+        return {"sold_base": sold_base, "proceeds_usd": round(proceeds_usd, 4),
                 "tx": sig, "dry": False}
 
 
@@ -544,48 +738,80 @@ class Swapper:
 def load_json(path, default):
     if os.path.exists(path):
         try:
-            return json.load(open(path))
-        except Exception:
-            pass
+            with open(path, encoding="utf-8") as handle:
+                return json.load(handle)
+        except Exception as e:
+            log(f"WARNING file state khong doc duoc {path}: {e} -> dung default")
     return default
 
 
 def save_json(path, obj):
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(obj, f)
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, path)
+
+
+def _configured_path(cfg, key, default):
+    """Resolve relative signal paths against this module, not process cwd."""
+    value = cfg.get(key) or default
+    return value if os.path.isabs(value) else os.path.join(BASE, value)
 
 
 def sig_path(cfg):
     """Duong dan signals.jsonl (configurable de chay cross-machine)."""
-    return cfg.get("signals_jsonl") or SIG_P
+    return _configured_path(cfg, "signals_jsonl", SIG_P)
 
 
 def alert_path(cfg):
-    return cfg.get("alerts_jsonl") or ALERT_P
+    return _configured_path(cfg, "alerts_jsonl", ALERT_P)
+
+
+def sell_path(cfg):
+    return _configured_path(cfg, "sells_jsonl", SELL_P)
 
 
 def tail_new(path, offset):
-    """Doc cac dong moi append tu offset. Tra ve (rows, new_offset)."""
+    """Read complete appended JSONL records without losing a partial tail.
+
+    Offsets are byte offsets. A producer may be in the middle of writing the
+    last line; that line stays unread until a later call completes it.
+    """
     rows = []
     try:
         size = os.path.getsize(path)
     except FileNotFoundError:
         return rows, offset
-    if offset > size:
+    if offset < 0 or offset > size:
         offset = 0
-    with open(path) as f:
-        f.seek(offset)
-        for line in f:
-            line = line.strip()
-            if line:
-                try:
-                    rows.append(json.loads(line))
-                except Exception:
-                    pass
-        offset = f.tell()
-    return rows, offset
+    with open(path, "rb") as handle:
+        handle.seek(offset)
+        cursor = offset
+        while True:
+            line_start = handle.tell()
+            raw = handle.readline()
+            if not raw:
+                break
+            if not raw.endswith(b"\n"):
+                # Do not advance past an incomplete append.
+                cursor = line_start
+                break
+            cursor = handle.tell()
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                rows.append(json.loads(raw.decode("utf-8")))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                # A complete malformed line cannot be retried forever; callers
+                # keep reading later records instead of blocking the stream.
+                continue
+    return rows, cursor
 
 
 class LiveTrader:
@@ -611,19 +837,104 @@ class LiveTrader:
                                          self.dry)
         self.positions = load_json(POS_P, [])
         st = load_json(STATE_P, {})
-        self.state = {"sig_offset": 0, "alert_offset": 0, "processed": [],
-                      "daily": {}, **st}
-        # lan chay dau: bat dau tu CUOI file, khong danh tin cu
-        if not st:
-            try:
-                self.state["sig_offset"] = os.path.getsize(sig_path(self.cfg))
-            except FileNotFoundError:
-                pass
-            try:
-                self.state["alert_offset"] = os.path.getsize(alert_path(self.cfg))
-            except FileNotFoundError:
-                pass
+        self.paths = {
+            "signals": os.path.abspath(sig_path(self.cfg)),
+            "alerts": os.path.abspath(alert_path(self.cfg)),
+            "sells": os.path.abspath(sell_path(self.cfg)),
+        }
+        self.state = {
+            "sig_offset": 0, "alert_offset": 0, "sell_offset": 0,
+            "processed": [], "processed_sells": [],
+            "signal_failures": {}, "pending_buys": {},
+            "source_files": {}, "daily": {}, **st,
+        }
+        self.entry_blocked = False
+        self.onchain_tokens = set()
+        self.unmanaged_tokens = set()
+        self._last_reconcile = 0
+        self._init_source_offsets(not bool(st))
         self._price_last = {}
+        self._log_source_health()
+
+    def _init_source_offsets(self, first_start):
+        """Bind persisted offsets to the configured files.
+
+        A path change or inode rotation must not silently reuse an offset from
+        another machine/file. On first start we intentionally skip historical
+        signals; on-chain recovery handles already-held tokens separately.
+        """
+        key_to_offset = {
+            "signals": "sig_offset",
+            "alerts": "alert_offset",
+            "sells": "sell_offset",
+        }
+        source_files = self.state.setdefault("source_files", {})
+        for key, path in self.paths.items():
+            meta = source_files.get(key) or {}
+            try:
+                st = os.stat(path)
+            except FileNotFoundError:
+                if first_start:
+                    self.state[key_to_offset[key]] = 0
+                source_files[key] = {"path": path, "inode": None,
+                                     "size": 0, "missing": True}
+                continue
+            path_changed = meta.get("path") not in (None, path)
+            inode_changed = (meta.get("inode") is not None
+                             and meta.get("inode") != st.st_ino)
+            if first_start or path_changed or inode_changed:
+                self.state[key_to_offset[key]] = st.st_size
+                if path_changed or inode_changed:
+                    log(f"source {key} thay file -> bo qua history, "
+                        f"bat dau tai EOF: {path}")
+            elif self.state[key_to_offset[key]] > st.st_size:
+                self.state[key_to_offset[key]] = 0
+            source_files[key] = {
+                "path": path, "inode": st.st_ino, "size": st.st_size,
+            }
+
+    def _log_source_health(self):
+        for key, path in self.paths.items():
+            if os.path.exists(path):
+                try:
+                    size = os.path.getsize(path)
+                except OSError:
+                    size = -1
+                log(f"source {key}: {path} ({size} bytes, "
+                    f"offset={self._offset_key(key)})")
+            else:
+                log(f"WARNING source {key} CHUA TON TAI: {path}")
+
+    @staticmethod
+    def _offset_key(key):
+        return {"signals": "sig_offset", "alerts": "alert_offset",
+                "sells": "sell_offset"}[key]
+
+    def _tail_source(self, key):
+        path = self.paths[key]
+        offset_key = self._offset_key(key)
+        try:
+            st = os.stat(path)
+        except FileNotFoundError:
+            return [], self.state[offset_key]
+        meta = self.state.setdefault("source_files", {}).get(key, {})
+        if meta.get("missing"):
+            # The source did not exist at startup; consume the file created
+            # afterwards. If deployment forwards a historical file, configure
+            # it before starting the trader so startup can bind at EOF.
+            self.state[offset_key] = 0
+            log(f"source {key} vua xuat hien -> doc tu dau: {path}")
+        elif (meta.get("path") != path or
+              (meta.get("inode") is not None and meta["inode"] != st.st_ino)):
+            self.state[offset_key] = 0
+        if self.state[offset_key] > st.st_size:
+            self.state[offset_key] = 0
+        rows, offset = tail_new(path, self.state[offset_key])
+        self.state[offset_key] = offset
+        self.state.setdefault("source_files", {})[key] = {
+            "path": path, "inode": st.st_ino, "size": st.st_size,
+        }
+        return rows, offset
 
     # -- helpers ------------------------------------------------------
 
@@ -638,6 +949,11 @@ class LiveTrader:
 
     def _daily(self):
         d = self.state.setdefault("daily", {})
+        if (not self.dry and d.get("day") == self._today()
+                and "risk_unavailable" not in d):
+            # Old state files predate fail-closed daily accounting.
+            d["risk_unavailable"] = True
+            log("daily state cu khong co portfolio baseline -> block entry")
         if d.get("day") != self._today():
             # ngay moi: chup portfolio (SOL trong vi) lam moc daily stop
             try:
@@ -646,15 +962,20 @@ class LiveTrader:
                     self.cfg["wallet_address"]) / 1e9 if not self.dry
                     else 1000.0)
                 d.update({"day": self._today(), "realized_usd": 0.0,
-                          "day_start_portfolio_usd": round(bal * sol_usd, 2)})
+                          "day_start_portfolio_usd": round(bal * sol_usd, 2),
+                          "risk_unavailable": False})
             except Exception as e:
                 d.update({"day": self._today(), "realized_usd": 0.0,
-                          "day_start_portfolio_usd": 1000.0})
-                log(f"daily reset: khong do duoc portfolio ({e}) -> moc 1000")
+                          "day_start_portfolio_usd": 1000.0,
+                          "risk_unavailable": not self.dry})
+                log(f"daily reset: khong do duoc portfolio ({e}) -> "
+                    f"{'block entry' if not self.dry else 'moc 1000'}")
         return d
 
     def _daily_halted(self):
         d = self._daily()
+        if not self.dry and d.get("risk_unavailable"):
+            return True
         base = d.get("day_start_portfolio_usd") or 1.0
         return d.get("realized_usd", 0.0) < -self.cfg["daily_stop_pct"] * base
 
@@ -664,31 +985,256 @@ class LiveTrader:
         except Exception:
             return self.jup.ds_price_usd(mint)
 
+    def _recent_signal_by_token(self, limit=5000):
+        """Load recent buy signals for startup recovery, independent of offset."""
+        rows = []
+        path = self.paths["signals"]
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    try:
+                        row = json.loads(line)
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        continue
+                    if isinstance(row, dict) and row.get("token"):
+                        rows.append(row)
+                        if len(rows) > limit:
+                            del rows[:len(rows) - limit]
+        except FileNotFoundError:
+            pass
+        latest = {}
+        for row in rows:
+            latest[row["token"]] = row
+        return latest
+
+    def reconcile_onchain(self, now=None, force=False):
+        """Reconcile wallet token balances before allowing new entries.
+
+        This closes the blind spot between a confirmed swap and the local JSON
+        save, and recovers a position after restart when its buy signal still
+        exists. Unknown non-zero tokens are never sold automatically; they
+        block new entries and are logged for manual review.
+        """
+        if self.dry:
+            self.entry_blocked = False
+            return True
+        now = time.time() if now is None else now
+        if (not force and now - self._last_reconcile
+                < float(self.cfg.get("reconcile_interval_seconds", 60))):
+            return not self.entry_blocked
+        self._last_reconcile = now
+        try:
+            balances = self.swapper.rpc.get_token_balances(self.swapper.pubkey)
+        except Exception as e:
+            self.entry_blocked = True
+            log(f"CRITICAL reconcile token balances loi: {e} -> block entry")
+            return False
+        known = self._recent_signal_by_token()
+        self.onchain_tokens = {
+            mint for mint, bal in balances.items()
+            if int(bal.get("amount", 0) or 0) > 0
+            and mint not in STABLE_MINTS
+            and mint != SOL_MINT
+        }
+        log(f"RECONCILE wallet: {len(self.onchain_tokens)} non-stable token "
+            f"balances, tracked={len(self.positions)}, "
+            f"occupancy={len(self.onchain_tokens | {p.get('token') for p in self.positions})}")
+        changed = False
+        unmanaged = []
+        pending = self.state.setdefault("pending_buys", {})
+        for pos in list(self.positions):
+            bal = balances.get(pos.get("token"), {})
+            actual = int(bal.get("amount", 0) or 0)
+            if actual <= 0:
+                log(f"RECONCILE: {pos.get('symbol')} khong con token "
+                    "tren vi -> bo local position, khong ban lai")
+                self.positions.remove(pos)
+                changed = True
+                continue
+            pos["onchain_tokens_base"] = actual
+            pending.pop(str(pos.get("signal_tid") or ""), None)
+            initial = int(pos.get("tokens_base", 0) or 0)
+            if initial <= 0:
+                pos["tokens_base"] = actual
+                pos["decimals"] = int(bal.get("decimals", pos.get("decimals", 0)))
+                initial = actual
+                changed = True
+            if initial > 0:
+                expected = initial * float(pos.get("remaining", 1.0))
+                if actual < expected * 0.98:
+                    pos["remaining"] = min(1.0, actual / initial)
+                    log(f"RECONCILE: {pos.get('symbol')} balance giam -> "
+                        f"remaining={pos['remaining']:.4f}")
+                    changed = True
+        local_tokens = {p.get("token") for p in self.positions}
+        for mint, bal in balances.items():
+            amount = int(bal.get("amount", 0) or 0)
+            if amount <= 0 or mint in (SOL_MINT, USDC_MINT) or mint in local_tokens:
+                continue
+            signal = known.get(mint)
+            if not signal or not self.cfg.get("recover_unmanaged_tokens", True):
+                unmanaged.append(mint)
+                continue
+            entry = signal.get("price_now") or signal.get("price_usd")
+            if not entry or float(entry) <= 0:
+                unmanaged.append(mint)
+                continue
+            pos = {
+                "token": mint, "symbol": signal.get("symbol", "?"),
+                "wallet": signal.get("wallet", ""),
+                "signal_tid": signal.get("tid"),
+                "opened_at": int(signal.get("ts") or signal.get("detected_at") or now),
+                "entry": float(entry),
+                "size_usd": float(self.cfg["trade_size_usd"]),
+                "tokens_base": amount, "onchain_tokens_base": amount,
+                "decimals": int(bal.get("decimals", 0)), "peak": float(entry),
+                "remaining": 1.0, "realized_usd": 0.0,
+                "tp1": False, "tp2": False, "ts_keep": False,
+                "ts_done": False, "smart_exit": False, "legs": [],
+                "entry_tx": signal.get("tx"), "recovered": True,
+                "price_poll_at": 0,
+            }
+            self.positions.append(pos)
+            local_tokens.add(mint)
+            tid = str(signal.get("tid") or "")
+            if tid:
+                self.state.setdefault("processed", []).append(tid)
+                self.state.setdefault("pending_buys", {}).pop(tid, None)
+            changed = True
+            log(f"RECOVER position {pos['symbol']} balance={amount} "
+                f"entry~{entry} (khong mua lai)")
+        self.unmanaged_tokens = set(unmanaged)
+        self.state["unmanaged_tokens"] = unmanaged[-100:]
+        pending_uncertain = bool(pending)
+        self.entry_blocked = bool(unmanaged or pending_uncertain)
+        if pending_uncertain:
+            log("CRITICAL pending BUY intent chua reconcile xong -> block entry")
+        if unmanaged:
+            log(f"CRITICAL unmanaged token(s) tren vi: "
+                f"{', '.join(x[:10] + '...' for x in unmanaged)} -> block entry")
+        if changed:
+            self.save()
+        return not self.entry_blocked
+
+    def _mark_processed(self, tid, status="opened"):
+        processed = self.state.setdefault("processed", [])
+        if tid not in processed:
+            processed.append(tid)
+        failures = self.state.setdefault("signal_failures", {})
+        failures.pop(tid, None)
+        self.state["processed"] = processed[-3000:]
+        self.save()
+        log(f"signal {tid[:12]}... -> {status}")
+
+    def _record_signal_failure(self, signal, now, error):
+        tid = signal["tid"]
+        failures = self.state.setdefault("signal_failures", {})
+        old = failures.get(tid, {})
+        attempts = int(old.get("attempts", 0)) + 1
+        base = float(self.cfg.get("signal_retry_seconds", 30))
+        ceiling = float(self.cfg.get("max_signal_retry_seconds", 900))
+        retry_after = now + min(ceiling, base * (2 ** min(attempts - 1, 5)))
+        failures[tid] = {
+            "signal": signal, "attempts": attempts,
+            "last_error": str(error)[:300], "retry_at": retry_after,
+        }
+        self.save()
+        log(f"signal {tid[:12]}... FAIL attempt={attempts}, "
+            f"retry_at={datetime.fromtimestamp(retry_after, tz=timezone.utc).isoformat()}: "
+            f"{error}")
+
+    def _retry_failed_signals(self, now):
+        """Retry transient buy failures even after the JSONL offset advanced."""
+        failures = self.state.setdefault("signal_failures", {})
+        due = []
+        for tid, rec in list(failures.items()):
+            if float(rec.get("retry_at", 0)) <= now and rec.get("signal"):
+                due.append(rec["signal"])
+        return due
+
     # -- signal intake -------------------------------------------------
 
+    def _occupied_token_count(self):
+        tracked = {
+            p.get("token") for p in self.positions
+            if p.get("remaining", 1.0) > 0
+        }
+        return len(tracked | set(self.onchain_tokens))
+
+    def _attempt_signal(self, s, now):
+        tid = str(s.get("tid") or "")
+        if not tid or tid in self.state.setdefault("processed", []):
+            return False
+        if not isinstance(s.get("token"), str) or not s.get("token"):
+            self._mark_processed(tid, "skipped_invalid_token")
+            return False
+        try:
+            amount_usd = float(s.get("amount_usd") or 0)
+        except (TypeError, ValueError):
+            self._mark_processed(tid, "skipped_invalid_amount")
+            return False
+        if not math.isfinite(amount_usd):
+            self._mark_processed(tid, "skipped_invalid_amount")
+            return False
+        if amount_usd < self.cfg["min_signal_usd"]:
+            self._mark_processed(tid, "skipped_below_minimum")
+            return False
+        occupied = self._occupied_token_count()
+        if occupied >= self.cfg["max_positions"]:
+            self._mark_processed(tid, "skipped_capacity")
+            log(f"skip {s.get('symbol')}: wallet/positions da co "
+                f"{occupied}/{self.cfg['max_positions']} token")
+            return False
+        if self._daily_halted():
+            self._mark_processed(tid, "skipped_daily_stop")
+            log("DAILY STOP: dung mo vi the moi hom nay")
+            return False
+        if self.entry_blocked:
+            self._record_signal_failure(
+                s, now, "entry blocked: on-chain reconciliation pending")
+            return False
+        pending = self.state.setdefault("pending_buys", {})
+        pending[tid] = {"signal": s, "started_at": int(now),
+                        "status": "buy_intent"}
+        self.save()  # durable intent before a network side effect
+        try:
+            self._open_from_signal(s, now)
+        except SwapUncertain as e:
+            pending[tid]["status"] = "buy_uncertain"
+            pending[tid]["error"] = str(e)[:300]
+            self.entry_blocked = True
+            self.save()
+            log(f"BUY {tid[:12]}... khong chac ket qua -> block entry: {e}")
+            return False
+        except SwapError as e:
+            pending.pop(tid, None)
+            self._record_signal_failure(s, now, e)
+            return False
+        except Exception as e:
+            pending[tid]["status"] = "buy_uncertain"
+            pending[tid]["error"] = str(e)[:300]
+            self.entry_blocked = True
+            self.save()
+            log(f"BUY {tid[:12]}... khong chac ket qua -> block entry: {e}")
+            return False
+        pending.pop(tid, None)
+        self._mark_processed(tid, "opened")
+        return True
+
     def ingest_signals(self, now):
-        sigs, off = tail_new(sig_path(self.cfg), self.state["sig_offset"])
-        self.state["sig_offset"] = off
+        sigs, _ = self._tail_source("signals")
         opened = 0
-        for s in sigs:
-            tid = s.get("tid")
-            if not tid or tid in self.state["processed"]:
-                continue
-            self.state["processed"].append(tid)
-            if (s.get("amount_usd") or 0) < self.cfg["min_signal_usd"]:
-                continue
-            if len(self.positions) >= self.cfg["max_positions"]:
-                log(f"skip {s.get('symbol')}: du {self.cfg['max_positions']} "
-                    f"vi the toi da")
-                continue
-            if self._daily_halted():
-                log("DAILY STOP: dung mo vi the moi hom nay")
-                continue
+        # Retry previously failed signals first
+        for s in self._retry_failed_signals(now):
             try:
-                self._open_from_signal(s, now)
-                opened += 1
-            except (NoRoute, SwapError) as e:
-                log(f"skip mo {s.get('symbol')}: {e}")
+                if self._attempt_signal(s, now):
+                    opened += 1
+            except Exception:
+                log("ERROR retry signal:\n" + traceback.format_exc())
+        for s in sigs:
+            try:
+                if self._attempt_signal(s, now):
+                    opened += 1
             except Exception:
                 log("ERROR mo vi the:\n" + traceback.format_exc())
         return opened
@@ -728,8 +1274,7 @@ class LiveTrader:
     # -- sell-cluster intake --------------------------------------------
 
     def ingest_alerts(self):
-        alerts, off = tail_new(alert_path(self.cfg), self.state["alert_offset"])
-        self.state["alert_offset"] = off
+        alerts, _ = self._tail_source("alerts")
         for a in alerts:
             if a.get("type") != "sell_cluster":
                 continue
@@ -840,6 +1385,10 @@ class LiveTrader:
                 "module KHONG tu dong dong.")
             self.save()
             return "stop"
+        try:
+            self.reconcile_onchain(now)
+        except Exception:
+            log("ERROR reconcile:\n" + traceback.format_exc())
         try:
             self.ingest_signals(now)
         except Exception:
