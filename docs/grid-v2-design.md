@@ -116,10 +116,10 @@ Chạy mỗi `scanner.rescan_minutes` (vd 15 phút) trên universe rộng hơn (
 | ADX(14) 1h | Không có trend | < 20 |
 | ADX(14) 15m | Không có trend ngắn hạn | < 22 |
 | Độ rộng Bollinger (20, 2) 1h | Biên đủ rộng để ăn TP, không quá rộng | 2×TP + phí ≤ BBW ≤ `bbw_max` |
-| Percentile BBW 30 ngày | Đang co hẹp so với chính nó | ≤ 50% |
+| Percentile BBW ~20 ngày | Không đang nở mạnh (breakout) | ≤ 80% (đã nới từ 50% khi code G2) |
 | Range 24–48h (high/low) | Biên ổn định | `range_min` … `range_max` |
 | Số lần cắt đường giữa trong lookback | Thật sự dao động qua lại | ≥ `min_mid_crosses` (vd 4) |
-| Choppiness Index 1h / Efficiency Ratio | Đi ngang / không hiệu quả theo hướng | CHOP > 55 / ER < 0,3 |
+| Choppiness Index (cửa sổ 48h) / Efficiency Ratio | Đi ngang / không hiệu quả theo hướng | CHOP ≥ 45 và ER ≤ 0,35 (CHOP tính trên 48h, không dùng 14 nến) |
 | Vị trí giá trong biên | Tránh vào khi đang ở sát mép | 15–85% |
 
 - **Điểm tổng hợp** → chọn top `grid.max_symbols`. Dashboard hiển thị bảng xếp
@@ -198,8 +198,8 @@ lệnh và mẫu báo cáo.
 | Giai đoạn | Nội dung | Ảnh hưởng lệnh thật |
 |---|---|---|
 | G0 | Sửa basket + trần tổng 10% | ✅ đã xong (`8b95587`) |
-| G1 | Config runtime DB + cache + trang dashboard (có mật khẩu) | Chỉ đổi nơi đọc tham số |
-| G2 | Scanner đi ngang, **chế độ quan sát** + bảng xếp hạng trên dashboard | Không |
+| G1 | Config runtime DB + cache + trang dashboard (đăng nhập, user lưu DB) | ✅ xong (`869aba8` + dashboard) — xem `docs/upgrade.md` mục 9 |
+| G2 | Scanner đi ngang, **chế độ quan sát** + bảng xếp hạng trên dashboard | ✅ xong — ngưỡng CHOP/percentile đã chỉnh, xem `docs/upgrade.md` mục 9.3 |
 | G3 | Backtest: kiểm chứng scanner + grid v2 | Không |
 | G4 | Range grid 2 chiều theo scanner, `max_symbols`, SL biên, giảm vị thế khi trend | Có (dry-run → testnet) |
 | G5 | Lệnh vào LIMIT post-only + quản lý slot + xử lý khớp một phần | Có (testnet bắt buộc) |

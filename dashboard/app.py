@@ -1,10 +1,12 @@
-"""Dashboard Crypto Bots — 2 tab: LIVE (tien that) va PAPER (chay thu). Tieng Viet.
+"""Dashboard Crypto Bots — LIVE (tien that), PAPER (chay thu), cau hinh bot,
+scanner, quan tri tai khoan. Bat buoc dang nhap (bang dashboard_users).
 
 Chay:  DATABASE_URL=postgres://... streamlit run app.py
 Tu refresh 60s. Vi the dang mo doc truc tiep tu state file cua bot.
 """
 import json
 import os
+import sys
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -13,6 +15,10 @@ import psycopg
 import psycopg.rows
 import requests
 import streamlit as st
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))), "db"))
+import bot_config as bc  # noqa: E402  (config runtime + tai khoan)
 
 st.set_page_config(page_title="Crypto Bots Dashboard", layout="wide")
 
@@ -1219,6 +1225,467 @@ def tab_paper_radar(where, params):
     radar_trades_frag(where, params)
 
 
+# ---------------- cau hinh bot + tai khoan (G1/G2) ----------------
+# Tham so chien luoc/rui ro luu DB (bot_config_versions); bot kiem version
+# moi ~10s va ap dung khong restart. Dashboard bat buoc dang nhap; tai khoan
+# luu bang dashboard_users (lan dau chua co user -> tao admin dau tien).
+APPLY_LABEL = {"now": "áp dụng ngay", "new_lots": "áp dụng cho lot mới",
+               "rebuild": "từ lần dựng lưới kế tiếp"}
+FEE_TAKER = 0.0005     # Binance USDT-M VIP0 taker
+FEE_MAKER = 0.0002     # Binance USDT-M VIP0 maker
+SLIPPAGE = 0.0001      # moi phia, uoc tinh
+
+
+def widget_spec(p):
+    """Thong so number_input cho 1 Param (gia tri hien thi; % neu pct)."""
+    mult = 100.0 if p.pct else 1.0
+    lo = None if p.lo is None else p.lo * mult
+    hi = None if p.hi is None else p.hi * mult
+    if p.kind == "int":
+        return {"min_value": int(lo) if lo is not None else None,
+                "max_value": int(hi) if hi is not None else None,
+                "step": 1, "format": "%d"}
+    if p.pct:
+        return {"min_value": float(lo), "max_value": float(hi),
+                "step": 0.05, "format": "%.3f"}
+    span = (hi - lo) if (lo is not None and hi is not None) else 100.0
+    step = 0.01 if span <= 2 else 0.05 if span <= 10 else \
+        0.5 if span <= 100 else 5.0
+    fmt = "%.2f" if step < 0.1 else "%.1f" if step < 1 else "%.0f"
+    return {"min_value": float(lo) if lo is not None else None,
+            "max_value": float(hi) if hi is not None else None,
+            "step": step, "format": fmt}
+
+
+def to_widget(p, value):
+    """Gia tri luu (phan so) -> gia tri hien thi tren widget."""
+    if p.kind == "int":
+        return int(value)
+    if p.kind == "float":
+        return round(float(value) * (100.0 if p.pct else 1.0), 6)
+    return value
+
+
+def from_widget(p, value):
+    """Gia tri widget -> gia tri luu (bo nhieu so thuc)."""
+    if p.kind == "int":
+        return int(value)
+    if p.kind == "float":
+        return round(float(value) / (100.0 if p.pct else 1.0), 8)
+    return value
+
+
+def fmt_param(p, value):
+    if value is None:
+        return "—"
+    if p.kind == "bool":
+        return "bật" if value else "tắt"
+    if p.kind == "float" and p.pct:
+        return "%g%%" % round(float(value) * 100, 4)
+    if p.kind == "float":
+        return "%g" % round(float(value), 6)
+    return str(value)
+
+
+def estimate_trade(margin, leverage, tp_pct, sl_pct, entry_maker=False,
+                   fee_taker=FEE_TAKER, fee_maker=FEE_MAKER,
+                   slippage=SLIPPAGE):
+    """Lai/lo uoc tinh 1 lot (USDT) sau phi + truot gia.
+
+    Mac dinh vao + ra deu market (hanh vi hien tai); entry_maker=True khi
+    vao bang limit maker (grid v2)."""
+    notional = float(margin) * float(leverage)
+    fee_in = fee_maker if entry_maker else fee_taker
+    cost = fee_in + fee_taker + 2 * slippage
+    return {"notional": notional,
+            "net_tp": notional * (float(tp_pct) - cost),
+            "net_sl": -notional * (float(sl_pct) + cost),
+            "cost_pct": cost}
+
+
+def apply_status(latest, applied, now=None):
+    """(muc do, thong diep) trang thai bot ap dung config.
+
+    muc do: ok | pending | error | unknown."""
+    if latest is None:
+        return "unknown", "Chưa có version config nào (bot sẽ tự tạo khi khởi động)."
+    if not applied:
+        return "unknown", ("Bot chưa báo cáo áp dụng config (bot chưa chạy "
+                           "bản mới hoặc chưa kết nối DB).")
+    now = now or datetime.now(timezone.utc)
+    ver, status = applied.get("version"), applied.get("status")
+    at = applied.get("applied_at")
+    age = (now - at).total_seconds() if at else None
+    if status == "error" and (ver is None or ver >= latest):
+        return "error", ("Bot TỪ CHỐI version %s (vẫn chạy config cũ): %s"
+                         % (ver, applied.get("error") or ""))
+    if ver == latest:
+        return "ok", "Bot đang chạy version %s." % latest
+    if age is not None and age > 120:
+        return "error", ("Bot vẫn ở version %s, chưa nhận version %s sau %d "
+                         "giây — kiểm tra bot." % (ver, latest, age))
+    return "pending", ("Bot đang ở version %s; version %s sẽ được áp dụng "
+                       "trong ~10 giây." % (ver, latest))
+
+
+def usd(x):
+    return ("-$%.2f" if x < 0 else "$%.2f") % abs(x)
+
+
+def changed_keys(prev_cfg, cfg):
+    if not prev_cfg:
+        return []
+    return [k for k in sorted(set(prev_cfg) | set(cfg))
+            if prev_cfg.get(k) != cfg.get(k)]
+
+
+def _rerun_fragment():
+    try:
+        st.rerun(scope="fragment")
+    except Exception:
+        st.rerun()
+
+
+def db_call(fn, *args, **kwargs):
+    """Goi ham bot_config voi ket noi dung chung; mat ket noi -> thu lai 1
+    lan. Loi nghiep vu (ValueError/PermissionError) nem cho UI hien thi."""
+    for attempt in range(2):
+        con = get_conn()
+        if con is None:
+            raise RuntimeError("Chưa đặt DATABASE_URL")
+        try:
+            return fn(con, *args, **kwargs)
+        except (psycopg.OperationalError, psycopg.InterfaceError):
+            try:
+                con.close()
+            except Exception:
+                pass
+            get_conn.clear()
+            if attempt == 1:
+                raise
+
+
+@st.cache_resource
+def _ensure_config_schema():
+    db_call(bc.ensure_tables)
+    return True
+
+
+def current_user():
+    return st.session_state.get("auth_user")
+
+
+def is_admin():
+    u = current_user()
+    return bool(u and u.get("role") == "admin")
+
+
+def auth_gate():
+    """Chan toan bo dashboard toi khi dang nhap. Tra ve user dict."""
+    try:
+        _ensure_config_schema()
+    except Exception as e:
+        st.error("Không tạo được bảng tài khoản/config trong DB: %s" % e)
+        st.stop()
+    user = current_user()
+    if user:
+        fresh = db_call(bc.get_user, user["username"])
+        if fresh and fresh["is_active"]:
+            user = {"username": fresh["username"], "role": fresh["role"]}
+            st.session_state["auth_user"] = user
+            return user
+        st.session_state.pop("auth_user", None)
+        st.warning("Phiên đăng nhập đã hết hiệu lực (tài khoản bị khoá/xoá).")
+    if db_call(bc.user_count) == 0:
+        st.subheader("🔐 Khởi tạo tài khoản quản trị")
+        st.info("Chưa có tài khoản nào. Tạo tài khoản **admin đầu tiên** — "
+                "chỉ làm được 1 lần; tài khoản sau thêm trong tab Quản trị.")
+        with st.form("first_admin"):
+            u = st.text_input("Tên đăng nhập")
+            p1 = st.text_input("Mật khẩu (≥ 8 ký tự)", type="password")
+            p2 = st.text_input("Nhập lại mật khẩu", type="password")
+            ok = st.form_submit_button("Tạo admin")
+        if ok:
+            errs = bc.check_new_credentials(u.strip(), p1, p2)
+            if errs:
+                for e in errs:
+                    st.error(e)
+            elif db_call(bc.create_first_admin, u.strip(), p1):
+                st.session_state["auth_user"] = {"username": u.strip(),
+                                                 "role": "admin"}
+                st.rerun()
+            else:
+                st.error("Đã có tài khoản khác được tạo trước — hãy đăng nhập.")
+        st.stop()
+    st.subheader("🔐 Đăng nhập")
+    with st.form("login"):
+        u = st.text_input("Tên đăng nhập")
+        p = st.text_input("Mật khẩu", type="password")
+        ok = st.form_submit_button("Đăng nhập")
+    if ok:
+        user, msg = db_call(bc.authenticate, u.strip(), p)
+        if user:
+            st.session_state["auth_user"] = {"username": user["username"],
+                                             "role": user["role"]}
+            st.rerun()
+        st.error(msg)
+    st.stop()
+
+
+def sidebar_account(user):
+    with st.sidebar:
+        st.markdown("👤 **%s** · %s" % (user["username"], user["role"]))
+        if st.button("Đăng xuất", key="logout"):
+            st.session_state.pop("auth_user", None)
+            st.rerun()
+        with st.expander("Đổi mật khẩu"):
+            with st.form("self_pw"):
+                p1 = st.text_input("Mật khẩu mới", type="password")
+                p2 = st.text_input("Nhập lại", type="password")
+                ok = st.form_submit_button("Đổi")
+            if ok:
+                if p1 != p2:
+                    st.error("Không khớp")
+                else:
+                    try:
+                        db_call(bc.reset_password, user["username"],
+                                user["username"], p1)
+                        st.success("Đã đổi mật khẩu")
+                    except (ValueError, PermissionError) as e:
+                        st.error(str(e))
+
+
+def _ts_local(ts):
+    if ts is None:
+        return "—"
+    return ts.astimezone(TZINFO).strftime("%d/%m %H:%M:%S")
+
+
+def _param_widget(p, value, key, disabled):
+    label = p.label
+    help_ = " · ".join(x for x in (p.help, APPLY_LABEL.get(p.apply, ""))
+                       if x)
+    if p.kind == "bool":
+        return st.checkbox(label, value=bool(value), key=key,
+                           disabled=disabled, help=help_)
+    if p.kind == "enum":
+        idx = p.choices.index(value) if value in p.choices else 0
+        return st.selectbox(label, p.choices, index=idx, key=key,
+                            disabled=disabled, help=help_)
+    spec = widget_spec(p)
+    v = to_widget(p, value)
+    if spec["min_value"] is not None:
+        v = max(spec["min_value"], v)
+    if spec["max_value"] is not None:
+        v = min(spec["max_value"], v)
+    return st.number_input(label, value=v, key=key, disabled=disabled,
+                           help=help_, **spec)
+
+
+def _tab_config():
+    admin = is_admin()
+    bot = bc.BOT_BINANCE
+    row = db_call(bc.load_version, bot)
+    applied = db_call(bc.applied, bot)
+    latest = row["version"] if row else None
+    base = bc.extract({}) if row is None else dict(bc.defaults(),
+                                                   **row["config"])
+    level, msg = apply_status(latest, applied)
+    {"ok": st.success, "pending": st.info, "error": st.error,
+     "unknown": st.warning}[level](msg)
+    if row:
+        st.caption("Version %s · %s · %s%s" % (
+            latest, row["author"], _ts_local(row["created_at"]),
+            (" · " + row["note"]) if row.get("note") else ""))
+    if not admin:
+        st.caption("Chỉ admin được sửa cấu hình.")
+
+    new = {}
+    vkey = latest or 0
+    for group in bc.GROUPS:
+        params = [p for p in bc.PARAMS if p.group == group]
+        with st.expander(group, expanded=group in ("Lệnh", "Grid", "Rủi ro")):
+            cols = st.columns(3)
+            for i, p in enumerate(params):
+                with cols[i % 3]:
+                    w = _param_widget(p, base.get(p.key, p.default),
+                                      "cfg:%s:%s" % (p.key, vkey),
+                                      disabled=not admin)
+                    new[p.key] = from_widget(p, w)
+
+    est = estimate_trade(new["order_margin_usdt"], new["leverage"],
+                         new["grid.tp_pct"] or new["grid.step_min"],
+                         new["grid.sl_pct"])
+    est_mk = estimate_trade(new["order_margin_usdt"], new["leverage"],
+                            new["grid.tp_pct"] or new["grid.step_min"],
+                            new["grid.sl_pct"], entry_maker=True)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Notional mỗi lot", "$%s" % format(round(est["notional"]), ","))
+    c2.metric("Net khi chạm TP (vào market)", usd(est["net_tp"]))
+    c3.metric("Net khi chạm TP (vào limit maker)", usd(est_mk["net_tp"]))
+    c4.metric("Lỗ khi chạm SL sàn", usd(est["net_sl"]))
+    st.caption("Ước tính phí taker %.2f%% / maker %.2f%% + trượt giá %.2f%% "
+               "mỗi phía. Grid hiện vào lệnh market; vào limit maker là "
+               "giai đoạn G5." % (FEE_TAKER * 100, FEE_MAKER * 100,
+                                 SLIPPAGE * 100))
+
+    clean, errors = bc.validate(new)
+    for e in errors:
+        st.error(e)
+    changes = bc.diff(base, clean) if not errors else []
+    if changes:
+        st.markdown("**Thay đổi so với version đang lưu:**")
+        st.dataframe(pd.DataFrame([
+            {"Tham số": bc.PARAM_BY_KEY[k].label, "Khoá": k,
+             "Hiện tại": fmt_param(bc.PARAM_BY_KEY[k], a),
+             "Mới": fmt_param(bc.PARAM_BY_KEY[k], b),
+             "Áp dụng": APPLY_LABEL.get(bc.PARAM_BY_KEY[k].apply, "")}
+            for k, a, b in changes]), hide_index=True,
+            use_container_width=True)
+    if admin:
+        note = st.text_input("Ghi chú (lý do thay đổi)", key="cfg_note:%s"
+                             % vkey)
+        if st.button("💾 Lưu & áp dụng", type="primary",
+                     disabled=bool(errors) or not changes):
+            try:
+                v = db_call(bc.save_version, clean, current_user()["username"],
+                            note, bot)
+                st.session_state["cfg_saved"] = v
+                _rerun_fragment()
+            except (ValueError, PermissionError) as e:
+                st.error(str(e))
+    if (latest and st.session_state.get("cfg_saved") == latest
+            and level == "pending"):
+        st.success("Đã lưu version %s — bot áp dụng trong ~10 giây." % latest)
+
+    st.markdown("**Lịch sử (20 version gần nhất)**")
+    hist = db_call(bc.history, bot, 20)
+    rows = []
+    for i, h in enumerate(hist):
+        prev = hist[i + 1]["config"] if i + 1 < len(hist) else None
+        ks = changed_keys(prev, h["config"])
+        rows.append({"Version": h["version"], "Lúc": _ts_local(h["created_at"]),
+                     "Người sửa": h["author"], "Ghi chú": h["note"] or "",
+                     "Đổi": ", ".join(ks[:6]) + (" …" if len(ks) > 6 else "")})
+    if rows:
+        st.dataframe(pd.DataFrame(rows), hide_index=True,
+                     use_container_width=True)
+    if admin and len(hist) > 1:
+        c1, c2 = st.columns([1, 3])
+        pick = c1.selectbox("Khôi phục version", [h["version"]
+                                                  for h in hist[1:]],
+                            key="cfg_restore")
+        if c2.button("↩️ Khôi phục (tạo version mới)"):
+            old = next(h for h in hist if h["version"] == pick)["config"]
+            old = {k: v for k, v in old.items() if k in bc.PARAM_BY_KEY}
+            try:
+                v = db_call(bc.save_version, old, current_user()["username"],
+                            "khôi phục version %s" % pick, bot)
+                st.session_state["cfg_saved"] = v
+                _rerun_fragment()
+            except (ValueError, PermissionError) as e:
+                st.error("Không khôi phục được: %s" % e)
+
+
+def _tab_scanner():
+    row = db_call(bc.load_version, bc.BOT_BINANCE)
+    cfg = dict(bc.defaults(), **(row["config"] if row else {}))
+    mode = cfg["scanner.mode"]
+    st.caption("Chế độ: **%s** · top K = %s · quét lại mỗi %s phút. %s" % (
+        mode, cfg["scanner.top_k"], cfg["scanner.rescan_minutes"],
+        "Grid CHỈ mở lot mới trên top K đạt chuẩn." if mode == "filter"
+        else "Chỉ quan sát, chưa ảnh hưởng giao dịch."))
+    if not cfg["scanner.enabled"]:
+        st.warning("Scanner đang tắt.")
+    scans = db_call(bc.latest_scans, bc.BOT_BINANCE, 6)
+    if not scans:
+        st.info("Chưa có kết quả quét (bot cần chạy bản mới và kết nối DB).")
+        return
+    rows = []
+    for r in scans:
+        m = r["metrics"] or {}
+        pct = lambda x: None if x is None else round(x * 100, 2)  # noqa
+        rows.append({"Symbol": r["symbol"], "Đạt": "✅" if r["passed"] else "—",
+                     "Điểm": r["score"], "ADX 1h": m.get("adx_1h"),
+                     "ADX 15m": m.get("adx_15m"), "BB %": pct(m.get("bbw_pct")),
+                     "BB pctile": m.get("bbw_pctile"),
+                     "Biên %": pct(m.get("range_pct")),
+                     "Cắt giữa": m.get("mid_crosses"),
+                     "Vị trí": m.get("pos"), "CHOP": m.get("chop"),
+                     "ER": m.get("er"),
+                     "Lý do": "; ".join(r["reasons"] or []),
+                     "Lúc quét": _ts_local(r["ts"])})
+    n_ok = sum(1 for r in scans if r["passed"])
+    st.markdown("**%d/%d symbol đạt chuẩn đi ngang**" % (n_ok, len(scans)))
+    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+    st.caption("Vị trí = giá trong biên (0 = đáy, 1 = đỉnh), chỉ cộng điểm. "
+               "CHOP cao + ER thấp = dao động qua lại; ADX thấp = không trend.")
+
+
+def _tab_admin():
+    me = current_user()["username"]
+    users = db_call(bc.list_users)
+    st.dataframe(pd.DataFrame([
+        {"Tên": u["username"], "Vai trò": u["role"],
+         "Trạng thái": "hoạt động" if u["is_active"] else "đã khoá",
+         "Tạo bởi": u["created_by"], "Tạo lúc": _ts_local(u["created_at"]),
+         "Đăng nhập cuối": _ts_local(u["last_login_at"])}
+        for u in users]), hide_index=True, use_container_width=True)
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Thêm tài khoản**")
+        with st.form("add_user", clear_on_submit=True):
+            u = st.text_input("Tên đăng nhập")
+            p = st.text_input("Mật khẩu (≥ 8 ký tự)", type="password")
+            role = st.selectbox("Vai trò", bc.ROLES[::-1],
+                                help="viewer chỉ xem; admin sửa config + "
+                                     "quản lý tài khoản")
+            ok = st.form_submit_button("Thêm")
+        if ok:
+            try:
+                db_call(bc.create_user, me, u.strip(), p, role)
+                st.success("Đã thêm %s" % u.strip())
+                _rerun_fragment()
+            except (ValueError, PermissionError) as e:
+                st.error(str(e))
+    with c2:
+        st.markdown("**Sửa tài khoản**")
+        names = [u["username"] for u in users]
+        who = st.selectbox("Tài khoản", names, key="adm_who")
+        target = next((u for u in users if u["username"] == who), None)
+        if target:
+            a1, a2 = st.columns(2)
+            try:
+                if a1.button("Mở khoá" if not target["is_active"] else "Khoá",
+                             key="adm_active"):
+                    db_call(bc.set_active, me, who, not target["is_active"])
+                    _rerun_fragment()
+                other = "viewer" if target["role"] == "admin" else "admin"
+                if a2.button("Đổi thành %s" % other, key="adm_role"):
+                    db_call(bc.set_role, me, who, other)
+                    _rerun_fragment()
+            except (ValueError, PermissionError) as e:
+                st.error(str(e))
+            with st.form("adm_pw", clear_on_submit=True):
+                p = st.text_input("Mật khẩu mới cho %s" % who, type="password")
+                ok = st.form_submit_button("Đặt lại mật khẩu")
+            if ok:
+                try:
+                    db_call(bc.reset_password, me, who, p)
+                    st.success("Đã đặt lại mật khẩu %s" % who)
+                except (ValueError, PermissionError) as e:
+                    st.error(str(e))
+
+
+try:
+    _frag_ui = st.fragment
+except AttributeError:
+    _frag_ui = lambda f: f  # noqa: E731
+tab_config = _frag_ui(_tab_config)
+tab_scanner = _frag_ui(_tab_scanner)
+tab_admin = _frag_ui(_tab_admin)
+
+
 # ---------------- main ----------------
 def main():
     st.title("📊 Crypto Bots Dashboard")
@@ -1228,6 +1695,8 @@ def main():
                  "streamlit run app.py")
         st.stop()
 
+    user = auth_gate()
+    sidebar_account(user)
     st.caption(f"Du lieu cap nhat lan cuoi — {last_updates_line()}")
 
     filt = st.radio("Khoang thoi gian", ["7 ngay", "30 ngay", "Tat ca"],
@@ -1240,10 +1709,12 @@ def main():
         where = "WHERE closed_at >= now() - make_interval(days => %s)"
         params = (days,)
 
-    t1, t2, t3, t4, t5 = st.tabs([
-        "🔴 Live Binance", "☀️ Live Radar",
-        "📄 Paper OKX", "🦅 Paper Radar",
-        "🖥️ Monitor"])
+    names = ["🔴 Live Binance", "☀️ Live Radar", "📄 Paper OKX",
+             "🦅 Paper Radar", "🖥️ Monitor", "⚙️ Cấu hình", "🧭 Scanner"]
+    if user["role"] == "admin":
+        names.append("👤 Quản trị")
+    tabs = st.tabs(names)
+    t1, t2, t3, t4, t5 = tabs[:5]
     with t1:
         tab_live_binance(where, params)
     with t2:
@@ -1254,6 +1725,13 @@ def main():
         tab_paper_radar(where, params)
     with t5:
         tab_monitor()
+    with tabs[5]:
+        tab_config()
+    with tabs[6]:
+        tab_scanner()
+    if user["role"] == "admin":
+        with tabs[7]:
+            tab_admin()
 
     st.divider()
     st.markdown('<div class="small-note">Vi the & equity live tu refresh '

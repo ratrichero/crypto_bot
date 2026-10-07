@@ -490,7 +490,7 @@ def authenticate(conn, username: str, password: str,
     locked = user.get("locked_until")
     if locked is not None and locked > now:
         return None, "Tạm khoá do đăng nhập sai nhiều lần, thử lại sau %s" % (
-            locked.strftime("%H:%M UTC"))
+            locked.astimezone(timezone.utc).strftime("%H:%M UTC"))
     if not verify_password(password or "", user["password_hash"]):
         failed = int(user["failed_attempts"] or 0) + 1
         lock = now + timedelta(minutes=LOCK_MINUTES) if failed >= MAX_FAILED \

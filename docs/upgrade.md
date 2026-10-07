@@ -33,6 +33,10 @@ deploy thử nghiệm trực tiếp từ nhánh này.
    Kiểm tra log: `RESOLVE pending BUY CLAUDIA ...` hoặc `RECOVER position CLAUDIA ...`.
 7. Theo dõi 30–60 phút đầu: không có `CRITICAL` mới, dashboard ô HALT đúng
    trạng thái, PnL trade mới có `fee_entry`/`fee_exit`.
+8. **Từ `869aba8` (G1/G2):** xem mục 9. Có 3 việc:
+   - Mở dashboard **ngay sau deploy** để tạo admin.
+   - Kiểm tra log bot có dòng `CONFIG ap dung version 1 (nguon db)`.
+   - Grid lot mới có **TP 1%** (trước đây TP = 1 step 0.4–0.8%).
 
 ---
 
@@ -295,10 +299,11 @@ có thể tăng lên 10 nếu muốn giảm 30 weight/phút. Không nên giảm
 ```bash
 # Binance
 cd binance-bot
-for t in test_binance.py test_backtest.py test_protection.py; do python $t; done
+for t in test_binance.py test_backtest.py test_protection.py test_scanner.py; do python $t; done
 rm -f config.json universe.json        # file do test sinh ra, không commit
 # DB (Postgres thật qua pgserver)
 python db/test_binance_trades_pg.py
+python db/test_bot_config.py
 # Radar meme / dashboard
 cd meme-radar && python test_live_trader.py && python test_dexscreener.py; rm -f live_trader.log
 cd dashboard && python test_dashboard.py
@@ -308,12 +313,102 @@ cd dashboard && python test_dashboard.py
 |---|---|
 | `binance-bot/test_binance.py` | 97 pass |
 | `binance-bot/test_backtest.py` | 17 pass |
-| `binance-bot/test_protection.py` (harness sàn giả lập) | 136 pass |
+| `binance-bot/test_protection.py` (harness sàn giả lập) | 143 pass |
+| `binance-bot/test_scanner.py` (scanner + luật mở grid) | 48 pass |
 | `db/test_binance_trades_pg.py` | 7 pass |
+| `db/test_bot_config.py` (config/tài khoản, Postgres thật) | 54 pass |
 | `meme-radar/test_live_trader.py` | 145 pass |
 | `meme-radar/test_dexscreener.py` | 14 pass |
-| `dashboard/test_dashboard.py` | 15 pass |
+| `dashboard/test_dashboard.py` | 31 pass |
 
 Các dòng `Traceback ...` / `FAIL attempt=1` trong output test là log có chủ
 đích của kịch bản lỗi, không phải test hỏng. Chỉ coi là đạt khi dòng cuối là
 `N passed, 0 failed` / `N pass, 0 fail`.
+
+---
+
+## 9. G1 + G2 — config runtime, dashboard đăng nhập, scanner đi ngang
+
+Thiết kế ở `docs/grid-v2-design.md`. Commit: bot/DB `869aba8`, dashboard (commit kế tiếp).
+
+### 9.1 Config runtime (DB → cache → bot, không restart)
+
+- Bảng `bot_config_versions`: mỗi lần lưu trên dashboard tạo một version mới
+  (không ghi đè) kèm người sửa và ghi chú. Khôi phục = tạo version mới.
+- Bot kiểm tra version mới **mỗi 10 giây** và validate trước khi ghi vào dict
+  config dùng chung với engine.
+  - Config sai thì bot **giữ bản cũ** và ghi lỗi vào `bot_config_applied`.
+    Dashboard hiện cảnh báo đỏ.
+- Thứ tự nạp khi khởi động: DB → `runtime_config.cache.json` (bản tốt gần
+  nhất, khi DB lỗi) → `config.json`.
+- DB chưa có version thì bot tự seed version 1 từ `config.json`, khoá nào
+  thiếu thì lấy default. Giá trị đang chạy trên VPS (vd daily 20%) được giữ.
+- `config.json` vẫn được đọc lại mỗi 60s cho các khoá hạ tầng. Override từ DB
+  không bị mất khi đọc lại.
+- **Chỉ tham số chiến lược/rủi ro nằm trong DB.** Danh sách đầy đủ, biên và
+  ràng buộc chéo nằm ở `db/bot_config.py:PARAMS`.
+  - Các khoá sau vẫn ở file/env và **đổi phải restart** (cố ý): API key,
+    `DATABASE_URL`, `mode`, `use_testnet`, `hedge_mode`, `exchange_protection`.
+
+| Nhóm | Tham số chính | Mặc định | Hiệu lực |
+|---|---|---|---|
+| Lệnh | `order_margin_usdt` × `leverage` | 100 × 10 = **$1000** | lot mới; leverage đặt lại trên sàn ở lệnh kế tiếp của symbol |
+| Grid | `grid.tp_pct` | **1%** (0 = 1 step như cũ) | lot mới |
+| Grid | `grid.sl_pct` (trước hard-code) | 3% | lot mới |
+| Grid | `grid.max_symbols` | 0 = không giới hạn | ngay; chỉ chặn symbol chưa có lot |
+| Grid | tầng, độ giãn, `range_steps` | như cũ | lần dựng lưới kế tiếp |
+| Rủi ro | daily / basket / trần tổng grid | 10% / 2% / **10%** | ngay |
+| Scanner | `scanner.mode` | `observe` | ngay |
+
+Net mỗi lot ước tính ở mặc định ($1000, TP 1%): **≈ $8.8** khi vào market
+(hiện tại), ≈ $9.1 khi vào limit maker (G5). Muốn đạt $10–15 thì tăng TP
+(1.2% ≈ $10.8) hoặc tăng lot. Dashboard tính lại ngay khi đổi.
+
+### 9.2 Dashboard: đăng nhập + 3 tab mới
+
+- **Toàn bộ dashboard phải đăng nhập.** Tài khoản lưu ở bảng `dashboard_users`:
+  - Mật khẩu băm bằng scrypt.
+  - Sai 5 lần thì khoá 15 phút.
+  - Không khoá hoặc hạ quyền được admin cuối cùng.
+- **Lần đầu** (bảng rỗng): dashboard hiện form tạo admin đầu tiên. Form chỉ
+  dùng được một lần, có khoá bảng nên hai người mở cùng lúc không tạo được hai
+  admin. Sau đó tài khoản mới **chỉ** thêm được ở tab 👤 Quản trị.
+  - ⚠️ Ai mở dashboard trước thì tạo được admin, nên hãy tạo ngay sau deploy.
+- Vai trò:
+  - `admin`: sửa config, quản lý tài khoản.
+  - `viewer`: chỉ xem; các ô config bị khoá.
+  - Admin khoá một tài khoản thì phiên đang mở của người đó mất hiệu lực ở lần
+    tải lại kế tiếp.
+- Phiên đăng nhập gắn với tab trình duyệt: F5 thì phải đăng nhập lại.
+- **⚙️ Cấu hình:**
+  - Form theo nhóm, tham số % nhập theo %.
+  - Có notional, net TP/SL ước tính và bảng thay đổi trước khi lưu.
+  - Trạng thái bot: đang chạy version nào, đang chờ, hay đã từ chối.
+  - Lịch sử 20 version và nút khôi phục.
+- **🧭 Scanner:** bảng xếp hạng mới nhất, gồm điểm, từng chỉ báo và lý do loại.
+- Dashboard tự tạo bảng nếu chưa có. Có thể chạy `db/schema.sql` trước.
+
+### 9.3 Scanner đi ngang (G2, mặc định chỉ quan sát)
+
+- Bot quét 1 symbol mỗi lượt slow loop. Mỗi symbol quét lại sau 15 phút.
+  - Dùng klines 1h × 499 (weight 2) + nến 15m sẵn có, nên với 30 symbol chỉ
+    tốn ≈ 4 weight/phút.
+  - Chạy ở mọi mode, kể cả `data_only`.
+- Kết quả lưu ở `scanner_snapshots` (giữ 14 ngày) + `binance-bot/scanner_latest.json`.
+- Tiêu chí (chỉnh trên dashboard): ADX 1h ≤ 20, ADX 15m ≤ 22, độ rộng BB 1h
+  2.5–10%, percentile BB ≤ 80%, biên 48h 2.5–12%, cắt giữa biên ≥ 4 lần,
+  CHOP (48h) ≥ 45, ER ≤ 0.35.
+  - Vị trí giá trong biên chỉ cộng điểm, không dùng để loại.
+- **So với bản thiết kế đã đổi 2 ngưỡng** (đo trên dữ liệu tổng hợp 50 seed):
+  - CHOP tính trên cửa sổ 48h thay cho 14 nến: CHOP(14) quá nhiễu.
+  - Percentile BB nới từ 50% lên 80%: BB co hẹp hay đi trước breakout, nên
+    chỉ loại lúc BB đang nở mạnh.
+  - Kết quả: đi ngang 22/50 đạt, random walk 7/50, **trend 0/50**.
+- `scanner.mode = filter`: grid chỉ mở lot mới trên top K đạt chuẩn. Dữ liệu
+  quá 45 phút (3 chu kỳ) thì chặn (fail-closed). Lot đang mở vẫn được quản lý
+  bình thường.
+  - **Khuyến nghị:** để `observe` 1–2 tuần, đối chiếu bảng xếp hạng với chart
+    thật, sau đó mới bật `filter`.
+- Universe scanner = universe bot đang chạy (`universe.json`, top 30). Mở rộng
+  universe sang 50–80 là việc của G4.
+
