@@ -77,6 +77,32 @@ PARAMS: Tuple[Param, ...] = (
           "Rebuild khi giá lệch anchor quá N step", 2, 30, apply="rebuild"),
     Param("grid.max_entries_per_cycle", "int", 1, "Grid",
           "Số lot mở tối đa mỗi vòng", 1, 10),
+    # ---- Grid v2 (range grid 2 chieu theo scanner)
+    Param("grid.engine", "enum", "classic", "Grid v2", "Kiểu grid",
+          choices=("classic", "range"),
+          help="classic = grid quanh anchor (cũ, chỉ khi regime đi ngang); "
+               "range = grid 2 chiều trong biên scanner: long nửa dưới, "
+               "short nửa trên, chỉ symbol đạt chuẩn + top K (bất kể chế "
+               "độ observe/filter). Đổi kiểu khi grid đang flat là an toàn "
+               "nhất; lot cũ vẫn được quản lý tới khi đóng.",
+          apply="rebuild"),
+    Param("grid.max_lots_per_symbol", "int", 4, "Grid v2",
+          "Số lot tối đa mỗi symbol (range)", 1, 20,
+          help="Cùng với 'Số lot grid tối đa' và 'Số symbol grid cùng lúc'."),
+    Param("grid.boundary_sl_buffer", "float", 0.005, "Grid v2",
+          "SL ngoài biên (%)", 0.0, 0.05, pct=True,
+          help="SL long = đáy biên × (1 − x), short = đỉnh × (1 + x); không "
+               "bao giờ xa hơn 'SL trên sàn mỗi lot'.", apply="new_lots"),
+    Param("grid.break_buffer", "float", 0.003, "Grid v2",
+          "Biên vỡ khi giá vượt quá (%)", 0.0, 0.05, pct=True,
+          help="Biên vỡ -> không mở mới, huỷ lệnh chờ của symbol."),
+    Param("grid.trend_exit_adx", "float", 25.0, "Grid v2",
+          "ADX 1h coi là chuyển trend", 10, 60,
+          help="ADX 1h (scanner) vượt ngưỡng -> coi như biên vỡ."),
+    Param("grid.derisk_on_trend", "bool", False, "Grid v2",
+          "Cắt lot đang lỗ khi biên vỡ"),
+    Param("grid.derisk_loss_pct", "float", 0.01, "Grid v2",
+          "Ngưỡng lỗ để cắt khi biên vỡ (%)", 0.001, 0.10, pct=True),
     # ---- Rui ro
     Param("risk.daily_max_loss_pct", "float", 0.10, "Rủi ro",
           "Daily stop (% equity)", 0.01, 0.50, pct=True),
@@ -234,6 +260,12 @@ def validate(flat: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
         errors.append("Biên giá tối thiểu phải ≤ tối đa")
     if clean["grid.max_positions"] > clean["max_total_positions"]:
         errors.append("Số lot grid tối đa phải ≤ tổng số lot tối đa")
+    if clean["grid.engine"] == "range":
+        if not clean["scanner.enabled"]:
+            errors.append("Range grid cần bật scanner (biên lấy từ scanner)")
+        if clean["grid.trend_exit_adx"] < clean["scanner.adx_1h_max"]:
+            errors.append("ADX 1h chuyển trend phải ≥ ADX 1h tối đa của "
+                          "scanner (nếu không biên vỡ ngay khi dựng)")
     return clean, errors
 
 

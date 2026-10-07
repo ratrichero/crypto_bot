@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 
 import binance_client
 import binance_safety
+import range_grid
 import runtime_config
 import scanner as range_scanner
 import strategy
@@ -339,6 +340,13 @@ def run_risk_controls(engine, st, mark_prices, prices, reconcile_hold):
         raise
     except Exception:
         log("manage_grid_risk loi:\n" + traceback.format_exc())
+    try:
+        if range_grid_risk(engine, st, mark_prices):
+            changed = True
+    except binance_safety.BinanceSafetyStop:
+        raise
+    except Exception:
+        log("range_grid_risk loi:\n" + traceback.format_exc())
     symbols = list(dict.fromkeys(
         list(SYMBOLS) + [p.get("symbol") for p in st.get("positions", [])]))
     for symbol in symbols:
@@ -505,6 +513,10 @@ def manage_grid(engine, st, symbol, price):
     changed = False
     active = [p for p in st["positions"]
               if p.get("tag") == "grid" and p.get("symbol") == symbol]
+    if any(str(p.get("level") or "").startswith("r") for p in active):
+        # Lot cua range grid (doi grid.engine khi chua flat): khong chong
+        # grid classic len; lot cu chay toi TP/SL/basket.
+        return False
     # Preserve level ownership across an anchor cycle. Never forget live lots.
     for pos in active:
         if pos.get("level") is not None:
@@ -575,6 +587,164 @@ def manage_grid(engine, st, symbol, price):
                 entries += 1
                 changed = True
                 log(f"OPEN #{pos['id']} {symbol} grid SELL k={k} @ {pos['entry']:.4f}")
+    return changed
+
+
+def grid_engine():
+    """grid.engine: classic (anchor, theo regime 15m) | range (G4)."""
+    return str(CFG["grid"].get("engine") or "classic")
+
+
+def _grid_lots(st, symbol=None):
+    return [p for p in st["positions"] if p.get("tag") == "grid"
+            and (symbol is None or p.get("symbol") == symbol)]
+
+
+def range_scan(symbol):
+    """Ket qua scanner CON MOI cua symbol (None neu thieu/het han)."""
+    if SCANNER is None:
+        return None
+    res = SCANNER.results.get(symbol)
+    if not res or SCANNER.clock() - float(res.get("ts", 0)) > SCANNER.max_age():
+        return None
+    return res
+
+
+def range_allowed_symbols():
+    """Range grid: symbol DAT chuan + top K, khong phu thuoc scanner.mode
+    (range grid can bien cua scanner nen luon loc). Scanner tat / chua co
+    ket qua -> rong (fail-closed: khong mo moi)."""
+    if SCANNER is None:
+        return set()
+    sc = SCANNER.scfg()
+    if not sc.get("enabled", True):
+        return set()
+    uni = set(SYMBOLS)
+    res = {k: v for k, v in SCANNER.results.items()
+           if k in uni and not is_disabled(k) and k not in MANAGE_ONLY}
+    return set(range_scanner.allowed_symbols(
+        res, int(sc["top_k"]), SCANNER.clock(), SCANNER.max_age()))
+
+
+def range_slot_ok(st, symbol, pending=None):
+    """Con slot mo lot range moi cho symbol? pending: {symbol: so lenh cho}
+    (G5) - lenh cho tinh nhu lot de du khop het van khong vuot tran."""
+    g = CFG["grid"]
+    pending = pending or {}
+    lots = _grid_lots(st)
+    if len(lots) + sum(pending.values()) >= int(g["max_positions"]):
+        return False
+    n_sym = sum(1 for p in lots if p.get("symbol") == symbol) \
+        + pending.get(symbol, 0)
+    if n_sym >= int(g.get("max_lots_per_symbol") or 4):
+        return False
+    limit = int(g.get("max_symbols") or 0)
+    busy = {p.get("symbol") for p in lots} | {k for k, v in pending.items()
+                                              if v}
+    if limit > 0 and symbol not in busy and len(busy) >= limit:
+        return False
+    return True
+
+
+def range_grid_risk(engine, st, mark_prices):
+    """Bien vo (gia ra ngoai bien qua break_buffer / ADX 1h > trend_exit_adx)
+    -> danh dau broken (khong mo moi, huy lenh cho). derisk_on_trend: cat
+    lot dang lo > derisk_loss_pct. Chay trong run_risk_controls (bat ke
+    halt) vi day la co che giam rui ro."""
+    g = CFG["grid"]
+    changed = False
+    for symbol, grid in st.get("grids", {}).items():
+        rng = grid.get("range")
+        price = mark_prices.get(symbol)
+        if not rng or price is None:
+            continue
+        if not grid.get("broken"):
+            scan = range_scan(symbol)
+            why = range_grid.check_break(rng, price,
+                                         scan and scan.get("metrics"), g)
+            if why:
+                grid["broken"] = True
+                grid["broken_reason"] = why
+                log("RANGE GRID %s VO BIEN: %s -> dung mo moi" % (symbol, why))
+                changed = True
+        if grid.get("broken"):
+            for pos in range_grid.derisk_targets(_grid_lots(st, symbol),
+                                                 price, g):
+                rec = engine.close(pos, price, "GRID_DERISK")
+                if rec:
+                    _record_close(st, rec)
+                    changed = True
+    return changed
+
+
+def manage_range_grid(engine, st, symbol, price, allowed):
+    """Range grid 2 chieu (G4): bien tu scanner, long nua duoi / short nua
+    tren, TP = grid.tp_pct, SL bien (khong xa hon grid.sl_pct).
+
+    - Chi dung bien moi khi symbol FLAT + dat chuan top K + co scan moi hon
+      bien cu: lot dang mo luon thuoc bien da sinh ra no.
+    - Bien vo / roi top K / risk_halted -> khong mo moi (lot cu chay tiep).
+    - Lot tag "grid" -> basket / tran tong / daily stop ap dung nhu cu."""
+    g = CFG["grid"]
+    grid = st["grids"].setdefault(symbol, {"anchor": None, "taken": {}})
+    grid.setdefault("taken", {})
+    active = _grid_lots(st, symbol)
+    ids = {p["id"] for p in active}
+    for pos in active:
+        if pos.get("level"):
+            grid["taken"].setdefault(pos["level"], pos["id"])
+    grid["taken"] = {k: v for k, v in grid["taken"].items() if v in ids}
+    changed = False
+    flat = not active
+    if flat and grid.get("rebuild_pending"):
+        # basket / tran tong / daily stop: bo bien cu, cho scan moi
+        grid["rebuild_pending"] = False
+        if grid.get("range") and not grid.get("broken"):
+            grid["broken"] = True
+            grid["broken_reason"] = "risk stop"
+        changed = True
+    if grid.get("risk_halted"):
+        return changed
+    scan = range_scan(symbol)
+    rng = grid.get("range")
+    if (flat and symbol in allowed and scan
+            and (rng is None or float(rng.get("ts", 0))
+                 < float(scan.get("ts", 0)))):
+        m = scan.get("metrics") or {}
+        new = range_grid.build_range(m, g, float(scan["ts"]))
+        why = new and range_grid.check_break(new, price, m, g)
+        if new and not why:
+            grid.update(range=new, broken=False, anchor=None)
+            grid.pop("broken_reason", None)
+            log("RANGE GRID %s bien [%.6g, %.6g] step=%.2f%% %d tang score=%s"
+                % (symbol, new["low"], new["high"], new["step"] * 100,
+                   len(new["levels"]), scan.get("score")))
+            changed = True
+            rng = new
+    if (rng is None or grid.get("broken") or symbol not in allowed
+            or any(not str(p.get("level") or "").startswith("r")
+                   for p in active)):
+        return changed
+    notional = CFG["order_margin_usdt"] * CFG["leverage"]
+    entries = 0
+    max_entries = int(g.get("max_entries_per_cycle", 1))
+    for lv in range_grid.market_triggers(rng, price, grid["taken"]):
+        if entries >= max_entries or not range_slot_ok(st, symbol):
+            break
+        if len(st["positions"]) >= CFG["max_total_positions"]:
+            break
+        sl, tp = range_grid.lot_exits(rng, lv["side"], price, g)
+        pos, _ = engine.open(symbol, lv["side"], notional, price,
+                             abs(sl / price - 1), abs(tp / price - 1),
+                             "grid", level=lv["key"])
+        if not pos:
+            break
+        grid["taken"][lv["key"]] = pos["id"]
+        entries += 1
+        changed = True
+        log("OPEN #%s %s range %s %s @ %.6g (bien %.6g-%.6g)" % (
+            pos["id"], symbol, lv["key"], lv["side"].upper(), pos["entry"],
+            rng["low"], rng["high"]))
     return changed
 
 
@@ -930,14 +1100,24 @@ def main():
                 # Kiem tra PAUSE file - neu co thi khong mo lenh moi
                 paused = os.path.exists(os.path.join(BASE, "PAUSE"))
                 if not st["halted"] and not paused:
+                    use_range = grid_engine() == "range"
+                    allowed = range_allowed_symbols() if use_range else None
                     for symbol in SYMBOLS:
                         px = prices.get(symbol)
                         cc = candles.get(symbol)
                         if px is None or not cc:
                             continue
+                        if is_disabled(symbol) or symbol in MANAGE_ONLY:
+                            continue
+                        if use_range:
+                            # Range grid: loc bang scanner (khong theo
+                            # regime 15m).
+                            if manage_range_grid(engine, st, symbol, px,
+                                                 allowed):
+                                dirty = True
+                            continue
                         regime = st["regimes"].get(symbol, {}).get("regime", "ranging")
-                        if (regime == "ranging" and not is_disabled(symbol)
-                                and symbol not in MANAGE_ONLY):
+                        if regime == "ranging":
                             if manage_grid(engine, st, symbol, px):
                                 dirty = True
 

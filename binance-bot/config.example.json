@@ -5,6 +5,7 @@
  "_comment_scalp": "TP 1%, SL 0.4% (net R:R ~1.8 sau phi). Breakout dinh/day N nen 5m + loc RSI + trend EMA20 tren 15m.",
  "_comment_adx": "ADX 15m: >=25 trong nhieu nen -> trending, <=20 -> ranging, vung giua giu regime cu de tranh flip.",
  "_comment_grid": "step = clamp(step_mult * ATR(14)/gia, step_min, step_max). Rebuild khi gia lech anchor qua range_steps step.",
+ "_comment_grid_v2": "grid.engine: classic = grid quanh anchor khi regime 15m di ngang (cu); range = grid 2 chieu trong bien scanner (long nua duoi, short nua tren, chi symbol dat chuan + top K), SL ngoai bien boundary_sl_buffer, bien vo (break_buffer / ADX 1h > trend_exit_adx) -> dung mo moi. Kiem chung bang backtest_v2.py truoc khi bat.",
  "_comment_hedge": "true = bat buoc: grid 2 chieu (long+short cung symbol) chi chay duoc o hedge mode. Bot tu bat luc khoi dong.",
  "_comment_risk": "Dung entry va dong vi the khi mark-to-market equity lo >= 10% trong ngay; grid basket stop rieng 2% equity. Chua tu dong doi leverage/size.",
  "_comment_testnet": "true = dung Binance futures testnet (can key testnet rieng). Chi de thu nghiem ky thuat, khong phan anh thanh khoan that.",
@@ -63,8 +64,14 @@
   "tp_pct": 0.01
  },
  "grid": {
+  "boundary_sl_buffer": 0.005,
+  "break_buffer": 0.003,
+  "derisk_loss_pct": 0.01,
+  "derisk_on_trend": false,
+  "engine": "classic",
   "levels_each_side": 5,
   "max_entries_per_cycle": 1,
+  "max_lots_per_symbol": 4,
   "max_positions": 7,
   "max_symbols": 0,
   "order_notional": 1000.0,
@@ -74,7 +81,8 @@
   "step_min": 0.004,
   "step_mult": 0.8,
   "step_pct": 0.005,
-  "tp_pct": 0.01
+  "tp_pct": 0.01,
+  "trend_exit_adx": 25.0
  },
  "risk": {
   "daily_max_loss_pct": 0.1,
