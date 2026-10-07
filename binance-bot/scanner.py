@@ -20,7 +20,7 @@ import math
 import time
 from typing import Dict, List, Optional, Sequence
 
-from indicators import adx
+from indicators import adx, atr
 
 DEFAULTS = {
     "adx_1h_max": 20.0, "adx_15m_max": 22.0,
@@ -110,32 +110,44 @@ def _r(v, nd=4):
     return None if v is None else round(float(v), nd)
 
 
-def evaluate(symbol: str, candles_1h: Sequence[dict],
-             candles_15m: Sequence[dict], cfg: Optional[dict] = None,
-             now: Optional[float] = None) -> dict:
-    """Danh gia 1 symbol. Tra ve {symbol, ts, passed, score, metrics,
-    reasons}. Thieu du lieu -> passed=False voi ly do."""
-    c = dict(DEFAULTS)
-    c.update(cfg or {})
-    now = time.time() if now is None else now
+def compute_metrics(candles_1h: Sequence[dict], candles_15m: Sequence[dict],
+                    range_hours: int = 48) -> Optional[dict]:
+    """Chi bao THO (khong lam tron) tu nen DA DONG. None neu thieu du lieu.
+
+    Tach khoi judge() de backtest tinh 1 lan roi thu nhieu bo nguong."""
     h1 = closed(candles_1h)
     m15 = closed(candles_15m)
-    reasons: List[str] = []
     if len(h1) < 60 or len(m15) < 30:
-        return {"symbol": symbol, "ts": now, "passed": False, "score": 0.0,
-                "metrics": {"bars_1h": len(h1), "bars_15m": len(m15)},
-                "reasons": ["thiếu dữ liệu nến"]}
+        return None
     closes = [x["c"] for x in h1]
-    adx1 = adx(h1)
-    adx15 = adx(m15)
     bbw_hist = bb_width_series(closes)
     bbw = bbw_hist[-1] if bbw_hist else None
-    pctile = percentile_rank(bbw_hist, bbw) if bbw is not None else None
-    rng = range_stats(h1, int(c["range_hours"]))
-    # CHOP tren ca cua so bien (48h): CHOP(14) 1h qua nhieu, khong tach
-    # duoc di ngang hoi quy ve giua bien voi random walk.
-    chop = choppiness(h1, min(int(c["range_hours"]), len(h1) - 1))
-    er = efficiency_ratio(closes, min(int(c["range_hours"]), len(closes) - 1))
+    rng = range_stats(h1, int(range_hours))
+    a15 = atr(m15, 14)
+    return {
+        "adx_1h": adx(h1), "adx_15m": adx(m15), "bbw_pct": bbw,
+        "bbw_pctile": percentile_rank(bbw_hist, bbw) if bbw is not None
+        else None,
+        "range": rng,
+        # CHOP tren ca cua so bien (48h): CHOP(14) 1h qua nhieu, khong tach
+        # duoc di ngang hoi quy ve giua bien voi random walk.
+        "chop": choppiness(h1, min(int(range_hours), len(h1) - 1)),
+        "er": efficiency_ratio(closes, min(int(range_hours), len(closes) - 1)),
+        "last": closes[-1],
+        "atr15_pct": (a15 / closes[-1]) if a15 and closes[-1] else None,
+    }
+
+
+def judge(raw: Optional[dict], cfg: Optional[dict] = None) -> tuple:
+    """(passed, score, metrics_hien_thi, reasons) theo nguong cfg."""
+    c = dict(DEFAULTS)
+    c.update(cfg or {})
+    if raw is None:
+        return False, 0.0, {}, ["thiếu dữ liệu nến"]
+    adx1, adx15 = raw["adx_1h"], raw["adx_15m"]
+    bbw, pctile = raw["bbw_pct"], raw["bbw_pctile"]
+    rng, chop, er = raw["range"], raw["chop"], raw["er"]
+    reasons: List[str] = []
     m = {"adx_1h": _r(adx1, 1), "adx_15m": _r(adx15, 1),
          "bbw_pct": _r(bbw), "bbw_pctile": _r(pctile, 1),
          "range_pct": _r(rng and rng["width_pct"]),
@@ -143,7 +155,8 @@ def evaluate(symbol: str, candles_1h: Sequence[dict],
          "range_low": _r(rng and rng["low"], 8),
          "mid_crosses": rng and rng["crosses"],
          "pos": _r(rng and rng["pos"], 3),
-         "chop": _r(chop, 1), "er": _r(er, 3), "last": _r(closes[-1], 8)}
+         "chop": _r(chop, 1), "er": _r(er, 3), "last": _r(raw["last"], 8),
+         "atr15_pct": _r(raw.get("atr15_pct"), 5)}
 
     def need(ok, msg):
         if not ok:
@@ -193,7 +206,25 @@ def evaluate(symbol: str, candles_1h: Sequence[dict],
     if pctile is not None:
         parts.append(1 - pctile / 100.0)
     score = round(100.0 * sum(parts) / len(parts), 1) if parts else 0.0
-    return {"symbol": symbol, "ts": now, "passed": not reasons,
+    return not reasons, score, m, reasons
+
+
+def evaluate(symbol: str, candles_1h: Sequence[dict],
+             candles_15m: Sequence[dict], cfg: Optional[dict] = None,
+             now: Optional[float] = None) -> dict:
+    """Danh gia 1 symbol. Tra ve {symbol, ts, passed, score, metrics,
+    reasons}. Thieu du lieu -> passed=False voi ly do."""
+    c = dict(DEFAULTS)
+    c.update(cfg or {})
+    now = time.time() if now is None else now
+    raw = compute_metrics(candles_1h, candles_15m, int(c["range_hours"]))
+    if raw is None:
+        return {"symbol": symbol, "ts": now, "passed": False, "score": 0.0,
+                "metrics": {"bars_1h": len(closed(candles_1h)),
+                            "bars_15m": len(closed(candles_15m))},
+                "reasons": ["thiếu dữ liệu nến"]}
+    passed, score, m, reasons = judge(raw, c)
+    return {"symbol": symbol, "ts": now, "passed": passed,
             "score": score, "metrics": m, "reasons": reasons}
 
 
