@@ -1275,9 +1275,14 @@ class LiveTrader:
             return False
         if not price:
             return False
+        # `held` = phan vi the (theo luong mua ban dau) DANG CON tren vi
+        # truoc khi ban. decide_exits tra frac theo luong BAN DAU, con
+        # execute_sell ban theo ty le so du HIEN TAI -> phai quy doi.
+        held = float(pos.get("remaining", 1.0))
         actions, reason = decide_exits(pos, price, now, self.cfg)
         for frac, why in actions:
-            self._sell_leg(pos, frac, why, price, now)
+            if self._sell_leg(pos, frac, why, price, now, held=held):
+                held -= frac
         # Chi dong vi the khi thuc su het token (cac leg thanh cong).
         # Neu leg that bai, remaining duoc hoan tac -> poll sau thu lai.
         if pos.get("remaining", 1.0) <= 0.005:
@@ -1309,10 +1314,28 @@ class LiveTrader:
         elif why == "TIME":
             pos["ts_done"] = False
 
-    def _sell_leg(self, pos, frac, why, price, now):
-        """Ban 1 leg. Tra ve True neu thanh cong, False neu da hoan tac."""
+    @staticmethod
+    def balance_fraction(frac, held):
+        """Quy doi frac (theo luong mua BAN DAU) -> ty le so du HIEN TAI.
+
+        Vd. sau TP1 con held=0.6666; TP2 frac=0.3333 -> ban 50% so du.
+        Leg cuoi (frac ~ held) tra 1.0 de ban sach, khong de lai dust.
+        """
+        if held <= 0 or frac >= held - 1e-3:
+            return 1.0
+        return max(0.0, min(1.0, frac / held))
+
+    def _sell_leg(self, pos, frac, why, price, now, held=None):
+        """Ban 1 leg. Tra ve True neu thanh cong, False neu da hoan tac.
+
+        frac: phan cua luong mua ban dau. held: phan dang con tren vi truoc
+        leg nay (mac dinh = remaining + frac, vi decide_exits da tru frac).
+        """
+        if held is None:
+            held = float(pos.get("remaining", 0.0)) + frac
+        bal_frac = self.balance_fraction(frac, held)
         try:
-            r = self.swapper.execute_sell(pos["token"], frac, pos["symbol"])
+            r = self.swapper.execute_sell(pos["token"], bal_frac, pos["symbol"])
         except (NoRoute, SwapError) as e:
             log(f"{pos['symbol']} ban {why} THAT BAI: {e} (se thu lai)")
             self._rollback_leg(pos, frac, why)
@@ -1334,11 +1357,13 @@ class LiveTrader:
         self._daily()["realized_usd"] = self._daily().get(
             "realized_usd", 0.0) + pnl
         pos["legs"].append({"frac": round(frac, 4), "why": why,
+                            "balance_frac": round(bal_frac, 4),
                             "proceeds_usd": round(proceeds, 4),
                             "pnl_usd": round(pnl, 4),
                             "at": int(now), "tx": r.get("tx")})
         log(f"{'DRY' if self.dry else 'LIVE'} SELL {pos['symbol']} {why} "
-            f"{frac:.0%} +${proceeds:.2f} (pnl {pnl:+.2f})")
+            f"{frac:.0%} goc ({bal_frac:.0%} so du) +${proceeds:.2f} "
+            f"(pnl {pnl:+.2f})")
         return True
 
     def _close_position(self, pos, reason, price, now):

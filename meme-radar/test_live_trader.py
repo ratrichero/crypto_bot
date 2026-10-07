@@ -460,6 +460,114 @@ def test_unknown_error_rolls_back_tp():
               and [l["why"] for l in pos["legs"]] == ["TP1"])
 
 
+
+# ---- khoi luong ban tung phan theo so du that ----
+
+class WalletSwapper:
+    """Mo phong execute_sell LIVE: ban `frac` cua so du HIEN TAI tren vi
+    (giong Swapper.execute_sell that), theo doi so du token."""
+
+    def __init__(self, balance, price=1.0, decimals=6, fail_whys=()):
+        self.balance = balance
+        self.price = price
+        self.dec = decimals
+        self.calls = []
+        self.fail_next = list(fail_whys)
+
+    def execute_sell(self, mint, frac, symbol="?"):
+        self.calls.append(round(frac, 4))
+        if self.fail_next:
+            self.fail_next.pop(0)
+            raise lt.SwapError("route tam thoi loi")
+        amount = self.balance if frac >= 0.999 else int(self.balance * frac)
+        self.balance -= amount
+        return {"sold_base": amount,
+                "proceeds_usd": amount / 10 ** self.dec * self.price,
+                "tx": "sig", "dry": False}
+
+
+def _live_like(tmpd, price, sw):
+    tr, _ = _dry_trader(tmpd, {"MINT": price})
+    tr.swapper = sw
+    return tr
+
+
+def test_partial_sell_sizes_vs_wallet():
+    print("== TP1 -> TP2 -> TRAIL: so du con 2/3 -> 1/3 -> 0 cua luong goc ==")
+    with isolated() as tmpd:
+        init = 10_000_000
+        sw = WalletSwapper(init)
+        tr = _live_like(tmpd, 1.5, sw)
+        pos = mkpos(entry=1.0, opened_at=900)
+        pos["price_poll_at"] = 0
+        tr.positions = [pos]
+        tr.manage_one(pos, 1000)                       # +50% TP1
+        check("TP1 ban 33.34% so du", sw.calls == [0.3334], str(sw.calls))
+        check("con ~2/3 luong goc", abs(sw.balance / init - 0.6666) < 1e-3,
+              str(sw.balance / init))
+        tr.jup.price_map["MINT"] = 2.0
+        tr.manage_one(pos, 1030)                       # +100% TP2
+        check("TP2 ban 50% so du hien tai", sw.calls[-1] == 0.5, str(sw.calls))
+        check("con ~1/3 luong goc", abs(sw.balance / init - 0.3333) < 1e-3,
+              str(sw.balance / init))
+        tr.jup.price_map["MINT"] = 1.3
+        closed = tr.manage_one(pos, 1060)              # trailing -35% tu dinh
+        check("TRAIL ban 100% so du", sw.calls[-1] == 1.0, str(sw.calls))
+        check("vi sach token", sw.balance == 0 and closed is True)
+
+
+def test_tp1_tp2_same_poll():
+    print("== TP1 + TP2 cung 1 poll (gia nhay +100%) ==")
+    with isolated() as tmpd:
+        init = 9_000_000
+        sw = WalletSwapper(init)
+        tr = _live_like(tmpd, 2.0, sw)
+        pos = mkpos(entry=1.0, opened_at=900)
+        pos["price_poll_at"] = 0
+        tr.positions = [pos]
+        tr.manage_one(pos, 1000)
+        check("2 leg: 33.34% roi 50%", sw.calls == [0.3334, 0.5], str(sw.calls))
+        check("con ~1/3 luong goc", abs(sw.balance / init - 0.3333) < 1e-3,
+              str(sw.balance / init))
+
+
+def test_time_keep_after_tp1():
+    print("== TP1 roi TIME_KEEP: ban 1/2 phan con lai ==")
+    with isolated() as tmpd:
+        init = 12_000_000
+        sw = WalletSwapper(init)
+        tr = _live_like(tmpd, 1.5, sw)
+        pos = mkpos(entry=1.0, opened_at=0)
+        pos["price_poll_at"] = 0
+        tr.positions = [pos]
+        tr.manage_one(pos, 60)                          # TP1
+        tr.jup.price_map["MINT"] = 1.3                  # +30% >= 20%
+        tr.manage_one(pos, 481 * 60)                    # TIME_KEEP
+        check("TIME_KEEP ban 50% so du", sw.calls[-1] == 0.5, str(sw.calls))
+        check("con 1/3 luong goc", abs(sw.balance / init - 0.3333) < 1e-3,
+              str(sw.balance / init))
+        check("remaining khop so du",
+              abs(pos["remaining"] - sw.balance / init) < 1e-3,
+              str((pos["remaining"], sw.balance / init)))
+
+
+def test_failed_tp1_then_tp2_same_poll():
+    print("== TP1 that bai, TP2 cung poll -> ty le theo so du chua giam ==")
+    with isolated() as tmpd:
+        init = 9_000_000
+        sw = WalletSwapper(init, fail_whys=["TP1"])
+        tr = _live_like(tmpd, 2.0, sw)
+        pos = mkpos(entry=1.0, opened_at=900)
+        pos["price_poll_at"] = 0
+        tr.positions = [pos]
+        tr.manage_one(pos, 1000)
+        check("TP2 ban 33.33% so du (TP1 chua ban)",
+              sw.calls == [0.3334, 0.3333], str(sw.calls))
+        check("remaining khop so du",
+              abs(pos["remaining"] - sw.balance / init) < 1e-3,
+              str((pos["remaining"], sw.balance / init)))
+
+
 if __name__ == "__main__":
     test_exit_tp_ladder()
     test_exit_sl()
@@ -479,5 +587,9 @@ if __name__ == "__main__":
     test_time_stop_retry_after_fail()
     test_time_keep_retry_after_fail()
     test_unknown_error_rolls_back_tp()
+    test_partial_sell_sizes_vs_wallet()
+    test_tp1_tp2_same_poll()
+    test_time_keep_after_tp1()
+    test_failed_tp1_then_tp2_same_poll()
     print(f"\n{PASS} pass, {FAIL} fail")
     sys.exit(1 if FAIL else 0)
