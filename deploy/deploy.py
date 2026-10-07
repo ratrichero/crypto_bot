@@ -115,14 +115,18 @@ def git_ok(*args):
 
 # ------------------------------------------------------------------ config
 def parse_env_file(path):
-    """KEY=VALUE; '#' comment; bo 'export ' va nhay bao quanh. Khong eval."""
-    out = {}
+    """KEY=VALUE; '#' comment; bo 'export ' va nhay bao quanh. Khong eval.
+    Key trung -> dong sau cung thang (giong systemd va run-app.sh)."""
     try:
         with open(path) as f:
-            lines = f.read().splitlines()
+            return parse_env_text(f.read())
     except (IOError, OSError):
-        return out
-    for line in lines:
+        return {}
+
+
+def parse_env_text(text):
+    out = {}
+    for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -1226,6 +1230,43 @@ def env_sources(app):
     return files
 
 
+def env_dup_keys(path):
+    """Ten bien khai bao >1 lan voi gia tri khac nhau trong 1 file."""
+    vals = {}
+    try:
+        with open(path) as f:
+            for raw in f:
+                one = parse_env_text(raw)
+                for k, v in one.items():
+                    vals.setdefault(k, set()).add(v)
+    except (IOError, OSError):
+        return set()
+    return {k for k, v in vals.items() if len(v) > 1}
+
+
+def expected_env(app):
+    """Gia tri run-app.sh se nap: file truoc uu tien, trong file dong cuoi."""
+    out = {}
+    for f in app.get("env_files") or ([app["env_file"]]
+                                      if app.get("env_file") else []):
+        if os.access(f, os.R_OK):
+            for k, v in parse_env_file(f).items():
+                out.setdefault(k, v)
+    return out
+
+
+def process_env_mismatch(app, pid):
+    """Ten bien cua process dang chay khac voi file env (KHONG tra gia tri)."""
+    try:
+        with open("/proc/%d/environ" % int(pid), "rb") as f:
+            raw = f.read().decode("utf-8", "replace").split("\0")
+    except (IOError, OSError, ValueError, TypeError):
+        return None
+    have = dict(x.split("=", 1) for x in raw if "=" in x)
+    return sorted(k for k, v in expected_env(app).items()
+                  if have.get(k) != v)
+
+
 def env_conflicts(app):
     """Ten bien co gia tri khac nhau giua cac file app nap (KHONG tra gia tri)."""
     seen, out = {}, set()
@@ -1281,6 +1322,12 @@ def check_app_env(app, unit):
                    % (app["env_file"], key))
             (errors if app.get("live") else warns).append(msg)
     have = set()
+    for ef in env_sources(app):
+        dups = env_dup_keys(ef)
+        if dups:
+            warns.append("%s khai bao %s nhieu lan voi gia tri khac nhau - dong "
+                         "SAU CUNG duoc dung; nen xoa dong thua"
+                         % (ef, ", ".join(sorted(dups))))
     conflict = env_conflicts(app)
     if conflict:
         msg = ("bien %s co gia tri KHAC nhau giua cac file (%s) - file dung "
@@ -1369,6 +1416,11 @@ def cmd_doctor(args, cfg):
             bad(e)
         for w in warns:
             warn(w)
+        if p and p.get("pid"):
+            diff = process_env_mismatch(a, p["pid"])
+            if diff:
+                bad("process dang chay co bien %s KHAC file env (rong/cu) -> "
+                    "git up --restart --only %s" % (", ".join(diff), a["name"]))
         others = foreign_processes(a, pids)
         for pid, cmd in others:
             warn("process ngoai pm2: pid %d  %s" % (pid, cmd))

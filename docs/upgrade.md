@@ -707,6 +707,10 @@ Chi tiết xem [`deploy/README.md`](../deploy/README.md).
   `meme-radar/.env .env`). Doctor so python/EnvironmentFile với systemd. Biến trùng
   tên mà khác giá trị giữa các file → doctor báo lỗi, `git up` không restart app
   tiền thật.
+- Sửa lỗi Jupiter 401 sau khi chuyển pm2. Nguyên nhân: `run-app.sh` không ghi đè
+  biến đã có, và khi key trùng thì lấy dòng đầu. Biến `JUPITER_API_KEY` vì vậy bị
+  rỗng trong process. Giờ nạp như systemd: dòng sau cùng thắng, file ghi đè biến
+  thừa hưởng. `doctor` báo process đang chạy có biến khác file.
 - Bỏ `deploy/deploy.local.env` và `DEPLOY_BRANCH`. Cấu hình duy nhất là
   `deploy/deploy.env` (commit trong repo). File cũ còn trên VPS bị bỏ qua, xoá được.
 - **Bỏ mọi câu hỏi y/N** (deploy, đổi nhánh, setup): mặc định là đồng ý. Khoá

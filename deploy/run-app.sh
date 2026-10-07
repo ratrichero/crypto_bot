@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 # Khoi dong 1 app cho pm2:  run-app.sh <env_files|-> <cwd> <python> [args...]
 #
-# - env_files: 1 hoac nhieu file, ngan cach bang ':' - nap theo thu tu, file
-#   TRUOC duoc uu tien (bien da co thi khong ghi de).
-# - Nap env file (KEY=VALUE, '#' la comment, bo nhay bao quanh) bang parser
-#   rieng: KHONG eval -> gia tri chua $, dau cach, ky tu dac biet giu nguyen.
-#   Bien da co san trong moi truong duoc giu (giong _load_env_file cua bot).
+# - env_files: 1 hoac nhieu file, ngan cach bang ':'. File TRUOC duoc uu tien.
+# - Giong EnvironmentFile cua systemd: trong 1 file, dong SAU CUNG thang (giong
+#   parse_env_file cua deploy.py); gia tri trong file GHI DE bien thua huong tu
+#   shell/pm2 daemon (vd JUPITER_API_KEY= rong lot vao tu shell da start pm2).
+# - Parser rieng: KHONG eval -> gia tri chua $, dau cach, ky tu dac biet giu
+#   nguyen.
 #   Secret khong nam trong pm2 dump (~/.pm2/dump.pm2), sua .env roi restart
 #   la app nhan gia tri moi.
 # - exec python -> cung PID, SIGINT/SIGTERM cua pm2 toi thang bot (dung sach).
 set -u
 env_files="$1"; cwd="$2"; py="$3"; shift 3
+
+declare -A _env=()
 
 load_env_file() {
     local env_file="$1" line key val
@@ -34,16 +37,18 @@ load_env_file() {
             \'*\') val="${val#\'}"; val="${val%\'}" ;;
         esac
         [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
-        if [ -z "${!key+x}" ]; then
-            export "$key=$val"
-        fi
+        _env["$key"]="$val"
     done < "$env_file"
 }
 
 if [ "$env_files" != "-" ] && [ -n "$env_files" ]; then
     IFS=':' read -r -a _files <<< "$env_files"
-    for f in "${_files[@]}"; do
-        [ -n "$f" ] && load_env_file "$f"
+    # nap tu file CUOI ve file DAU -> file dau ghi de sau cung = uu tien nhat
+    for (( i=${#_files[@]}-1; i>=0; i-- )); do
+        [ -n "${_files[$i]}" ] && load_env_file "${_files[$i]}"
+    done
+    for key in "${!_env[@]}"; do
+        export "$key=${_env[$key]}"
     done
 fi
 

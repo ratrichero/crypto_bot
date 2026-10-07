@@ -146,6 +146,14 @@ APPS=muse-dashboard muse-radar muse-live-trader muse-binance
 - Ví dụ live trader: `meme-radar/.env .env`. Key ví lấy từ `meme-radar/.env`,
   còn `JUPITER_API_KEY` (chỉ có ở `.env` gốc) được bổ sung từ file sau.
 - `-` nghĩa là không nạp file nào.
+- Nạp giống `EnvironmentFile` của systemd:
+  - trong một file, nếu một biến khai báo nhiều lần thì **dòng sau cùng** thắng;
+  - giá trị trong file **ghi đè** biến thừa hưởng từ shell hoặc pm2 daemon.
+    Trước đây `JUPITER_API_KEY=` rỗng lọt vào kiểu này và gây lỗi Jupiter 401.
+- `doctor` báo hai trường hợp, chỉ in tên biến:
+  - biến khai báo trùng mà khác giá trị trong cùng một file;
+  - process đang chạy có biến khác với file (ví dụ rỗng) → cần
+    `git up --restart --only <app>`.
 - Bot tự đọc thêm `.env` trong thư mục của nó, nhưng chỉ lấy những biến chưa có.
 - Nếu cùng một biến có **giá trị khác nhau** giữa các file (kể cả `.env` riêng
   của bot):

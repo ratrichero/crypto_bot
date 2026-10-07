@@ -108,8 +108,8 @@ def test_parse_env_and_run_app():
         check("run-app.sh nap giong parse_env_file",
               all(got[k] == env[k] for k in
                   ("DEMO", "EXP", "SINGLE", "SPACED", "EMPTY")), got)
-        check("run-app.sh khong ghi de bien da co san",
-              got["KEEP"] == "from-env", got)
+        check("run-app.sh: file ghi de bien thua huong tu shell/pm2 (nhu systemd)",
+              got["KEEP"] == "from-file", got)
         check("run-app.sh dat PYTHONUNBUFFERED", got["PYTHONUNBUFFERED"] == "1")
         res = subprocess.run(["bash", os.path.join(HERE, "run-app.sh"),
                               "/khong/co.env", tmp, sys.executable, "-c", ""])
@@ -143,6 +143,36 @@ def test_parse_env_and_run_app():
                               "-c", ""])
         check("run-app.sh nhieu file, 1 file thieu -> ma 78",
               res.returncode == 78, res.returncode)
+
+        # loi VPS: .env co JUPITER_API_KEY 2 lan (dong dau rong), shell start
+        # pm2 cung co JUPITER_API_KEY= rong -> phai ra key that (dong cuoi)
+        dup = os.path.join(tmp, "dup.env")
+        with open(dup, "w") as f:
+            f.write("JUPITER_API_KEY=\nA=1\nJUPITER_API_KEY=that\n")
+        out = subprocess.run(
+            ["bash", os.path.join(HERE, "run-app.sh"), dup, tmp,
+             sys.executable, "-c", code2],
+            env=dict(base_env, JUPITER_API_KEY=""),
+            stdout=subprocess.PIPE, universal_newlines=True).stdout
+        got = json.loads(out)
+        check("trung key trong 1 file -> dong cuoi thang; env rong bi ghi de",
+              got["JUPITER_API_KEY"] == "that"
+              and d.parse_env_file(dup)["JUPITER_API_KEY"] == "that", got)
+        check("doctor: phat hien key trung khac gia tri trong 1 file",
+              d.env_dup_keys(dup) == {"JUPITER_API_KEY"}, d.env_dup_keys(dup))
+        # process dang chay co bien rong -> bao ten bien, khong in gia tri
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            env=dict(base_env, JUPITER_API_KEY="", A="1"))
+        try:
+            app = {"env_files": [dup], "env_file": dup}
+            check("process co JUPITER_API_KEY rong -> mismatch",
+                  d.process_env_mismatch(app, proc.pid) == ["JUPITER_API_KEY"],
+                  d.process_env_mismatch(app, proc.pid))
+        finally:
+            proc.kill()
+            proc.wait()
+
     finally:
         shutil.rmtree(tmp)
 
