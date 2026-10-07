@@ -10,7 +10,8 @@ Lenh:
                      sang pm2, pm2 save + pm2 startup
 
 Tuy chon: --yes (dong y restart app tien that), --dry-run, --only a,b,
-          --no-restart, --restart (ep restart app chon), --force-deps
+          --no-restart, --restart (ep restart app chon), --force-deps,
+          --force (lam lai moi buoc + restart moi app)
 
 Nguyen tac an toan:
   * Chi fast-forward (khong merge/rebase/reset); working tree co sua doi ->
@@ -645,7 +646,7 @@ def step_migrate(cfg, dry_run, force=False):
     return status
 
 
-def step_build(apps, dry_run):
+def step_build(apps, dry_run, force=False):
     """Build web neu co package.json (hien chua co: dashboard la Streamlit)."""
     step("Kiem tra build web")
     pkgs = [p for p in git("ls-files", "*package.json").splitlines()
@@ -665,7 +666,7 @@ def step_build(apps, dry_run):
                     h.update(rel.encode() + b"\0" + f.read())
         digest = h.hexdigest()
         stamp = ("build", hashlib.sha1(d.encode()).hexdigest()[:12])
-        if read_stamp(*stamp) == digest:
+        if not force and read_stamp(*stamp) == digest:
             skip("%s khong doi" % d)
             continue
         if dry_run:
@@ -736,7 +737,7 @@ def plan_restarts(cfg, apps, head, force_names=()):
                 item["reasons"].append("%s doi luc %s, sau khi app start" % (
                     what, datetime.fromtimestamp(ts).strftime("%d/%m %H:%M")))
         if name in force_names:
-            item["reasons"].append("--restart")
+            item["reasons"].append("--force/--restart")
         if item["reasons"]:
             item["action"] = "restart"
     return plan
@@ -840,6 +841,7 @@ def append_history(rec):
 
 # ============================================================== commands
 def cmd_deploy(args, cfg):
+    started = time.time()
     lock = acquire_lock()
     branch = check_branch(cfg)
     only = args.only.split(",") if args.only else None
@@ -862,20 +864,25 @@ def cmd_deploy(args, cfg):
                 os.execv(sys.executable, argv)
 
     head = new if args.dry_run else git("rev-parse", "HEAD")
-    deps_changed = step_deps(cfg, apps_all, args.dry_run, args.force_deps)
+    force = getattr(args, "force", False)
+    deps_changed = step_deps(cfg, apps_all, args.dry_run,
+                             args.force_deps or force)
     migrate_error = None
     try:
-        migrated = step_migrate(cfg, args.dry_run)
+        migrated = step_migrate(cfg, args.dry_run, force)
     except DeployError as e:
         bad(str(e))
         migrate_error, migrated = str(e), "error"
-    rebuilt = step_build(apps_all, args.dry_run)
+    rebuilt = step_build(apps_all, args.dry_run, force)
 
     step("Kiem tra app can restart")
     if args.dry_run and head != git("rev-parse", "HEAD"):
         info(_c("2", "  (--dry-run: so voi commit %s chua pull)" % short(head)))
-    plan = plan_restarts(cfg, apps, head,
-                         force_names=set(only or []) if args.restart else ())
+    if force:
+        force_names = {a["name"] for a in apps}
+    else:
+        force_names = set(only or []) if args.restart else set()
+    plan = plan_restarts(cfg, apps, head, force_names=force_names)
     for item in plan:
         (skip if item["action"] == "skip" else warn)(describe(item, head))
 
@@ -941,6 +948,13 @@ def cmd_deploy(args, cfg):
             "%s: %s" % (name, res))
     if not results:
         skip("khong app nao duoc restart")
+    n_ok = sum(1 for r in results.values() if r == "restarted")
+    summary = ("xong trong %ds - code:%s thu-vien:%d migrate:%s build:%d "
+               "restart:%d/%d%s" % (
+                   time.time() - started, short(head) if old != head else "-",
+                   len(deps_changed), migrated, len(rebuilt), n_ok,
+                   len(results), " (CO LOI)" if failed else ""))
+    (bad if failed else ok)(summary)
     return 1 if failed else 0
 
 
@@ -1300,6 +1314,10 @@ def main(argv=None):
                     help="ep restart cac app trong --only")
     ap.add_argument("--force-deps", action="store_true",
                     help="chay pip install du requirements khong doi")
+    ap.add_argument("--force", action="store_true",
+                    help="bo qua moi dau 'da lam': cai thu vien, migrate, build "
+                         "lai va restart moi app dang chay (app tien that van "
+                         "hoi y/N tru khi --yes)")
     ap.add_argument("--resume-from", help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
     if args.restart and not args.only:

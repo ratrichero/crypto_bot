@@ -708,6 +708,7 @@ def test_migrate_error_blocks_restart():
         class A(object):
             only = None
             dry_run = no_restart = restart = yes = force_deps = False
+            force = False
             resume_from = None
         cfg = {"APPS": "muse-dashboard"}
         with use_root(tmp):
@@ -719,6 +720,26 @@ def test_migrate_error_blocks_restart():
             rc = d.cmd_deploy(A(), cfg)
         check("migrate ok -> restart binh thuong",
               restarted == ["muse-dashboard"] and rc == 0, (restarted, rc))
+        seen = {}
+        d.step_deps = lambda cfg, apps, dry, force: seen.update(deps=force) \
+            or set()
+        d.step_migrate = lambda cfg, dry, force=False: seen.update(
+            mig=force) or "applied"
+        d.step_build = lambda apps, dry, force=False: seen.update(
+            build=force) or set()
+        plan_args = {}
+
+        def fake_plan(cfg, apps, head, force_names=()):
+            plan_args["force"] = set(force_names)
+            return []
+        d.plan_restarts = fake_plan
+        a = A()
+        a.force = True
+        with use_root(tmp):
+            d.cmd_deploy(a, cfg)
+        check("--force: lam lai thu vien/migrate/build + restart moi app",
+              seen == {"deps": True, "mig": True, "build": True}
+              and plan_args["force"] == {"muse-dashboard"}, (seen, plan_args))
     finally:
         for n, f in saved.items():
             setattr(d, n, f)
