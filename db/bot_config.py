@@ -127,6 +127,36 @@ PARAMS: Tuple[Param, ...] = (
           "Khoảng cách tối thiểu tầng ↔ giá để đặt LIMIT (%)", 0.0, 0.01,
           pct=True, help="Tránh lệnh post-only bị sàn từ chối vì sẽ khớp "
                          "ngay."),
+    # ---- Loc chieu xu huong cho grid (task 34, binance-bot/trend_filter.py)
+    Param("trend.market_filter", "bool", True, "Xu hướng",
+          "Lọc theo xu hướng BTC (mọi coin)",
+          help="BTC giảm (dưới EMA 1h + EMA dốc xuống, hoặc giảm mạnh trong "
+               "vài giờ) → không mở lot grid LONG mới trên mọi coin; BTC "
+               "tăng → không mở SHORT mới. Chỉ chặn mở mới, lot đang mở vẫn "
+               "chạy tới TP/SL. Thiếu dữ liệu → chặn (an toàn)."),
+    Param("trend.symbol_filter", "bool", True, "Xu hướng",
+          "Lọc theo xu hướng từng coin",
+          help="Coin dưới EMA 1h và EMA dốc xuống → không mở long grid mới "
+               "trên coin đó (ngược lại với short). Đi ngang (EMA phẳng) "
+               "→ grid chạy bình thường."),
+    Param("trend.ema_period", "int", 50, "Xu hướng", "Chu kỳ EMA (nến 1h)",
+          10, 90),
+    Param("trend.slope_bars", "int", 6, "Xu hướng",
+          "Đo độ dốc EMA qua N nến 1h", 1, 48),
+    Param("trend.slope_min_atr", "float", 0.5, "Xu hướng",
+          "Độ dốc EMA tối thiểu (× ATR 1h)", 0.0, 5.0,
+          help="EMA dịch ≥ x lần ATR(14) 1h trong N nến → có xu hướng. Chuẩn "
+               "hoá theo ATR nên coin biến động mạnh/yếu dùng chung ngưỡng. "
+               "Nhỏ = nhạy hơn (chặn nhiều hơn); 0.5 ≈ đi ngang bị chặn 1 "
+               "phía ~10-18% thời gian."),
+    Param("trend.market_move_hours", "int", 4, "Xu hướng",
+          "BTC: cửa sổ đo biến động nhanh (giờ)", 1, 48),
+    Param("trend.market_move_pct", "float", 0.015, "Xu hướng",
+          "BTC: giảm/tăng ≥ x% trong cửa sổ → xu hướng ngay (%)", 0.0, 0.20,
+          pct=True, help="Bắt cú dump/pump nhanh mà EMA chưa kịp dốc. "
+                         "0 = tắt."),
+    Param("trend.refresh_minutes", "int", 5, "Xu hướng",
+          "Lấy lại nến 1h mỗi (phút)", 1, 60),
     # ---- Rui ro
     Param("risk.daily_max_loss_pct", "float", 0.10, "Rủi ro",
           "Daily stop (% equity)", 0.01, 0.50, pct=True),
@@ -289,6 +319,9 @@ def validate(flat: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
     if clean["grid.range_min_levels"] > clean["grid.levels_each_side"]:
         errors.append("Số tầng tối thiểu để vào top K phải ≤ số tầng mỗi "
                       "phía")
+    if clean["trend.ema_period"] + clean["trend.slope_bars"] > 98:
+        errors.append("Chu kỳ EMA + số nến đo độ dốc phải ≤ 98 (bot lấy 99 "
+                      "nến 1h)")
     if clean["grid.engine"] == "range":
         if not clean["scanner.enabled"]:
             errors.append("Range grid cần bật scanner (biên lấy từ scanner)")

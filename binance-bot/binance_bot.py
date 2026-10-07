@@ -30,6 +30,7 @@ import range_grid
 import runtime_config
 import scanner as range_scanner
 import strategy
+import trend_filter
 from indicators import atr
 from binance_ws import BinanceWS
 
@@ -57,6 +58,7 @@ CIRCUIT_P = os.path.join(BASE, "binance_circuit.json")
 SCANNER_P = os.path.join(BASE, "scanner_latest.json")
 RUNTIME = None           # runtime_config.RuntimeConfig (tao trong main)
 SCANNER = None           # scanner.ScannerRunner (tao trong main)
+TREND = None             # trend_filter.TrendFilter (tao trong main)
 
 
 def make_engine(st):
@@ -567,6 +569,34 @@ def grid_entry_allowed(st, symbol, has_lots):
     return True
 
 
+_GRID_BLOCK_LOG: dict = {}
+
+
+def grid_trend_block(symbol, side):
+    """Loc chieu xu huong (task 34): ly do chan mo lot grid `side` moi tren
+    `symbol`, None = duoc. A = xu huong BTC (moi symbol), C = xu huong rieng
+    symbol. Chi chan MO MOI, khong dung toi lot dang mo."""
+    if TREND is None:
+        return None
+    return TREND.blocks(symbol, side)
+
+
+def grid_side_allowed(st, symbol, side):
+    """Duoc mo lot grid `side` moi tren `symbol`? Log 1 lan moi khi ly do
+    chan doi (khong spam moi 0.5s)."""
+    why = grid_trend_block(symbol, side)
+    key = (symbol, side)
+    if why:
+        short = why.split(" (")[0]
+        if _GRID_BLOCK_LOG.get(key) != short:
+            log("GRID %s khong mo %s: %s" % (symbol, side.upper(), why))
+            _GRID_BLOCK_LOG[key] = short
+        return False
+    if _GRID_BLOCK_LOG.pop(key, None) is not None:
+        log("GRID %s mo lai phia %s" % (symbol, side.upper()))
+    return True
+
+
 def manage_grid(engine, st, symbol, price):
     g = CFG["grid"]
     grid = st["grids"].setdefault(symbol, {"anchor": None, "taken": {}})
@@ -630,7 +660,8 @@ def manage_grid(engine, st, symbol, price):
         if len(st["positions"]) >= CFG["max_total_positions"]:
             break
         bk = f"b{k}"
-        if price <= anchor * (1 - k * step) and bk not in grid["taken"]:
+        if (price <= anchor * (1 - k * step) and bk not in grid["taken"]
+                and grid_side_allowed(st, symbol, "long")):
             pos, _ = engine.open(symbol, "long", notional,
                                  anchor * (1 - k * step),
                                  sl_pct, tp_pct, "grid", level=bk)
@@ -643,7 +674,8 @@ def manage_grid(engine, st, symbol, price):
         if entries >= max_entries:
             break
         sk = f"s{k}"
-        if price >= anchor * (1 + k * step) and sk not in grid["taken"]:
+        if (price >= anchor * (1 + k * step) and sk not in grid["taken"]
+                and grid_side_allowed(st, symbol, "short")):
             pos, _ = engine.open(symbol, "short", notional,
                                  anchor * (1 + k * step),
                                  sl_pct, tp_pct, "grid", level=sk)
@@ -823,6 +855,8 @@ def manage_range_grid(engine, st, symbol, price, allowed):
             break
         if len(st["positions"]) >= CFG["max_total_positions"]:
             break
+        if not grid_side_allowed(st, symbol, lv["side"]):
+            continue
         sl, tp = range_grid.lot_exits(rng, lv["side"], price, g)
         pos, _ = engine.open(symbol, lv["side"], notional, price,
                              abs(sl / price - 1), abs(tp / price - 1),
@@ -877,6 +911,7 @@ def manage_range_limits(engine, st, prices, allowed):
     pend = [o for o in _pending_entries(st)
             if o.get("status") not in ENTRY_TERMINAL]
     rows, eligible = [], set()
+    trend_blocked = {}           # (symbol, side) -> ly do (loc xu huong)
     gap = float(g.get("limit_min_gap_pct", 0.0005))
     for symbol in SYMBOLS:
         grid = st["grids"].get(symbol) or {}
@@ -898,6 +933,11 @@ def manage_range_limits(engine, st, prices, allowed):
                 cands.append({"key": o["level"], "side": o["side"],
                               "price": o["price"],
                               "dist": abs(o["price"] / px - 1)})
+        for sd in ("long", "short"):
+            if not grid_side_allowed(st, symbol, sd):
+                trend_blocked[(symbol, sd)] = grid_trend_block(symbol, sd)
+        cands = [c for c in cands
+                 if (symbol, c["side"]) not in trend_blocked]
         rows.append({"symbol": symbol,
                      "score": (range_scan(symbol) or {}).get("score", 0),
                      "lots": len(lots), "candidates": cands,
@@ -909,6 +949,9 @@ def manage_range_limits(engine, st, prices, allowed):
     for o in pend:
         if o["symbol"] not in eligible:
             why = "symbol bị chặn / biên vỡ / rời top K"
+        elif (o["symbol"], o.get("side")) in trend_blocked:
+            why = "lọc xu hướng: %s" % trend_blocked[(o["symbol"],
+                                                      o.get("side"))]
         elif (o["symbol"], o.get("level")) not in chosen:
             why = "hết slot / ưu tiên tầng gần giá hơn"
         else:
@@ -1005,7 +1048,7 @@ def main():
         log("START BLOCKED by Binance safety circuit: %s" % e)
         return
 
-    global RUNTIME, SCANNER
+    global RUNTIME, SCANNER, TREND
     try:
         RUNTIME = runtime_config.RuntimeConfig(CFG, log=log)
         RUNTIME.start()
@@ -1016,6 +1059,9 @@ def main():
     SCANNER = range_scanner.ScannerRunner(
         CFG, binance_client.get_klines, log=log,
         db=RUNTIME.db if RUNTIME else None, path=SCANNER_P,
+        fatal=(binance_safety.BinanceSafetyStop,))
+    TREND = trend_filter.TrendFilter(
+        CFG, binance_client.get_klines, log=log,
         fatal=(binance_safety.BinanceSafetyStop,))
 
     st = load_state()
@@ -1377,6 +1423,15 @@ def main():
                         raise
                     except Exception:
                         log("SCANNER loi:\n" + traceback.format_exc())
+                # Loc chieu xu huong grid (BTC + tung symbol), moi mode.
+                if TREND is not None:
+                    try:
+                        TREND.tick(SYMBOLS, prices)
+                        st["trend"] = TREND.snapshot()
+                    except binance_safety.BinanceSafetyStop:
+                        raise
+                    except Exception:
+                        log("TREND loi:\n" + traceback.format_exc())
                 if not st["halted"]:
                     for symbol in SYMBOLS:
                         px = prices.get(symbol)

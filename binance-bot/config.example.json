@@ -6,6 +6,7 @@
  "_comment_adx": "ADX 15m: >=25 trong nhieu nen -> trending, <=20 -> ranging, vung giua giu regime cu de tranh flip.",
  "_comment_grid": "step = clamp(step_mult * ATR(14)/gia, step_min, step_max). Rebuild khi gia lech anchor qua range_steps step. Mac dinh cho von ~1000 USDT, lot 1000: step 1-1.5% (~ TP 1%), 2 tang moi phia, toi da 3 lot grid -> basket 3% chi cat khi gia di nguoc ~3% (breakout that), lo ~33 USDT ~ 3.7 lan TP.",
  "_comment_grid_v2": "grid.engine: classic = grid quanh anchor khi regime 15m di ngang (cu); range = grid 2 chieu trong bien scanner (long nua duoi, short nua tren, chi symbol dat chuan + top K), SL ngoai bien boundary_sl_buffer, bien vo (break_buffer / ADX 1h > trend_exit_adx) -> dung mo moi. Kiem chung bang backtest_v2.py truoc khi bat. grid.entry_mode=limit (chi voi engine range): dat truoc LIMIT post-only GTX o tang gan gia, lenh cho chiem slot; het TTL / khop 1 phan qua partial_fill_timeout_seconds -> huy phan con lai, phan da khop thanh lot co SL/TP. fee_maker chi dung cho dry-run/backtest.",
+ "_comment_trend": "Loc chieu xu huong grid (trend_filter.py): xu huong BTC (market_filter, ap moi coin) va tung coin (symbol_filter) tren nen 1h: gia duoi EMA + EMA doc xuong >= slope_min_atr x ATR(14) 1h qua slope_bars nen (hoac BTC giam >= market_move_pct trong market_move_hours gio) -> khong mo lot grid LONG moi; nguoc lai chan SHORT. Chi chan mo moi; thieu du lieu -> chan. market_symbol chi doi trong file (restart).",
  "_comment_hedge": "true = bat buoc: grid 2 chieu (long+short cung symbol) chi chay duoc o hedge mode. Bot tu bat luc khoi dong.",
  "_comment_risk": "Dung entry va dong vi the khi mark-to-market equity lo >= 10% trong ngay; grid basket stop rieng 3% equity moi symbol. Chua tu dong doi leverage/size.",
  "_comment_testnet": "true = dung Binance futures testnet (can key testnet rieng). Chi de thu nghiem ky thuat, khong phan anh thanh khoan that.",
@@ -90,6 +91,17 @@
   "step_pct": 0.01,
   "tp_pct": 0.01,
   "trend_exit_adx": 25.0
+ },
+ "trend": {
+  "market_filter": true,
+  "symbol_filter": true,
+  "market_symbol": "BTCUSDT",
+  "ema_period": 50,
+  "slope_bars": 6,
+  "slope_min_atr": 0.5,
+  "market_move_hours": 4,
+  "market_move_pct": 0.015,
+  "refresh_minutes": 5
  },
  "risk": {
   "daily_max_loss_pct": 0.1,
