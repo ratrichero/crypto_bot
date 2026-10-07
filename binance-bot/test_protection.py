@@ -1659,6 +1659,72 @@ def test_clear_halt_request_checks_safety():
 
 
 # ===================================================================
+# Guard TP khop khi leg con lot khac (su co NEAR live): sync khong ghi
+# duoc -> truoc day treo vinh vien (SL con, DB khong co, halt mismatch)
+# ===================================================================
+def _bot_loop(eng, st, rounds=15, mark=60300):
+    for _ in range(rounds):
+        CLOCK.sleep(11)
+        eng.sync_exchange_protection(force=True)
+        eng.detect_exchange_closed({"BTCUSDT": mark})
+        eng.reconcile_positions(force=True)
+        hold = str(st.get("halt_reason") or "").startswith(
+            ("exchange position", "exchange protection reconciliation",
+             "unmanaged ", "position "))
+        if not hold:
+            eng.retry_protection()
+            eng.cleanup_orphan_orders()
+
+
+def _tp_fires_with_sibling(break_exchange):
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    a = open_lot(eng, "long", 60000, level="b1")
+    b = open_lot(eng, "long", 59700, level="b2")
+    CLOCK.sleep(120)
+    order = fake.fire(a["tp_algo_id"], price=60300)
+    break_exchange(fake, order)
+    _bot_loop(eng, st)
+    sl_open = any(str(x["algoId"]) == str(a["sl_algo_id"])
+                  for x in fake.open_algos())
+    return fake, eng, st, a, b, sl_open
+
+
+def _check_tp_sibling(name, break_exchange):
+    fake, eng, st, a, b, sl_open = _tp_fires_with_sibling(break_exchange)
+    rec = [r for r in eng.db_rows if r["id"] == a["id"]]
+    check("%s: lot TP duoc ghi DB (dung lot, reason TP)" % name,
+          len(rec) == 1 and rec[0]["reason"] == "TP"
+          and abs(rec[0]["exit"] - 60300) < 1e-6, (eng.db_rows, eng.logs[-6:]))
+    check("%s: SL cua lot da khop bi huy" % name, not sl_open)
+    check("%s: lot con lai giu nguyen, du SL/TP, khong halt" % name,
+          [p["id"] for p in st["positions"]] == [b["id"]]
+          and len(guards_of(fake, b)) == 2 and not st.get("halted"),
+          (st["positions"], st.get("halt_reason")))
+
+
+def test_tp_with_sibling_algo_query_fails():
+    def broken(fake, order):
+        fake.fapiPrivateGetAlgoOrder = lambda params: (_ for _ in ()).throw(
+            BinanceError("binance -1000 unknown"))
+    _check_tp_sibling("TP+lot ke, query algo loi", broken)
+
+
+def test_tp_with_sibling_fill_order_fails():
+    def broken(fake, order):
+        fake.fetch_order = lambda *a, **k: (_ for _ in ()).throw(
+            BinanceError("binance -1000 unknown"))
+    _check_tp_sibling("TP+lot ke, fetch_order loi (dung userTrades)", broken)
+
+
+def test_tp_with_sibling_fill_order_in_progress():
+    def stuck(fake, order):
+        fake.orders[str(order["orderId"])].update(
+            filled=order["filled"] / 2, status="open")
+    _check_tp_sibling("TP+lot ke, lenh TP con PARTIALLY_FILLED", stuck)
+
+
+# ===================================================================
 # Kiem soat rui ro LUON chay (halt chi chan mo lenh moi)
 # ===================================================================
 def test_basket_runs_during_reconcile_hold():
@@ -1805,6 +1871,9 @@ TESTS = [
     test_terminal_partial_open_is_adopted_and_unhalted,
     test_stuck_partial_halt_recovers_on_reconcile,
     test_clear_halt_request_checks_safety,
+    test_tp_with_sibling_algo_query_fails,
+    test_tp_with_sibling_fill_order_fails,
+    test_tp_with_sibling_fill_order_in_progress,
     test_basket_runs_during_reconcile_hold,
     test_basket_evaluates_risk_halted_symbol_with_lots,
     test_grid_total_stop_across_symbols,

@@ -1634,12 +1634,41 @@ class BinanceEngine(EntryOrdersMixin):
                 gone = [p.get("id") for p in lots for label in ("sl", "tp")
                         if p.get("%s_algo_id" % label)
                         and str(p.get("%s_algo_id" % label)) not in open_ids]
+                defers = getattr(self, "_partial_defer", None)
+                if defers is None:
+                    defers = self._partial_defer = {}
                 if gone:
-                    self.log("INFO leg reduced %s %s: guard cua lot %s khong "
-                             "con open -> de protection sync ghi nhan"
-                             % (symbol, side, sorted(set(gone))))
-                    self._protection_sync_soon()
-                    continue
+                    # Guard cua lot vua khop: sync_exchange_protection ghi
+                    # nhan voi fill that. Nhung neu sync khong ghi duoc (doc
+                    # algo/lenh loi lien tuc) thi truoc day treo VINH VIEN:
+                    # lot con trong state, guard con lai khong bi huy, DB
+                    # khong co trade. Qua han -> ghi DUNG cac lot mat guard
+                    # neu tong qty cua chung = phan leg giam.
+                    first = defers.setdefault(key, now)
+                    wait = float(self.cfg.get(
+                        "exchange_close_defer_seconds", 90))
+                    gone_lots = [p for p in lots if p.get("id") in set(gone)]
+                    gone_qty = sum(float(p.get("qty", 0) or 0)
+                                   for p in gone_lots)
+                    if now - first < wait or abs(gone_qty - reduction) > tol:
+                        if now - first < wait:
+                            self.log("INFO leg reduced %s %s: guard cua lot %s "
+                                     "khong con open -> de protection sync "
+                                     "ghi nhan" % (symbol, side,
+                                                   sorted(set(gone))))
+                        else:
+                            self.log("WARNING leg reduced %s %s: lot mat guard "
+                                     "%s (qty %s) khong khop phan giam %s -> "
+                                     "giu nguyen" % (symbol, side,
+                                                     sorted(set(gone)),
+                                                     gone_qty, reduction))
+                        self._protection_sync_soon()
+                        continue
+                    self.log("WARNING leg reduced %s %s: protection sync chua "
+                             "ghi nhan lot %s sau %.0fs -> ghi theo leg giam"
+                             % (symbol, side, sorted(set(gone)), now - first))
+                    chosen = gone_lots
+                defers.pop(key, None)
             pending.pop(key, None)
             exit_px, order_id = self._reduction_fill(
                 symbol, side, reduction,
@@ -1661,7 +1690,8 @@ class BinanceEngine(EntryOrdersMixin):
                     "entry": round(float(pos.get("entry", 0) or 0), 6),
                     "exit": round(px, 6),
                     "notional": round(float(pos.get("notional", 0) or 0), 2),
-                    "reason": "CLOSED_ON_EXCHANGE",
+                    "reason": self._exit_reason_from_price(pos, px,
+                                                           not estimated),
                     "closed_at": int(now), "live": True, "dry": self.dry_run,
                     "estimated": estimated,
                     "exit_source": "exchange_detect_partial",
@@ -1888,21 +1918,38 @@ class BinanceEngine(EntryOrdersMixin):
             outcome["avg"] = None
         if (outcome["status"] == "FINISHED" and outcome["order_id"]
                 and (outcome["avg"] is None or outcome["qty"] is None)):
+            fetched = False
             try:
                 order = self._private_call(
                     "private:order_status", self.ex.fetch_order,
                     str(outcome["order_id"]),
                     self._ccxt_symbol(symbol) or symbol)
-                outcome["avg"] = outcome["avg"] or self._order_average(order)
-                outcome["qty"] = self._float_or_none(
-                    (order or {}).get("filled")
-                    or (order or {}).get("executedQty"))
+                fetched = True
+                if self._order_in_progress(order):
+                    # Lenh MARKET do guard sinh ra con dang khop: filled la
+                    # mot phan -> chua biet (sync lai sau), khong phai partial.
+                    outcome["qty"] = None
+                else:
+                    outcome["avg"] = (outcome["avg"]
+                                      or self._order_average(order))
+                    outcome["qty"] = self._float_or_none(
+                        (order or {}).get("filled")
+                        or (order or {}).get("executedQty"))
             except binance_safety.BinanceSafetyStop:
                 raise
             except Exception as exc:
                 self.log("WARNING fetch algo fill order %s: %s" %
                          (outcome["order_id"],
                           binance_safety.redact_body(exc)))
+            if not fetched or (outcome["qty"] is not None
+                               and outcome["avg"] is None):
+                # Nguon su that du phong: userTrades theo orderId (algo da
+                # FINISHED -> lenh da ket thuc, trade la cuoi cung).
+                summary = self._order_fill_summary(symbol,
+                                                   outcome["order_id"])
+                if summary is not None:
+                    outcome["qty"] = summary["qty"]
+                    outcome["avg"] = outcome["avg"] or summary["avg"]
         # qty None = unknown fill (fail closed: caller changes nothing);
         # qty 0 = Binance explicitly reports no execution.
         return outcome
