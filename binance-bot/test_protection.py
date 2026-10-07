@@ -1725,6 +1725,56 @@ def test_tp_with_sibling_fill_order_in_progress():
 
 
 # ===================================================================
+# Khoi dong: hedge mode (su co VPS: con SL/TP tren san -> -4067)
+# ===================================================================
+def test_ensure_hedge_mode_reads_mode_first():
+    err_4067 = BinanceError('binance {"code":-4067,"msg":"Position side '
+                            'cannot be changed if there exists open orders."}')
+
+    def run(dual, set_exc=None):
+        fake = FakeBinance()
+        eng, st = make_engine(fake)
+        calls = []
+
+        def get_dual(params=None):
+            if isinstance(dual, Exception):
+                raise dual
+            return {"dualSidePosition": dual}
+
+        def set_mode(hedged, *a, **k):
+            calls.append(hedged)
+            if set_exc is not None:
+                raise set_exc
+            return {"code": 200}
+        fake.fapiPrivateGetPositionSideDual = get_dual
+        fake.set_position_mode = set_mode
+        try:
+            eng._ensure_hedge_mode()
+            return None, calls
+        except RuntimeError as e:
+            return str(e), calls
+
+    err, calls = run(True, err_4067)
+    check("hedge: da HEDGE + con lenh cho -> khong goi doi mode, khoi dong OK",
+          err is None and calls == [], (err, calls))
+    err, calls = run("true", err_4067)
+    check("hedge: dualSidePosition dang chuoi 'true' -> OK", err is None
+          and calls == [])
+    err, calls = run(False)
+    check("hedge: ONE-WAY -> bat hedge", err is None and calls == [True])
+    err, calls = run(False, err_4067)
+    check("hedge: ONE-WAY + khong doi duoc -> dung, bao ro ONE-WAY",
+          err and "ONE-WAY" in err and calls == [True], err)
+    err, calls = run(BinanceError("binance -1001 internal"),
+                     BinanceError('binance {"code":-4059,"msg":"No need to '
+                                  'change position side."}'))
+    check("hedge: doc mode loi + -4059 -> OK", err is None and calls == [True])
+    err, calls = run(BinanceError("binance -1001 internal"), err_4067)
+    check("hedge: doc mode loi + -4067 -> dung, KHONG khuyen dong SL/TP",
+          err and "Khong xac dinh" in err and "KHONG can dong" in err, err)
+
+
+# ===================================================================
 # Kiem soat rui ro LUON chay (halt chi chan mo lenh moi)
 # ===================================================================
 def test_basket_runs_during_reconcile_hold():
@@ -1874,6 +1924,7 @@ TESTS = [
     test_tp_with_sibling_algo_query_fails,
     test_tp_with_sibling_fill_order_fails,
     test_tp_with_sibling_fill_order_in_progress,
+    test_ensure_hedge_mode_reads_mode_first,
     test_basket_runs_during_reconcile_hold,
     test_basket_evaluates_risk_halted_symbol_with_lots,
     test_grid_total_stop_across_symbols,

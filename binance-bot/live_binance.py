@@ -802,8 +802,43 @@ class BinanceEngine(EntryOrdersMixin):
             return str(market_info.get("symbol") or market.get("id") or raw).upper()
         return str(raw).upper() if raw else raw
 
+    def _read_hedge_mode(self):
+        """True = hedge, False = one-way, None = khong doc duoc.
+        GET /fapi/v1/positionSide/dual (weight 30, chi goi luc khoi dong)."""
+        try:
+            raw = getattr(self.ex, "fapiPrivateGetPositionSideDual", None)
+            if raw is not None:
+                row = self._private_call("private:account", raw, {},
+                                         _weight=30) or {}
+                value = row.get("dualSidePosition")
+            else:
+                row = self._private_call("private:account",
+                                         self.ex.fetch_position_mode,
+                                         _weight=30) or {}
+                value = row.get("hedged")
+        except binance_safety.BinanceSafetyStop:
+            raise
+        except Exception as e:
+            self.log("WARNING khong doc duoc position mode: %s"
+                     % binance_safety.redact_body(e))
+            return None
+        if isinstance(value, str):
+            value = value.strip().lower()
+            return True if value == "true" else (
+                False if value == "false" else None)
+        return value if isinstance(value, bool) else None
+
     def _ensure_hedge_mode(self):
-        """Bat hedge (dual-side) mode cho tai khoan. Can cho grid 2 chieu."""
+        """Dam bao tai khoan o hedge (dual-side) mode. Can cho grid 2 chieu.
+
+        DOC mode truoc: da hedge -> khong gui lenh doi. Binance kiem tra lenh
+        cho/vi the TRUOC khi kiem tra mode, nen POST doi mode khi con SL/TP
+        tren san tra -4067/-4068 (khong phai -4059 'No need to change') ->
+        truoc day bot khong khoi dong duoc du tai khoan da o hedge."""
+        mode = self._read_hedge_mode()
+        if mode is True:
+            self.log("Binance position mode: da o HEDGE (dual-side), OK")
+            return
         try:
             self._private_call(
                 "private:account",
@@ -819,11 +854,16 @@ class BinanceEngine(EntryOrdersMixin):
             if "-4059" in msg or "No need to change position side" in msg:
                 self.log("Binance position mode: da o HEDGE tu truoc, OK")
                 return
+            if mode is None:
+                raise RuntimeError(
+                    "Khong xac dinh duoc position mode (doc loi, bat hedge "
+                    "loi: %s). Kiem tra API key/ket noi roi chay lai - KHONG "
+                    "can dong lenh SL/TP." % e)
             raise RuntimeError(
-                "Khong bat duoc hedge mode tren Binance: %s. "
-                "Grid 2 chieu BAT BUOC hedge mode (one-way se net long/short "
-                "cung symbol). Dong het vi the/lenh cho tren san roi chay lai."
-                % e)
+                "Tai khoan dang o ONE-WAY mode va khong bat duoc hedge mode: "
+                "%s. Grid 2 chieu BAT BUOC hedge mode (one-way se net "
+                "long/short cung symbol). Binance chi cho doi mode khi khong "
+                "con vi the/lenh cho." % e)
 
     def _filters_for(self, symbol):
         if symbol not in self._filters:
