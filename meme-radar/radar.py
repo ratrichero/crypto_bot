@@ -523,6 +523,11 @@ def main():
                 entry = s["price_now"] or s["price_usd"]
                 if not entry:
                     continue
+                # Dedup: khong mo vi the moi neu da co token nay dang mo
+                # (khac holder co scale-in, scalp chi giu 1 vi the/token)
+                if any(p.get("token") == s["token"] and p.get("remaining", 1.0) > 0
+                       for p in st["paper"]):
+                    continue
                 size = size_for_mcap(s.get("mcap_usd", 0))
                 st["paper"].append({
                     "token": s["token"], "symbol": s["symbol"],
