@@ -716,7 +716,34 @@ class Swapper:
             slippage_bps=sell_slippage,
             max_price_impact_pct=sell_impact,
         )
-        sig = self._sign_and_send(txb64)
+        # Token da roi vi it nhat ~90% luong ban -> coi la tx da land.
+        landed_below = bal_base - amount * 0.9
+
+        def _unconfirmed_result(sig_, nb_, why_):
+            est = int(q.get("otherAmountThreshold", 0)) / 1e9 * sol_usd
+            log(f"LIVE SELL {symbol} {why_} nhung token da di "
+                f"-> tinh theo threshold ~${est:.2f} (CANH BAO)")
+            return {"sold_base": bal_base - nb_, "proceeds_usd": round(est, 4),
+                    "tx": sig_, "dry": False, "unconfirmed": True}
+
+        try:
+            sig = self._sign_and_send(txb64)
+        except Exception as e:
+            # sendTransaction co the timeout SAU khi validator da nhan tx.
+            # Khong duoc coi la that bai (retry se ban trung) -> kiem tra so du.
+            attempts = max(1, int(self.cfg.get("buy_balance_verify_attempts", 4)))
+            delay = float(self.cfg.get("buy_balance_verify_seconds", 2))
+            for i in range(attempts):
+                try:
+                    nb, _ = self.rpc.get_token_balance_base(self.pubkey, mint)
+                    if nb <= landed_below:
+                        return _unconfirmed_result(None, nb, "send exception")
+                except Exception:
+                    pass
+                if i + 1 < attempts:
+                    time.sleep(delay)
+            raise SwapUncertain(
+                f"SELL {symbol} send exception, chua thay token giam: {e}")
         log(f"LIVE SELL {symbol} {frac:.0%} tx={sig[:12]}... cho confirm "
             f"(slippage={sell_slippage}bps, impact<={sell_impact:g}%)")
         confirmed = self._confirm(sig)
@@ -727,12 +754,8 @@ class Swapper:
             except Exception as e:
                 raise SwapUncertain(
                     f"SELL {symbol} timeout, khong doc duoc balance: {e}")
-            if nb < bal_base * 0.9:
-                est = int(q.get("otherAmountThreshold", 0)) / 1e9 * sol_usd
-                log(f"LIVE SELL {symbol} timeout nhung token da di "
-                    f"-> tinh theo threshold ~${est:.2f} (CANH BAO)")
-                return {"sold_base": bal_base - nb, "proceeds_usd": round(est, 4),
-                        "tx": sig, "dry": False, "unconfirmed": True}
+            if nb <= landed_below:
+                return _unconfirmed_result(sig, nb, "timeout")
             raise SwapUncertain(f"sell unconfirmed: {sig[:12]} (se reconcile)")
         try:
             sol_after = self.rpc.get_balance_lamports(self.pubkey)
@@ -1371,11 +1394,25 @@ class LiveTrader:
         # `held` = phan vi the (theo luong mua ban dau) DANG CON tren vi
         # truoc khi ban. decide_exits tra frac theo luong BAN DAU, con
         # execute_sell ban theo ty le so du HIEN TAI -> phai quy doi.
+        # Leg ban tung phan truoc do "khong chac" (tx co the da land):
+        # chua ro so du -> CHAN leg tung phan (tranh ban trung), chi cho
+        # leg ban sach (an toan vi ban toan bo so du thuc).
+        pending_uncertain = (pos.get("uncertain_sell") is not None
+                             and self._resolve_uncertain_sell(pos, now, price)
+                             == "pending")
         held = float(pos.get("remaining", 1.0))
         actions, reason = decide_exits(pos, price, now, self.cfg)
         for frac, why in actions:
+            if (pending_uncertain
+                    and self.balance_fraction(frac, held) < 1.0):
+                self._rollback_leg(pos, frac, why)
+                log(f"{pos['symbol']} hoan {why}: leg ban truoc chua ro ket "
+                    "qua, cho xac minh so du")
+                continue
             if self._sell_leg(pos, frac, why, price, now, held=held):
                 held -= frac
+                if pending_uncertain and pos.get("remaining", 1.0) <= 0.005:
+                    pos.pop("uncertain_sell", None)
         # Chi dong vi the khi thuc su het token (cac leg thanh cong).
         # Neu leg that bai, remaining duoc hoan tac -> poll sau thu lai.
         if pos.get("remaining", 1.0) <= 0.005:
@@ -1408,6 +1445,69 @@ class LiveTrader:
             pos["ts_done"] = False
 
     @staticmethod
+    def _apply_leg_flags(pos, why):
+        """Nguoc cua _rollback_leg (phan flag): leg da thuc su land."""
+        if why == "TP1":
+            pos["tp1"] = True
+        elif why == "TP2":
+            pos["tp2"] = True
+        elif why == "TIME_KEEP":
+            pos["ts_done"] = True
+            pos["ts_keep"] = True
+        elif why == "TIME":
+            pos["ts_done"] = True
+
+    def _resolve_uncertain_sell(self, pos, now, price):
+        """Xac minh leg ban "khong chac" qua so du on-chain.
+
+        Tra ve 'landed' | 'not_landed' | 'pending'. 'pending' khi chua doc
+        duoc so du, hoac so du chua giam nhung tx van co the land (truoc
+        confirm_timeout_seconds ~ blockhash con hieu luc).
+        """
+        u = pos.get("uncertain_sell") or {}
+        if self.dry:
+            pos.pop("uncertain_sell", None)
+            return "not_landed"
+        initial = int(pos.get("tokens_base", 0) or 0)
+        try:
+            actual, _ = self.swapper.rpc.get_token_balance_base(
+                self.swapper.pubkey, pos["token"])
+        except Exception as e:
+            log(f"{pos['symbol']}: xac minh leg {u.get('why')} loi doc so "
+                f"du ({e}) -> cho")
+            return "pending"
+        if initial <= 0:
+            pos.pop("uncertain_sell", None)
+            return "not_landed"
+        held, frac = float(u.get("held", 0)), float(u.get("frac", 0))
+        if actual <= (held - frac * 0.5) * initial:
+            sold = max(0.0, held - actual / initial)
+            pos["remaining"] = min(float(pos.get("remaining", 1.0)),
+                                   actual / initial)
+            self._apply_leg_flags(pos, u.get("why"))
+            px = float(u.get("price") or price or 0)
+            proceeds = sold * initial / (10 ** pos["decimals"]) * px
+            pnl = proceeds - sold * pos["size_usd"]
+            pos["realized_usd"] = pos.get("realized_usd", 0.0) + pnl
+            self._daily()["realized_usd"] = self._daily().get(
+                "realized_usd", 0.0) + pnl
+            pos["legs"].append({"frac": round(sold, 4), "why": u.get("why"),
+                                "proceeds_usd": round(proceeds, 4),
+                                "pnl_usd": round(pnl, 4), "at": int(now),
+                                "tx": None, "estimated": True})
+            pos.pop("uncertain_sell", None)
+            log(f"CANH BAO {pos['symbol']} leg {u.get('why')} DA LAND (xac "
+                f"minh so du): ban {sold:.2%}, uoc tinh +${proceeds:.2f}")
+            return "landed"
+        wait = float(self.cfg.get("confirm_timeout_seconds", 90))
+        if now - float(u.get("at", 0)) >= wait:
+            pos.pop("uncertain_sell", None)
+            log(f"{pos['symbol']} leg {u.get('why')} KHONG land (so du "
+                "khong giam sau timeout) -> cho phep ban lai")
+            return "not_landed"
+        return "pending"
+
+    @staticmethod
     def balance_fraction(frac, held):
         """Quy doi frac (theo luong mua BAN DAU) -> ty le so du HIEN TAI.
 
@@ -1429,14 +1529,24 @@ class LiveTrader:
         bal_frac = self.balance_fraction(frac, held)
         try:
             r = self.swapper.execute_sell(pos["token"], bal_frac, pos["symbol"])
-        except (NoRoute, SwapError) as e:
-            log(f"{pos['symbol']} ban {why} THAT BAI: {e} (se thu lai)")
+        except Exception as e:
+            definite = (isinstance(e, (NoRoute, SwapError))
+                        and not isinstance(e, SwapUncertain))
+            if definite:
+                log(f"{pos['symbol']} ban {why} THAT BAI: {e} (se thu lai)")
+            else:
+                log(f"{pos['symbol']} ban {why} KHONG CHAC ket qua:\n"
+                    + traceback.format_exc())
             self._rollback_leg(pos, frac, why)
-            return False
-        except Exception:
-            log(f"{pos['symbol']} ban {why} LOI khong xac dinh (se thu lai):\n"
-                + traceback.format_exc())
-            self._rollback_leg(pos, frac, why)
+            if not definite and bal_frac < 1.0:
+                # Leg tung phan co the da land: KHONG retry ngay (se ban
+                # trung). Ghi lai de xac minh qua so du on-chain.
+                pos["uncertain_sell"] = {
+                    "why": why, "frac": frac, "held": held, "at": now,
+                    "price": price,
+                }
+                log(f"{pos['symbol']} {why}: cho xac minh so du truoc khi "
+                    "ban tung phan tiep")
             return False
         if r.get("simulated"):
             proceeds = r["proceeds_usd"]

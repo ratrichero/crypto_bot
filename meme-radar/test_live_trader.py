@@ -743,6 +743,140 @@ def test_reconcile_live_airdrops():
               str(tr._occupied_token_count()))
 
 
+
+# ---- sell khong chac: khong ban trung ----
+
+class SellRpc:
+    def __init__(self, balance):
+        self.balance = balance
+
+    def get_token_balance_base(self, owner, mint):
+        return self.balance, 6
+
+    def get_balance_lamports(self, owner):
+        return 10 * 10 ** 9
+
+
+class SellJup(FakeJup):
+    def swap_tx(self, quote, user_pubkey, priority_fee):
+        return "TX"
+
+
+def _swapper_send_fails(rpc, land):
+    cfg = dict(lt.DEFAULTS, mode="live", buy_balance_verify_attempts=2,
+               buy_balance_verify_seconds=0)
+    sw = lt.Swapper(rpc, SellJup(), None, cfg, dry_run=False)
+    sw.pubkey = "PUB"
+
+    def boom(_tx):
+        if land:
+            rpc.balance -= int(rpc.balance * 0.5)
+        raise RuntimeError("sendTransaction timeout")
+    sw._sign_and_send = boom
+    return sw
+
+
+def test_execute_sell_send_exception():
+    print("== execute_sell: send exception -> xac minh so du ==")
+    rpc = SellRpc(1_000_000)
+    r = _swapper_send_fails(rpc, land=True).execute_sell("MINT", 0.5, "TST")
+    check("tx da land -> tra ket qua unconfirmed",
+          r.get("unconfirmed") is True and r["sold_base"] == 500_000, str(r))
+    rpc = SellRpc(1_000_000)
+    try:
+        _swapper_send_fails(rpc, land=False).execute_sell("MINT", 0.5, "TST")
+        check("phai SwapUncertain", False)
+    except lt.SwapUncertain:
+        check("chua thay token giam -> SwapUncertain", True)
+
+
+class UncertainWallet:
+    """Swapper + rpc gia cho trader live: dieu khien tung lan ban."""
+
+    def __init__(self, balance, modes):
+        self.balance = balance
+        self.modes = list(modes)   # moi lan sell: ok | landed_unc | unc
+        self.calls = []
+        self.rpc = self
+        self.pubkey = "PUB"
+
+    def get_token_balance_base(self, owner, mint):
+        return self.balance, 6
+
+    def get_balance_lamports(self, owner):
+        return 10 * 10 ** 9
+
+    def execute_sell(self, mint, frac, symbol="?"):
+        self.calls.append(round(frac, 4))
+        mode = self.modes.pop(0) if self.modes else "ok"
+        amount = self.balance if frac >= 0.999 else int(self.balance * frac)
+        if mode in ("ok", "landed_unc"):
+            self.balance -= amount
+        if mode != "ok":
+            raise lt.SwapUncertain("sell unconfirmed (test)")
+        return {"sold_base": amount, "proceeds_usd": amount / 1e6 * 1.5,
+                "tx": "sig", "dry": False}
+
+
+def _live_wallet_trader(tmpd, price, wallet):
+    tr, jup = _dry_trader(tmpd, {"MINT": price})
+    tr.dry = False
+    tr.swapper = wallet
+    return tr, jup
+
+
+def test_uncertain_partial_landed_no_double_sell():
+    print("== TP1 khong chac nhung da land -> khong ban TP1 lan 2 ==")
+    with isolated() as tmpd:
+        init = 10_000_000
+        w = UncertainWallet(init, ["landed_unc"])
+        tr, _ = _live_wallet_trader(tmpd, 1.5, w)
+        pos = mkpos(entry=1.0, opened_at=900)
+        pos["price_poll_at"] = 0
+        tr.positions = [pos]
+        tr.manage_one(pos, 1000)
+        check("ghi uncertain_sell", pos.get("uncertain_sell") is not None)
+        tr.manage_one(pos, 1030)   # poll sau: xac minh so du -> landed
+        check("chi ban 1 lan", w.calls == [0.3334], str(w.calls))
+        check("tp1 da bat lai", pos["tp1"] is True)
+        check("so du con 2/3", abs(w.balance / init - 0.6666) < 1e-3,
+              str(w.balance / init))
+        check("remaining khop so du", abs(pos["remaining"] - w.balance / init) < 1e-3)
+        check("leg uoc tinh", pos["legs"] and pos["legs"][-1].get("estimated"))
+
+
+def test_uncertain_partial_not_landed_waits_then_retries():
+    print("== TP1 khong chac, chua land: cho het timeout roi moi ban lai ==")
+    with isolated() as tmpd:
+        init = 10_000_000
+        w = UncertainWallet(init, ["unc"])
+        tr, _ = _live_wallet_trader(tmpd, 1.5, w)
+        pos = mkpos(entry=1.0, opened_at=900)
+        pos["price_poll_at"] = 0
+        tr.positions = [pos]
+        tr.manage_one(pos, 1000)
+        tr.manage_one(pos, 1030)   # < 90s: pending -> khong ban
+        check("trong 90s khong ban lai", w.calls == [0.3334], str(w.calls))
+        tr.manage_one(pos, 1100)   # > 90s: not landed -> ban lai
+        check("sau timeout ban lai TP1", w.calls == [0.3334, 0.3334], str(w.calls))
+        check("so du con 2/3", abs(w.balance / init - 0.6666) < 1e-3)
+
+
+def test_uncertain_pending_allows_full_sl():
+    print("== dang cho xac minh nhung cham SL -> van ban sach ==")
+    with isolated() as tmpd:
+        w = UncertainWallet(10_000_000, ["unc"])
+        tr, jup = _live_wallet_trader(tmpd, 1.5, w)
+        pos = mkpos(entry=1.0, opened_at=900)
+        pos["price_poll_at"] = 0
+        tr.positions = [pos]
+        tr.manage_one(pos, 1000)
+        jup.price_map["MINT"] = 0.7    # -30% -> SL
+        closed = tr.manage_one(pos, 1030)
+        check("SL ban 100% so du", w.calls[-1] == 1.0, str(w.calls))
+        check("dong vi the", closed is True and w.balance == 0)
+
+
 if __name__ == "__main__":
     test_exit_tp_ladder()
     test_exit_sl()
@@ -775,5 +909,9 @@ if __name__ == "__main__":
     test_rpc_error_redacted()
     test_capacity_ignores_airdrops()
     test_reconcile_live_airdrops()
+    test_execute_sell_send_exception()
+    test_uncertain_partial_landed_no_double_sell()
+    test_uncertain_partial_not_landed_waits_then_retries()
+    test_uncertain_pending_allows_full_sl()
     print(f"\n{PASS} pass, {FAIL} fail")
     sys.exit(1 if FAIL else 0)
