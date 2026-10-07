@@ -703,6 +703,10 @@ Chi tiết xem [`deploy/README.md`](../deploy/README.md).
 - `git up --branch X`: checkout sang nhánh X rồi deploy. Từ đó `git up` theo nhánh
   đang checkout, không ghi file nào. Chỉ đổi sang nhánh đã có `deploy/` (`main`
   hiện chưa có).
+- `ENV_FILE_<APP>` nhận nhiều file, file trước ưu tiên (ví dụ live trader:
+  `meme-radar/.env .env`). Doctor so python/EnvironmentFile với systemd. Biến trùng
+  tên mà khác giá trị giữa các file → doctor báo lỗi, `git up` không restart app
+  tiền thật.
 - Bỏ `deploy/deploy.local.env` và `DEPLOY_BRANCH`. Cấu hình duy nhất là
   `deploy/deploy.env` (commit trong repo). File cũ còn trên VPS bị bỏ qua, xoá được.
 - **Bỏ mọi câu hỏi y/N** (deploy, đổi nhánh, setup): mặc định là đồng ý. Khoá

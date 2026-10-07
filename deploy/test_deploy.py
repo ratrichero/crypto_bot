@@ -118,6 +118,31 @@ def test_parse_env_and_run_app():
         res = subprocess.run(["bash", os.path.join(HERE, "run-app.sh"), "-",
                               tmp, "/khong/co/python"])
         check("run-app.sh thieu python -> ma 78", res.returncode == 78)
+
+        # nhieu file: file truoc uu tien, file sau bo sung bien con thieu
+        own = os.path.join(tmp, "own.env")      # vd meme-radar/.env
+        root = os.path.join(tmp, "root.env")    # vd .env goc
+        with open(own, "w") as f:
+            f.write("SOLANA_PRIVATE_KEY=vi-rieng\n")
+        with open(root, "w") as f:
+            f.write("SOLANA_PRIVATE_KEY=vi-goc\nJUPITER_API_KEY=jk\n")
+        code2 = ("import os,json;print(json.dumps({k:os.environ.get(k) for k "
+                 "in ['SOLANA_PRIVATE_KEY','JUPITER_API_KEY']}))")
+        base_env = {k: v for k, v in os.environ.items()
+                    if k not in ("SOLANA_PRIVATE_KEY", "JUPITER_API_KEY")}
+        out = subprocess.run(
+            ["bash", os.path.join(HERE, "run-app.sh"), own + ":" + root, tmp,
+             sys.executable, "-c", code2], env=base_env,
+            stdout=subprocess.PIPE, universal_newlines=True).stdout
+        got = json.loads(out)
+        check("run-app.sh nhieu file: file truoc uu tien + bo sung key thieu",
+              got == {"SOLANA_PRIVATE_KEY": "vi-rieng",
+                      "JUPITER_API_KEY": "jk"}, got)
+        res = subprocess.run(["bash", os.path.join(HERE, "run-app.sh"),
+                              own + ":/khong/co.env", tmp, sys.executable,
+                              "-c", ""])
+        check("run-app.sh nhieu file, 1 file thieu -> ma 78",
+              res.returncode == 78, res.returncode)
     finally:
         shutil.rmtree(tmp)
 
@@ -136,7 +161,8 @@ def test_ecosystem():
         with open(os.path.join(dep, "deploy.env"), "a") as f:
             f.write("\nAPPS=muse-dashboard muse-binance\nDASHBOARD_PORT=9999\n"
                     "PYTHON_MUSE_BINANCE=/opt/py/bin/python\n"
-                    "ENV_FILE_MUSE_DASHBOARD=\nDASHBOARD_ARGS=--a 1 \"--b x\"\n")
+                    "ENV_FILE_MUSE_DASHBOARD=\nDASHBOARD_ARGS=--a 1 \"--b x\"\n"
+                    "ENV_FILE_MUSE_BINANCE=binance-bot/.env .env\n")
         with open(os.path.join(dep, "deploy.local.env"), "w") as f:
             f.write("APPS=muse-radar\nDASHBOARD_PORT=1111\n")  # bi bo qua
         out = subprocess.run(
@@ -155,6 +181,9 @@ def test_ecosystem():
         check("dashboard: ENV_FILE rieng rong -> '-' (khong nap)",
               dash["args"][0] == os.path.join(tmp, ".env")
               or dash["args"][0] == "-", dash["args"][0])
+        check("binance: ENV_FILE nhieu file -> noi bang ':' theo thu tu",
+              bn["args"][0] == os.path.join(tmp, "binance-bot", ".env") + ":"
+              + os.path.join(tmp, ".env"), bn["args"][0])
         check("binance: PYTHON rieng tung app",
               bn["args"][2] == "/opt/py/bin/python", bn["args"])
         check("binance: thoat ma 0/78 KHONG restart (chong spam API)",
@@ -514,6 +543,45 @@ def test_systemd_env_check():
                                          live=True, env_file=""), u5)
         check("ENV_FILE=- va systemd khong env -> khong loi", errors == [],
               errors)
+        # systemd nap 2 file; pm2 nap ca 2 -> ok; thieu 1 -> loi
+        u6 = dict(unit, EnvironmentFiles="%s (ignore_errors=no) %s "
+                  "(ignore_errors=no)" % (unit_env, app_env), Environment="")
+        two = dict(app, name="muse-live-trader", env_files=[unit_env, app_env],
+                   env_file=unit_env + " " + app_env)
+        errors, _ = d.check_app_env(two, u6)
+        check("systemd 2 EnvironmentFile, pm2 nap du 2 -> khong loi",
+              errors == [], errors)
+        # vd systemd nap meme-radar/.env + .env (co JUPITER_API_KEY), pm2 chi
+        # nap meme-radar/.env -> loi theo TEN bien thieu
+        with open(app_env, "a") as f:
+            f.write("JUPITER_API_KEY=jk\n")
+        errors, _ = d.check_app_env(dict(two, env_files=[unit_env],
+                                         env_file=unit_env), u6)
+        check("pm2 thieu file co JUPITER_API_KEY -> loi neu ten bien thieu",
+              any("JUPITER_API_KEY" in e for e in errors)
+              and not any("jk" in e.split() for e in errors), errors)
+        # gia tri khac nhau giua cac file -> chan app tien that, khong in gia tri
+        bot_dir = os.path.join(tmp, "bot")
+        os.makedirs(bot_dir)
+        with open(os.path.join(bot_dir, ".env"), "w") as f:
+            f.write("SOLANA_PRIVATE_KEY=vi-rieng\n")
+        with open(app_env, "a") as f:
+            f.write("SOLANA_PRIVATE_KEY=vi-goc\n")
+        with use_root(tmp):
+            lt = {"name": "muse-live-trader", "live": True, "cwd": "bot",
+                  "python": sys.executable, "env_files": [app_env],
+                  "env_file": app_env}
+            errors, _ = d.check_app_env(lt, None)
+            check("SOLANA_PRIVATE_KEY khac nhau (.env goc vs .env cua bot) -> loi",
+                  any("SOLANA_PRIVATE_KEY" in e and "KHAC" in e for e in errors)
+                  and not any("vi-goc" in e or "vi-rieng" in e for e in errors),
+                  errors)
+            with open(os.path.join(bot_dir, ".env"), "w") as f:
+                f.write("SOLANA_PRIVATE_KEY=vi-goc\n")
+            errors, _ = d.check_app_env(lt, None)
+            check("cung gia tri -> khong bao xung dot",
+                  not any("KHAC" in e for e in errors), errors)
+
     finally:
         shutil.rmtree(tmp)
 
@@ -531,6 +599,11 @@ def test_load_apps():
           apps["muse-dashboard"]["env_file"].endswith(".env"))
     a2 = {a["name"]: a for a in d.load_apps(dict(cfg,
                                                   ENV_FILE_MUSE_BINANCE="-"))}
+    a3 = {a["name"]: a for a in d.load_apps(dict(
+        cfg, ENV_FILE_MUSE_BINANCE="binance-bot/.env .env"))}
+    check("ENV_FILE nhieu file -> env_files dung thu tu",
+          [os.path.relpath(x, d.ROOT) for x in a3["muse-binance"]["env_files"]]
+          == ["binance-bot/.env", ".env"], a3["muse-binance"]["env_files"])
     check("ENV_FILE rieng '-' -> khong nap file nao",
           a2["muse-binance"]["env_file"] == ""
           and a2["muse-dashboard"]["env_file"].endswith(".env"))
@@ -806,6 +879,16 @@ def test_migrate_error_blocks_restart():
             rc = d.cmd_deploy(A(), {"APPS": "muse-binance"})
         check("app tien that tu restart, khong hoi y/N",
               restarted == ["muse-binance"] and rc == 0, (restarted, rc))
+        saved_conf = d.env_conflicts
+        try:
+            d.env_conflicts = lambda app: {"SOLANA_PRIVATE_KEY"}
+            del restarted[:]
+            with use_root(tmp):
+                rc = d.cmd_deploy(A(), {"APPS": "muse-binance"})
+            check("app tien that, env xung dot -> KHONG restart, ma loi 1",
+                  restarted == [] and rc == 1, (restarted, rc))
+        finally:
+            d.env_conflicts = saved_conf
         src = open(os.path.join(os.path.dirname(os.path.abspath(d.__file__)),
                                 "deploy.py")).read()
         check("deploy.py khong con cho nao hoi y/N",

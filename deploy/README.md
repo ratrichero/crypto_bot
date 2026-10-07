@@ -133,11 +133,24 @@ file đó thì `git up` bỏ qua và in nhắc xoá. Các giá trị chính:
 
 ```bash
 PYTHON=.venv/bin/python                  # riêng 1 app: PYTHON_MUSE_BINANCE=...
-ENV_FILE=.env                            # riêng 1 app: ENV_FILE_MUSE_LIVE_TRADER=meme-radar/.env
+ENV_FILE=.env                            # riêng 1 app: ENV_FILE_MUSE_LIVE_TRADER=meme-radar/.env .env
 DASHBOARD_PORT=8501
 DASHBOARD_ARGS=--server.baseUrlPath x    # nếu unit systemd cũ có thêm tham số
 APPS=muse-dashboard muse-radar muse-live-trader muse-binance
 ```
+
+**Secret (`ENV_FILE`)**: `deploy.env` chỉ cho biết nạp **file nào**. Secret được
+`run-app.sh` nạp từ các file đó mỗi lần app start.
+- Một app có thể nạp nhiều file, cách nhau dấu cách. File **trước** được ưu tiên:
+  biến đã có thì không bị file sau ghi đè.
+- Ví dụ live trader: `meme-radar/.env .env`. Key ví lấy từ `meme-radar/.env`,
+  còn `JUPITER_API_KEY` (chỉ có ở `.env` gốc) được bổ sung từ file sau.
+- `-` nghĩa là không nạp file nào.
+- Bot tự đọc thêm `.env` trong thư mục của nó, nhưng chỉ lấy những biến chưa có.
+- Nếu cùng một biến có **giá trị khác nhau** giữa các file (kể cả `.env` riêng
+  của bot):
+  - `doctor` báo lỗi và chỉ in tên biến;
+  - `git up` **không restart** app tiền thật, để tránh đổi ví hoặc key ngầm.
 
 Định nghĩa app (thư mục, entry, thư mục import, `kill_timeout`, có phải app tiền thật
 không) nằm trong `deploy/apps.json`. `deploy.py` và `ecosystem.config.js` cùng đọc file này.

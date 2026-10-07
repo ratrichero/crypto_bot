@@ -181,7 +181,10 @@ def load_apps(cfg, only=None):
         s["name"] = n
         s["python"] = abspath(cfg_for(cfg, "PYTHON", n))
         env_file = cfg_for(cfg, "ENV_FILE", n)
-        s["env_file"] = abspath(env_file) if env_file not in ("", "-") else ""
+        # 1 hoac nhieu file (cach nhau dau cach); file truoc duoc uu tien
+        s["env_files"] = ([abspath(x) for x in env_file.split()]
+                          if env_file.strip() not in ("", "-") else [])
+        s["env_file"] = " ".join(s["env_files"])
         apps.append(s)
     return apps
 
@@ -675,8 +678,11 @@ def step_migrate(cfg, dry_run, force=False):
         return "off"
     var = cfg.get("MIGRATE_DB_ENV") or "DATABASE_URL"
     env_file = cfg.get("MIGRATE_ENV_FILE") or cfg.get("ENV_FILE") or ""
-    url = os.environ.get(var) or \
-        (parse_env_file(abspath(env_file)).get(var) if env_file else None)
+    url = os.environ.get(var)
+    for f in ([] if env_file.strip() in ("", "-") else env_file.split()):
+        if url:
+            break
+        url = parse_env_file(abspath(f)).get(var)
     py = abspath(cfg.get("MIGRATE_PYTHON") or cfg.get("PYTHON"))
     url_tag = hashlib.sha256((url or "").encode()).hexdigest()
     status = "skip"
@@ -989,6 +995,14 @@ def cmd_deploy(args, cfg):
             results[name] = "syntax-error"
             failed = True
             continue
+        clash = env_conflicts(a) if a.get("live") else set()
+        if clash:
+            bad("%s: bien %s co gia tri KHAC nhau giua cac file env (%s) -> "
+                "KHONG restart (tranh doi vi/key). Chay git up doctor de xem"
+                % (name, ", ".join(sorted(clash)), " ".join(env_sources(a))))
+            results[name] = "env-conflict"
+            failed = True
+            continue
         if a.get("live"):
             summary = binance_state_summary(a)
             if summary:
@@ -1195,6 +1209,36 @@ def cron_lines(apps):
             if not line.strip().startswith("#") and any(k in line for k in keys)]
 
 
+def own_env_path(app):
+    """.env bot tu doc trong thu muc cua no (neu co), vd meme-radar/.env."""
+    if not app.get("cwd"):
+        return None
+    p = abspath(os.path.join(app["cwd"], ".env"))
+    return p if os.path.exists(p) else None
+
+
+def env_sources(app):
+    files = list(app.get("env_files") or ([app["env_file"]]
+                                          if app.get("env_file") else []))
+    own = own_env_path(app)
+    if own and not any(same_file(own, f) for f in files):
+        files.append(own)
+    return files
+
+
+def env_conflicts(app):
+    """Ten bien co gia tri khac nhau giua cac file app nap (KHONG tra gia tri)."""
+    seen, out = {}, set()
+    for f in env_sources(app):
+        if not os.access(f, os.R_OK):
+            continue
+        for k, v in parse_env_file(f).items():
+            if k in seen and seen[k] != v:
+                out.add(k)
+            seen.setdefault(k, v)
+    return out
+
+
 def check_app_env(app, unit):
     """-> (loi, canh bao) truoc khi chuyen tu systemd sang pm2."""
     errors, warns = [], []
@@ -1214,12 +1258,17 @@ def check_app_env(app, unit):
             errors.append("khong thay python %s" % app["python"])
     if unit:
         files = unit_env_files(unit)
-        if files and app["env_file"] and not any(
-                same_file(f, app["env_file"]) for f in files):
+        mine = app.get("env_files") or ([app["env_file"]]
+                                        if app["env_file"] else [])
+        # bien bi thieu da co kiem tra theo TEN ben duoi; o day chi bat truong
+        # hop pm2 nap file hoan toan khac systemd (gia tri co the khac nhau)
+        if files and mine and not any(same_file(f, m) for f in files
+                                      for m in mine):
             errors.append("systemd nap EnvironmentFile %s nhung pm2 se nap %s "
-                          "-> sua ENV_FILE_%s trong deploy/deploy.env"
-                          % (", ".join(files), app["env_file"], key))
-        elif files and not app["env_file"]:
+                          "-> sua ENV_FILE_%s trong deploy/deploy.env "
+                          "(nhieu file cach nhau dau cach, file truoc uu tien)"
+                          % (", ".join(files), " ".join(mine), key))
+        elif files and not mine:
             errors.append("systemd nap EnvironmentFile %s nhung pm2 khong nap "
                           "file nao -> dat ENV_FILE_%s" % (", ".join(files), key))
         elif not files and not (unit.get("Environment") or "").strip() \
@@ -1227,19 +1276,29 @@ def check_app_env(app, unit):
             msg = ("systemd KHONG cap bien moi truong nao, nhung pm2 se nap %s "
                    "- bien trong file nay se de len gia tri bot tu doc tu .env "
                    "rieng (vd SOLANA_PRIVATE_KEY). Neu dung y thi bo qua, neu "
-                   "khong: dat ENV_FILE_%s=- (khong nap) hoac file .env rieng cua bot"
+                   "khong: dat ENV_FILE_%s=- (khong nap), hoac nhieu file voi "
+                   ".env rieng cua bot dung TRUOC (vd: meme-radar/.env .env)"
                    % (app["env_file"], key))
             (errors if app.get("live") else warns).append(msg)
     have = set()
-    if app["env_file"]:
-        if not os.access(app["env_file"], os.R_OK):
-            errors.append("khong doc duoc ENV_FILE %s" % app["env_file"])
+    conflict = env_conflicts(app)
+    if conflict:
+        msg = ("bien %s co gia tri KHAC nhau giua cac file (%s) - file dung "
+               "truoc trong ENV_FILE thang, .env rieng cua bot (%s) thua. "
+               "Kiem tra dung vi/key truoc khi chuyen"
+               % (", ".join(sorted(conflict)), " ".join(env_sources(app)),
+                  own_env_path(app) or "-"))
+        (errors if app.get("live") else warns).append(msg)
+    for ef in app.get("env_files") or ([app["env_file"]]
+                                       if app["env_file"] else []):
+        if not os.access(ef, os.R_OK):
+            errors.append("khong doc duoc ENV_FILE %s" % ef)
         else:
-            have = set(parse_env_file(app["env_file"]))
-            mode = os.stat(app["env_file"]).st_mode & 0o777
+            have |= set(parse_env_file(ef))
+            mode = os.stat(ef).st_mode & 0o777
             if mode & 0o077:
                 warns.append("ENV_FILE %s quyen %o - nen chmod 600"
-                             % (app["env_file"], mode))
+                             % (ef, mode))
     if unit:
         need, unreadable = unit_env_names(unit)
         missing = sorted(need - have - SYSTEM_ENV)
