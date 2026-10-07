@@ -1222,6 +1222,45 @@ class BinanceEngine:
                      self.state.get("halted_at", "unknown"))
         return True
 
+    def cleanup_orphan_orders(self):
+        """Quet va xoa lenh condition mo coi (khong con vi the tuong ung).
+        Chay dinh ky moi 5 phut. Tra ve so lenh da xoa."""
+        if self.dry_run:
+            return 0
+        try:
+            # Lay vi the thuc te tren san
+            positions = self._private_call(
+                "private:account", self.ex.fetch_positions, _weight=5)
+            live_symbols = set()
+            for p in positions or []:
+                amt = float(p.get("contracts", 0) or 0)
+                if amt != 0:
+                    sym = str(p.get("symbol", "")).split("/")[0] + "USDT"
+                    live_symbols.add(sym.upper())
+            # Lay algo orders
+            algos = self._private_call(
+                "private:trade", self.ex.fapiPrivateGetOpenAlgoOrders)
+            if not isinstance(algos, list):
+                return 0
+            cleaned = 0
+            for o in algos:
+                sym = str(o.get("symbol", "")).upper()
+                if sym not in live_symbols:
+                    aid = o.get("algoId")
+                    try:
+                        self._private_call(
+                            "private:trade",
+                            self.ex.fapiPrivateDeleteAlgoOrder,
+                            {"symbol": sym, "algoId": int(aid)})
+                        self.log(f"CLEANUP: da xoa lenh mo coi {sym} algo={aid}")
+                        cleaned += 1
+                    except Exception as e:
+                        self.log(f"CLEANUP loi khi xoa {aid}: {e}")
+            return cleaned
+        except Exception as e:
+            self.log(f"CLEANUP loi: {e}")
+            return 0
+
     def _reconcile_startup(self):
         """Remove paper ghosts, then validate aggregate exchange quantities."""
         try:

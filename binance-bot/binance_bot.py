@@ -641,6 +641,18 @@ def main():
                             dirty = True
                     except Exception as e:
                         log(f"retry_protection loi: {e}")
+                    # Quet don lenh mo coi moi 5 phut
+                    try:
+                        now_ts = time.time()
+                        last_cleanup = st.get("_last_orphan_cleanup", 0)
+                        if now_ts - last_cleanup >= 300:
+                            cleaned = engine.cleanup_orphan_orders()
+                            st["_last_orphan_cleanup"] = now_ts
+                            if cleaned:
+                                log(f"CLEANUP: da xoa {cleaned} lenh mo coi")
+                                dirty = True
+                    except Exception as e:
+                        log(f"orphan cleanup loi: {e}")
                 # Kiem tra PAUSE file - neu co thi khong mo lenh moi
                 paused = os.path.exists(os.path.join(BASE, "PAUSE"))
                 if not st["halted"] and not paused:
