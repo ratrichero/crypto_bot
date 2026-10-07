@@ -1014,6 +1014,13 @@ class LiveTrader:
                 continue
             signal = known.get(mint)
             if not signal or not self.cfg.get("recover_unmanaged_tokens", True):
+                # Kiem tra: co phai airdrop/dust khong?
+                # Neu token chua tung xuat hien trong signal history -> co the la airdrop
+                # Chi block neu token da tung duoc bot biet (co signal) nhung mat track
+                if not signal:
+                    log(f"INFO token la tren vi (co the airdrop/dust): "
+                        f"{mint[:10]}... amount={amount} -> KHONG block entry")
+                    continue
                 unmanaged.append(mint)
                 continue
             entry = signal.get("price_now") or signal.get("price_usd")
