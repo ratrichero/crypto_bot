@@ -45,6 +45,57 @@ BINANCE_SQL = """INSERT INTO binance_trades
     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s, to_timestamp(%s), %s,%s,%s)
     ON CONFLICT (id) DO NOTHING"""
 
+# Cot phi/nguon gia (binance-bot >= c4a1a17). DB cu duoc ALTER idempotent;
+# ALTER loi -> dung BINANCE_SQL cu (khong mat trade).
+BINANCE_EXT_COLS = ("pnl_gross", "fee_entry", "fee_exit", "fee_estimated",
+                    "estimated", "exit_source")
+BINANCE_MIGRATE = [
+    "ALTER TABLE binance_trades ADD COLUMN IF NOT EXISTS %s %s" % (c, t)
+    for c, t in (("pnl_gross", "DOUBLE PRECISION"),
+                 ("fee_entry", "DOUBLE PRECISION"),
+                 ("fee_exit", "DOUBLE PRECISION"),
+                 ("fee_estimated", "BOOLEAN"), ("estimated", "BOOLEAN"),
+                 ("exit_source", "TEXT"))]
+BINANCE_EXT_SQL = """INSERT INTO binance_trades
+    (id, symbol, side, tag, entry, exit, notional, pnl, reason, closed_at,
+     live, dry, close_ord, pnl_gross, fee_entry, fee_exit, fee_estimated,
+     estimated, exit_source)
+    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s, to_timestamp(%s), %s,%s,%s,
+            %s,%s,%s,%s,%s,%s)
+    ON CONFLICT (id) DO UPDATE SET """ + ", ".join(
+    "%s = COALESCE(binance_trades.%s, EXCLUDED.%s)" % (c, c, c)
+    for c in BINANCE_EXT_COLS)
+_binance_ext = {"ok": False, "retry_at": 0.0}
+
+
+def binance_ext_ready():
+    """ALTER cac cot moi (idempotent); True neu dung duoc insert mo rong.
+    Loi (quyen/DB tam mat) -> insert cot cu, thu lai sau 10 phut."""
+    if not _binance_ext["ok"] and time.time() >= _binance_ext["retry_at"]:
+        try:
+            for sql in BINANCE_MIGRATE:
+                pg.execute(sql)
+            _binance_ext["ok"] = True
+        except Exception as e:
+            print(f"[{ts()}] WARNING migrate binance_trades: {e} "
+                  "-> insert cot cu, thu lai sau 10 phut", flush=True)
+            _binance_ext["retry_at"] = time.time() + 600
+    return _binance_ext["ok"]
+
+
+def binance_row(t, extended):
+    base = (int(t["id"]), t.get("symbol"), t.get("side"), t.get("tag"),
+            t.get("entry"), t.get("exit"),
+            float(t.get("notional", 0) or 0), t.get("pnl"),
+            t.get("reason"), t.get("closed_at"),
+            bool(t.get("live")), bool(t.get("dry")), t.get("close_ord"))
+    if not extended:
+        return base
+    est = t.get("estimated")
+    return base + (t.get("pnl_gross"), t.get("fee_entry"), t.get("fee_exit"),
+                   t.get("fee_estimated"),
+                   None if est is None else bool(est), t.get("exit_source"))
+
 
 def ts():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -144,18 +195,10 @@ def sync_wallets(path, st):
 
 def sync_binance(path, st):
     rows, off = tail_new(path, st.get("binance", 0))
-    vals = []
-    for t in rows:
-        if "id" not in t:
-            continue
-        vals.append((int(t["id"]), t.get("symbol"), t.get("side"), t.get("tag"),
-                     t.get("entry"), t.get("exit"),
-                     float(t.get("notional", 0) or 0), t.get("pnl"),
-                     t.get("reason"), t.get("closed_at"),
-                     bool(t.get("live")), bool(t.get("dry")),
-                     t.get("close_ord")))
+    ext = binance_ext_ready() if rows else False
+    vals = [binance_row(t, ext) for t in rows if "id" in t]
     if vals:
-        pg.executemany(BINANCE_SQL, vals)
+        pg.executemany(BINANCE_EXT_SQL if ext else BINANCE_SQL, vals)
     st["binance"] = off
     return len(vals)
 

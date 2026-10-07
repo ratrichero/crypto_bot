@@ -65,7 +65,20 @@ CREATE TABLE IF NOT EXISTS binance_trades (
     closed_at   TIMESTAMPTZ NOT NULL,
     live        BOOLEAN,                     -- true = tien that
     dry         BOOLEAN,                     -- true = dry-run
-    close_ord   TEXT                         -- order id dong lenh
+    close_ord   TEXT,                        -- order id dong lenh
+    pnl_gross   DOUBLE PRECISION,            -- P&L gop (truoc phi)
+    fee_entry   DOUBLE PRECISION,            -- phi mo (commission userTrades)
+    fee_exit    DOUBLE PRECISION,            -- phi dong (commission userTrades)
+    fee_estimated BOOLEAN,                   -- true = phi uoc tinh fee_rate
+    estimated   BOOLEAN,                     -- true = gia thoat uoc tinh
+    exit_source TEXT                         -- bot | exchange_algo | exchange_detect
 );
+-- DB cu: bo sung cot (idempotent; bot/sync cung tu chay khi khoi dong)
+ALTER TABLE binance_trades ADD COLUMN IF NOT EXISTS pnl_gross DOUBLE PRECISION;
+ALTER TABLE binance_trades ADD COLUMN IF NOT EXISTS fee_entry DOUBLE PRECISION;
+ALTER TABLE binance_trades ADD COLUMN IF NOT EXISTS fee_exit DOUBLE PRECISION;
+ALTER TABLE binance_trades ADD COLUMN IF NOT EXISTS fee_estimated BOOLEAN;
+ALTER TABLE binance_trades ADD COLUMN IF NOT EXISTS estimated BOOLEAN;
+ALTER TABLE binance_trades ADD COLUMN IF NOT EXISTS exit_source TEXT;
 CREATE INDEX IF NOT EXISTS idx_binance_trades_closed ON binance_trades (closed_at);
 CREATE INDEX IF NOT EXISTS idx_binance_trades_tag    ON binance_trades (tag);

@@ -61,6 +61,33 @@ def _mask(s):
     return (s[:3] + "..." + s[-2:]) if len(s) > 6 else "***"
 
 
+# ------------------------------------------------------------ Postgres
+DB_INSERT_SQL = """INSERT INTO binance_trades
+   (id, symbol, side, tag, entry, exit, notional, pnl,
+    reason, closed_at, live, dry, close_ord)
+   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,
+           to_timestamp(%s), %s,%s,%s)
+   ON CONFLICT (id) DO NOTHING"""
+DB_EXT_COLS = ("pnl_gross", "fee_entry", "fee_exit", "fee_estimated",
+               "estimated", "exit_source")
+DB_MIGRATE_SQL = [
+    "ALTER TABLE binance_trades ADD COLUMN IF NOT EXISTS %s %s" % (c, t)
+    for c, t in (("pnl_gross", "DOUBLE PRECISION"),
+                 ("fee_entry", "DOUBLE PRECISION"),
+                 ("fee_exit", "DOUBLE PRECISION"),
+                 ("fee_estimated", "BOOLEAN"), ("estimated", "BOOLEAN"),
+                 ("exit_source", "TEXT"))]
+DB_INSERT_EXT_SQL = """INSERT INTO binance_trades
+   (id, symbol, side, tag, entry, exit, notional, pnl,
+    reason, closed_at, live, dry, close_ord, pnl_gross, fee_entry,
+    fee_exit, fee_estimated, estimated, exit_source)
+   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,
+           to_timestamp(%s), %s,%s,%s, %s,%s,%s,%s,%s,%s)
+   ON CONFLICT (id) DO UPDATE SET """ + ", ".join(
+    "%s = COALESCE(binance_trades.%s, EXCLUDED.%s)" % (c, c, c)
+    for c in DB_EXT_COLS)
+
+
 # ------------------------------------------------------------ contract sizing
 def qty_for(notional, price, step_size, min_qty=0.0, min_notional=0.0):
     """Convert USD notional -> base-asset quantity (round DOWN to stepSize).
@@ -224,6 +251,27 @@ class BinanceEngine:
             self.log("DB warning: khong co DATABASE_URL hoac ket noi that "
                      "bai; chi ghi JSONL")
 
+    def _db_ext_ready(self, cur):
+        """ALTER idempotent cac cot phi/nguon gia; loi -> insert cot cu,
+        thu lai sau 10 phut (khong bao gio lam mat trade)."""
+        if getattr(self, "_db_ext", False):
+            return True
+        if time.time() < getattr(self, "_db_ext_retry_at", 0.0):
+            return False
+        try:
+            for sql in DB_MIGRATE_SQL:
+                cur.execute(sql)
+            self._db_ext = True
+        except Exception as e:
+            self._db_ext_retry_at = time.time() + 600
+            self.log("DB warning: migrate binance_trades that bai: %s "
+                     "-> insert cot cu" % e)
+            try:
+                cur.connection.rollback()
+            except Exception:
+                pass
+        return getattr(self, "_db_ext", False)
+
     def _db_insert_trade(self, rec):
         """Ghi 1 trade da dong truc tiep vao Postgres.
 
@@ -234,20 +282,21 @@ class BinanceEngine:
             conn = self._db_connect()
             if conn is None:
                 return False
+            base = (rec["id"], rec["symbol"], rec["side"], rec["tag"],
+                    rec["entry"], rec["exit"], rec["notional"], rec["pnl"],
+                    rec["reason"], rec["closed_at"],
+                    rec.get("live", True), rec.get("dry", False),
+                    rec.get("close_ord"))
             with conn.cursor() as cur:
-                cur.execute(
-                    """INSERT INTO binance_trades
-                       (id, symbol, side, tag, entry, exit, notional, pnl,
-                        reason, closed_at, live, dry, close_ord)
-                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                               to_timestamp(%s), %s,%s,%s)
-                       ON CONFLICT (id) DO NOTHING""",
-                    (rec["id"], rec["symbol"], rec["side"], rec["tag"],
-                     rec["entry"], rec["exit"], rec["notional"], rec["pnl"],
-                     rec["reason"], rec["closed_at"],
-                     rec.get("live", True), rec.get("dry", False),
-                     rec.get("close_ord")),
-                )
+                if self._db_ext_ready(cur):
+                    est = rec.get("estimated")
+                    cur.execute(DB_INSERT_EXT_SQL, base + (
+                        rec.get("pnl_gross"), rec.get("fee_entry"),
+                        rec.get("fee_exit"), rec.get("fee_estimated"),
+                        None if est is None else bool(est),
+                        rec.get("exit_source")))
+                else:
+                    cur.execute(DB_INSERT_SQL, base)
             self._db_ok = True
             return True
         except Exception as e:
