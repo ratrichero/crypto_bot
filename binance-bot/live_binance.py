@@ -1018,7 +1018,7 @@ class BinanceEngine:
         if self.dry_run:
             return []
         now = time.time()
-        if now - getattr(self, "_last_detect_closed", 0) < 60:
+        if now - getattr(self, "_last_detect_closed", 0) < 10:
             return []
         self._last_detect_closed = now
         try:
