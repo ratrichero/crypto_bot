@@ -1026,13 +1026,25 @@ class BinanceEngine:
 
         Chi xu ly truong hop san ve ~0 hoan toan; dong mot phan thi de
         reconcile_positions halt nhu cu.
+
+        Fail-closed: mot lan doc positionRisk rong/tre (API glitch, lenh vua
+        khop chua hien) KHONG du de xoa lot. Lot phai (1) da mo it nhat
+        ``exchange_close_min_age_seconds`` va (2) bi thay ~0 o hai lan quet
+        lien tiep cach nhau >= ``exchange_close_confirm_seconds``.
         """
         if self.dry_run:
             return []
         now = time.time()
-        if now - getattr(self, "_last_detect_closed", 0) < 10:
+        interval = float(self.cfg.get("exchange_close_check_seconds", 10))
+        if now - getattr(self, "_last_detect_closed", 0) < interval:
             return []
         self._last_detect_closed = now
+        min_age = float(self.cfg.get("exchange_close_min_age_seconds", 60))
+        confirm_after = float(self.cfg.get("exchange_close_confirm_seconds",
+                                           interval))
+        pending = getattr(self, "_exchange_close_pending", None)
+        if pending is None:
+            pending = self._exchange_close_pending = {}
         try:
             rows = self._private_call("private:account",
                                       self.ex.fetch_positions, _weight=5)
@@ -1043,6 +1055,9 @@ class BinanceEngine:
                      "positions: %s" % binance_safety.redact_body(exc))
             return []
         exchange = self._aggregate_positions(rows)
+        live_ids = {p.get("id") for p in self.state.get("positions", [])}
+        for stale in [i for i in pending if i not in live_ids]:
+            pending.pop(stale, None)
         marks = mark_prices or {}
         recs = []
         for pos in list(self.state.get("positions", [])):
@@ -1057,10 +1072,25 @@ class BinanceEngine:
                 step = 0.0
             tolerance = max(step * 1.1, abs(local_qty) * 0.001, 1e-10)
             if abs(local_qty - actual) <= tolerance:
+                pending.pop(pos.get("id"), None)
                 continue  # khop voi san
             if actual > tolerance:
+                pending.pop(pos.get("id"), None)
                 continue  # dong mot phan -> de reconcile_positions halt nhu cu
-            # San ve ~0 trong khi state van co -> da bi dong ngoai
+            # San ve ~0 trong khi state van co -> co the da bi dong ngoai.
+            opened_at = float(pos.get("opened_at", 0) or 0)
+            if opened_at and now - opened_at < min_age:
+                pending.pop(pos.get("id"), None)
+                continue  # lot vua mo: positionRisk co the chua cap nhat
+            first_seen = pending.get(pos.get("id"))
+            if first_seen is None:
+                pending[pos.get("id")] = now
+                self.log("WARNING EXCHANGE_CLOSE? #%s %s %s: san bao ~0, "
+                         "cho xac nhan lan 2" % (pos.get("id"), key[0], key[1]))
+                continue
+            if now - first_seen < confirm_after:
+                continue
+            pending.pop(pos.get("id"), None)
             symbol, side = key
             entry = float(pos.get("entry", 0) or 0)
             tp = pos.get("tp")

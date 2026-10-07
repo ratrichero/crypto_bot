@@ -282,10 +282,65 @@ def test_cancel_absent_guard_compares_aggregate():
           rec is not None, (st.get("halt_reason"), eng.logs[-4:]))
 
 
+# ===================================================================
+# 2. detect_exchange_closed: fail-closed confirmation
+# ===================================================================
+def detect_round(eng, marks=None, advance=11):
+    CLOCK.sleep(advance)
+    return eng.detect_exchange_closed(marks or {"BTCUSDT": 60000})
+
+
+def manual_close(fake, side, qty, price):
+    fake.prices["BTCUSDT"] = price
+    ps = "LONG" if side == "long" else "SHORT"
+    fake._fill("BTCUSDT", "sell" if side == "long" else "buy", ps, qty, price)
+
+
+def test_detect_ignores_single_empty_read():
+    fake = FakeBinance()
+    eng, st = make_engine(fake, protection=False)
+    open_lot(eng, "long", 60000, level="b1")
+    CLOCK.sleep(300)
+    fake.positions_override = []          # one glitchy empty positionRisk
+    first = detect_round(eng)
+    fake.positions_override = None        # next read is healthy again
+    second = detect_round(eng)
+    third = detect_round(eng)
+    check("detect: 1 lan doc rong khong xoa lot",
+          first == [] and second == [] and third == [])
+    check("detect: lot van con trong state", len(st["positions"]) == 1)
+
+
+def test_detect_skips_fresh_lot():
+    fake = FakeBinance()
+    eng, st = make_engine(fake, protection=False)
+    open_lot(eng, "long", 60000, level="b1")
+    fake.positions_override = []          # positionRisk lag right after fill
+    recs = detect_round(eng, advance=5) + detect_round(eng, advance=11)
+    check("detect: lot moi mo (<60s) khong bi coi la da dong", recs == [])
+    check("detect: lot moi mo van con", len(st["positions"]) == 1)
+
+
+def test_detect_confirms_real_external_close():
+    fake = FakeBinance()
+    eng, st = make_engine(fake, protection=False)
+    lot = open_lot(eng, "long", 60000, level="b1")
+    CLOCK.sleep(300)
+    manual_close(fake, "long", lot["qty"], 60450)
+    first = detect_round(eng)
+    second = detect_round(eng)
+    check("detect: lan quet 1 chi danh dau cho xac nhan", first == [])
+    check("detect: lan quet 2 ghi nhan dong", len(second) == 1, second)
+    check("detect: lot bi xoa sau xac nhan", st["positions"] == [])
+
+
 TESTS = [
     test_close_one_of_many_grid_lots,
     test_close_detects_real_partial,
     test_cancel_absent_guard_compares_aggregate,
+    test_detect_ignores_single_empty_read,
+    test_detect_skips_fresh_lot,
+    test_detect_confirms_real_external_close,
 ]
 
 
