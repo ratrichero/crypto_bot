@@ -55,6 +55,12 @@ PARAMS: Tuple[Param, ...] = (
     # ---- Grid
     Param("grid.max_positions", "int", 3, "Grid",
           "Số lot grid tối đa (mọi symbol)", 1, 40),
+    Param("grid.max_same_side", "int", 2, "Grid",
+          "Số lot grid cùng chiều tối đa (mọi symbol, 0 = tắt)", 0, 40,
+          help="Altcoin chạy theo BTC: nhiều lot long trên nhiều coin = một "
+               "lệnh cược lớn vào chiều tăng. Đạt trần thì không mở thêm lot "
+               "cùng chiều ở bất kỳ symbol nào (lệnh chờ LIMIT tính như lot). "
+               "Vốn $1k: 2."),
     Param("grid.max_symbols", "int", 0, "Grid",
           "Số symbol grid cùng lúc (0 = không giới hạn)", 0, 30,
           help="Đạt giới hạn thì symbol chưa có lot không được mở grid."),

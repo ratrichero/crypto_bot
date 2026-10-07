@@ -349,8 +349,166 @@ finally:
     bb.TREND, bb.SCANNER, bb.log = saved_tr, saved_sc, saved_log
     bb.SYMBOLS[:] = saved_sym
 
+# ------------------------------------------- B: tran lot cung chieu
+import range_grid  # noqa: E402
+
+
+def lot(i, sym, side, level="b1"):
+    return {"id": i, "symbol": sym, "side": side, "entry": 100.0, "qty": 10,
+            "notional": 1000.0, "tag": "grid", "level": level}
+
+
+saved = copy.deepcopy(bb.CFG)
+saved_tr, saved_sc, saved_log = bb.TREND, bb.SCANNER, bb.log
+saved_sym = list(bb.SYMBOLS)
+blog = []
+try:
+    bb.log = blog.append
+    bb.SCANNER, bb.TREND = None, None
+    bb.CFG.update(order_margin_usdt=100, leverage=10, max_total_positions=10)
+    bb.CFG["grid"].update(engine="classic", levels_each_side=2,
+                          max_positions=5, max_entries_per_cycle=1,
+                          max_symbols=0, range_steps=6, step_pct=0.01,
+                          max_same_side=2)
+    st = gstate("ETHUSDT")
+    st["positions"] = [lot(1, "BTCUSDT", "long"), lot(2, "SOLUSDT", "long")]
+    eng = FakeEngine(st)
+    bb.manage_grid(eng, st, "ETHUSDT", 98.9)
+    check("B classic: da co 2 long (coin khac) -> khong mo long thu 3",
+          eng.opens == [], eng.opens)
+    check("B classic: log 1 dong chung (moi symbol), co tran",
+          any("(moi symbol)" in m and "trần 2" in m for m in blog), blog)
+    st["grids"]["ETHUSDT"]["anchor"] = 100.0
+    bb.manage_grid(eng, st, "ETHUSDT", 101.1)
+    check("B classic: chieu short van mo duoc",
+          [p["side"] for p in eng.opens] == ["short"], eng.opens)
+    bb.CFG["grid"]["max_same_side"] = 0
+    st2 = gstate("ETHUSDT")
+    st2["positions"] = [lot(1, "BTCUSDT", "long"),
+                        lot(2, "SOLUSDT", "long")]
+    eng2 = FakeEngine(st2)
+    bb.manage_grid(eng2, st2, "ETHUSDT", 98.9)
+    check("B: max_same_side=0 -> tat tran", len(eng2.opens) == 1)
+    bb.CFG["grid"]["max_same_side"] = 2
+    st3 = {"positions": [lot(1, "BTCUSDT", "long")],
+           "entry_orders": [{"symbol": "SOLUSDT", "side": "long",
+                             "tag": "grid", "status": "NEW"},
+                            {"symbol": "XRPUSDT", "side": "long",
+                             "tag": "grid", "status": "CANCELED"}]}
+    check("B: lenh cho dang song tinh nhu lot, lenh da huy khong tinh",
+          bb.grid_side_count(st3, "long") == 2
+          and bb.grid_side_cap_block(st3, "long")
+          and bb.grid_side_cap_block(st3, "short") is None)
+    check("B: scalp khong tinh vao tran grid",
+          bb.grid_side_count({"positions": [dict(lot(5, "A", "long"),
+                                                 tag="scalp")]},
+                             "long") == 0)
+    # range market
+    NOWB = [4_000_000.0]
+    bb.SYMBOLS[:] = ["BTCUSDT", "ETHUSDT"]
+    bb.CFG["grid"].update(engine="range", entry_mode="market", step_min=0.01,
+                          step_max=0.01, tp_pct=0.01, sl_pct=0.03,
+                          max_lots_per_symbol=2, range_min_levels=1,
+                          boundary_sl_buffer=0.005, break_buffer=0.003,
+                          trend_exit_adx=25.0, max_positions=5)
+    bb.CFG["scanner"].update(enabled=True, top_k=2, rescan_minutes=15)
+    bb.SCANNER = sc.ScannerRunner(bb.CFG, lambda *a: [],
+                                  clock=lambda: NOWB[0])
+    bb.SCANNER.results["ETHUSDT"] = {
+        "symbol": "ETHUSDT", "ts": NOWB[0], "passed": True, "score": 70,
+        "reasons": [], "metrics": {"range_low": 95.0, "range_high": 105.0,
+                                   "adx_1h": 15, "atr15_pct": None,
+                                   "range_pct": 105 / 95 - 1}}
+    allowed = bb.range_allowed_symbols()
+    sr = {"positions": [lot(1, "BTCUSDT", "long", "rb1"),
+                        lot(2, "BTCUSDT", "long", "rb2")],
+          "grids": {}, "regimes": {}}
+    er = FakeEngine(sr)
+    bb.manage_range_grid(er, sr, "ETHUSDT", 98.9, allowed)
+    check("B range market: dat tran long -> khong mo long", er.opens == [],
+          er.opens)
+    bb.manage_range_grid(er, sr, "ETHUSDT", 101.1, allowed)
+    check("B range market: short van mo",
+          [p["side"] for p in er.opens] == ["short"], er.opens)
+finally:
+    bb.CFG.clear()
+    bb.CFG.update(saved)
+    bb.TREND, bb.SCANNER, bb.log = saved_tr, saved_sc, saved_log
+    bb.SYMBOLS[:] = saved_sym
+
+# plan_slots side_room (thuan)
+rows = [{"symbol": "A", "score": 80, "lots": 0, "pending": set(),
+         "candidates": [{"key": "rb1", "side": "long", "dist": 0.01},
+                        {"key": "rs1", "side": "short", "dist": 0.011},
+                        {"key": "rb2", "side": "long", "dist": 0.02}]},
+        {"symbol": "B", "score": 70, "lots": 0, "pending": set(),
+         "candidates": [{"key": "rb1", "side": "long", "dist": 0.005}]}]
+g = {"max_positions": 10, "max_lots_per_symbol": 10, "max_symbols": 0}
+ch = range_grid.plan_slots(rows, g, 0, side_room={"long": 1, "short": 0})
+check("plan_slots: side_room long=1 short=0 -> chi 1 long gan gia nhat",
+      ch == [("B", "rb1")], ch)
+ch = range_grid.plan_slots(rows, g, 0)
+check("plan_slots: khong side_room -> hanh vi cu", len(ch) == 4, ch)
+
+# range limit: tran cung chieu khi dat lenh cho
+saved = copy.deepcopy(bb.CFG)
+saved_tr, saved_sc, saved_log = bb.TREND, bb.SCANNER, bb.log
+saved_sym = list(bb.SYMBOLS)
+try:
+    bb.log = lambda m: None
+    NOWL = [5_000_000.0]
+    bb.SYMBOLS[:] = ["BTCUSDT", "ETHUSDT"]
+    bb.CFG.update(order_margin_usdt=100, leverage=10, max_total_positions=10)
+    bb.CFG["grid"].update(engine="range", entry_mode="limit", step_pct=0.01,
+                          step_min=0.01, step_max=0.01, tp_pct=0.01,
+                          sl_pct=0.03, levels_each_side=3, max_positions=6,
+                          max_lots_per_symbol=6, max_symbols=0,
+                          max_new_orders_per_cycle=6, range_min_levels=1,
+                          limit_min_gap_pct=0.0005, entry_ttl_minutes=60,
+                          partial_fill_timeout_seconds=60, max_same_side=2)
+    bb.CFG["scanner"].update(enabled=True, top_k=2, rescan_minutes=15)
+    bb.SCANNER = sc.ScannerRunner(bb.CFG, lambda *a: [],
+                                  clock=lambda: NOWL[0])
+    for s_ in ("BTCUSDT", "ETHUSDT"):
+        bb.SCANNER.results[s_] = {
+            "symbol": s_, "ts": NOWL[0], "passed": True, "score": 70,
+            "reasons": [], "metrics": {"range_low": 95.0, "range_high": 105.0,
+                                       "adx_1h": 15, "atr15_pct": None,
+                                       "range_pct": 105 / 95 - 1}}
+    bb.TREND = None
+    lst = {"equity": 10000.0, "mark_equity": 10000.0, "positions": [],
+           "grids": {}, "_pid": 0,
+           "stats": {"trades": 0, "wins": 0, "losses": 0, "fees": 0.0}}
+    leng = live_binance.BinanceEngine(bb.CFG, lst, dry_run=True,
+                                      log=lambda m: None)
+    allowed = bb.range_allowed_symbols()
+    prices = {"BTCUSDT": 100.0, "ETHUSDT": 100.0}
+    for s_ in prices:
+        bb.manage_range_grid(leng, lst, s_, 100.0, allowed)
+    for _ in range(3):
+        bb.manage_range_limits(leng, lst, prices, allowed)
+    sides = [o["side"] for o in lst["entry_orders"]]
+    check("B range limit: lenh cho <= 2 long + <= 2 short (2 symbol)",
+          sides.count("long") == 2 and sides.count("short") == 2, sides)
+    # 1 lot long da khop -> chi con 1 slot long cho lenh cho
+    lst["positions"].append(dict(lot(900, "BTCUSDT", "long", "rb3")))
+    bb.manage_range_limits(leng, lst, prices, allowed)
+    leng.sync_entry_orders(prices)
+    sides = [o["side"] for o in lst["entry_orders"]]
+    check("B range limit: lot long dang mo tinh vao tran -> huy bot lenh cho",
+          sides.count("long") == 1, sides)
+finally:
+    bb.CFG.clear()
+    bb.CFG.update(saved)
+    bb.TREND, bb.SCANNER, bb.log = saved_tr, saved_sc, saved_log
+    bb.SYMBOLS[:] = saved_sym
+
 # ----------------------------------------------------------- config
 flat = bot_config.defaults()
+check("config B: grid.max_same_side mac dinh 2, example khop",
+      flat["grid.max_same_side"] == 2
+      and json.load(open(os.path.join(BASE, "config.example.json")))[
+          "grid"]["max_same_side"] == 2)
 clean, errs = bot_config.validate(flat)
 check("config: mac dinh hop le + co nhom Xu hướng",
       not errs and "Xu hướng" in bot_config.GROUPS

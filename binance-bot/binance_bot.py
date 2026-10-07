@@ -581,20 +581,50 @@ def grid_trend_block(symbol, side):
     return TREND.blocks(symbol, side)
 
 
-def grid_side_allowed(st, symbol, side):
-    """Duoc mo lot grid `side` moi tren `symbol`? Log 1 lan moi khi ly do
-    chan doi (khong spam moi 0.5s)."""
-    why = grid_trend_block(symbol, side)
-    key = (symbol, side)
+def grid_side_count(st, side):
+    """So lot grid + lenh entry grid dang cho (G5) cung chieu, moi symbol."""
+    lots = sum(1 for p in _grid_lots(st) if p.get("side") == side)
+    pend = sum(1 for o in _pending_entries(st)
+               if o.get("side") == side and o.get("tag", "grid") == "grid"
+               and o.get("status") not in ENTRY_TERMINAL)
+    return lots + pend
+
+
+def grid_side_cap_block(st, side):
+    """Tran lot grid cung chieu tren TOAN tai khoan (grid.max_same_side,
+    0 = tat). Altcoin tuong quan cao: 9 lot long tren 8 coin = 1 lenh cuoc
+    lon vao chieu tang -> gioi han so lot cung chieu."""
+    cap = int(CFG["grid"].get("max_same_side") or 0)
+    if cap <= 0:
+        return None
+    n = grid_side_count(st, side)
+    if n >= cap:
+        return "trần %d lot grid %s cùng lúc (đang có %d, gồm lệnh chờ)" % (
+            cap, side.upper(), n)
+    return None
+
+
+def _note_block(key, label, side, why):
+    """Log 1 lan moi khi ly do chan doi (khong spam moi 0.5s). True = chan."""
     if why:
         short = why.split(" (")[0]
         if _GRID_BLOCK_LOG.get(key) != short:
-            log("GRID %s khong mo %s: %s" % (symbol, side.upper(), why))
+            log("GRID %s khong mo %s: %s" % (label, side.upper(), why))
             _GRID_BLOCK_LOG[key] = short
-        return False
+        return True
     if _GRID_BLOCK_LOG.pop(key, None) is not None:
-        log("GRID %s mo lai phia %s" % (symbol, side.upper()))
-    return True
+        log("GRID %s mo lai phia %s" % (label, side.upper()))
+    return False
+
+
+def grid_side_allowed(st, symbol, side, cap=True):
+    """Duoc mo lot grid `side` moi tren `symbol`? cap=False: bo qua tran
+    cung chieu (range limit tu phan slot theo chieu trong plan_slots)."""
+    if cap and _note_block(("*", side), "(moi symbol)", side,
+                           grid_side_cap_block(st, side)):
+        return False
+    return not _note_block((symbol, side), symbol, side,
+                           grid_trend_block(symbol, side))
 
 
 def manage_grid(engine, st, symbol, price):
@@ -934,7 +964,7 @@ def manage_range_limits(engine, st, prices, allowed):
                               "price": o["price"],
                               "dist": abs(o["price"] / px - 1)})
         for sd in ("long", "short"):
-            if not grid_side_allowed(st, symbol, sd):
+            if not grid_side_allowed(st, symbol, sd, cap=False):
                 trend_blocked[(symbol, sd)] = grid_trend_block(symbol, sd)
         cands = [c for c in cands
                  if (symbol, c["side"]) not in trend_blocked]
@@ -944,7 +974,19 @@ def manage_range_limits(engine, st, prices, allowed):
                      "pending": {o.get("level") for o in mine}})
         eligible.add(symbol)
     others = sum(1 for o in pend if o["symbol"] not in eligible)
-    chosen = set(range_grid.plan_slots(rows, g, len(_grid_lots(st)) + others))
+    side_room = None
+    cap = int(g.get("max_same_side") or 0)
+    if cap > 0:
+        # Tran cung chieu (B): lot + lenh cho ngoai danh sach eligible tinh
+        # truoc; lenh cho cua symbol eligible nam trong candidates.
+        side_room = {}
+        for sd in ("long", "short"):
+            used = (sum(1 for p in _grid_lots(st) if p.get("side") == sd)
+                    + sum(1 for o in pend if o["symbol"] not in eligible
+                          and o.get("side") == sd))
+            side_room[sd] = max(0, cap - used)
+    chosen = set(range_grid.plan_slots(rows, g, len(_grid_lots(st)) + others,
+                                       side_room=side_room))
     changed = False
     for o in pend:
         if o["symbol"] not in eligible:
@@ -953,7 +995,8 @@ def manage_range_limits(engine, st, prices, allowed):
             why = "lọc xu hướng: %s" % trend_blocked[(o["symbol"],
                                                       o.get("side"))]
         elif (o["symbol"], o.get("level")) not in chosen:
-            why = "hết slot / ưu tiên tầng gần giá hơn"
+            why = ("hết slot (tổng / mỗi symbol / cùng chiều) / ưu tiên "
+                   "tầng gần giá hơn")
         else:
             continue
         engine.cancel_entry(o, why)

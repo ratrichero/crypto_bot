@@ -93,6 +93,7 @@ try:
     bb.SYMBOLS[:] = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
     bb.CFG.update(order_margin_usdt=100, leverage=10, max_total_positions=10)
     G = bb.CFG["grid"]
+    G["max_same_side"] = 0      # test cac tran khac (B test o test_trend_filter)
     G.update(engine="range", step_pct=0.01, step_min=0.01, step_max=0.01,
              tp_pct=0.01, sl_pct=0.03, levels_each_side=5, max_positions=7,
              max_lots_per_symbol=4, max_symbols=0, boundary_sl_buffer=0.005,

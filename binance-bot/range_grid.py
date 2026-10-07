@@ -173,7 +173,9 @@ def limit_candidates(rng: dict, price: float, occupied: Iterable[str],
 
 
 def plan_slots(symbols: Sequence[dict], grid_cfg: dict,
-               total_lots: int) -> List[Tuple[str, str]]:
+               total_lots: int,
+               side_room: Optional[Dict[str, int]] = None
+               ) -> List[Tuple[str, str]]:
     """Phan bo slot cho lenh vao moi (dung cho ca limit va market).
 
     symbols: [{symbol, score, lots, candidates:[level], pending:set(keys)}]
@@ -183,6 +185,9 @@ def plan_slots(symbols: Sequence[dict], grid_cfg: dict,
     Gioi han: grid.max_positions (tong lot + lenh cho), max_lots_per_symbol,
     max_symbols (symbol co lot hoac lenh cho). Tra ve [(symbol, key)] duoc
     phep (gom pending duoc giu + tang moi).
+
+    side_room: {"long": n, "short": m} so slot con lai moi chieu (tran
+    grid.max_same_side tru lot da mo); None = khong gioi han theo chieu.
 
     Lenh cho TINH vao slot: neu tat ca cung khop thi van khong vuot tran.
     Dat tran -> danh sach rong -> moi lenh cho con lai bi huy.
@@ -199,20 +204,25 @@ def plan_slots(symbols: Sequence[dict], grid_cfg: dict,
         for lv in s.get("candidates", []):
             rows.append((lv["key"] not in s.get("pending", set()),
                          abs(float(lv.get("dist", 0.0))), s["symbol"],
-                         lv["key"], s))
+                         lv["key"], s, lv.get("side")))
     # uu tien: giu lenh cho cu, roi tang gan gia, roi symbol diem cao
     rank_sym = {s["symbol"]: i for i, s in enumerate(order)}
     rows.sort(key=lambda r: (r[0], r[1], rank_sym[r[2]]))
     used_sym: Dict[str, int] = {}
+    used_side: Dict[str, int] = {}
     chosen = []
     active_syms = set(busy)
-    for _new, _dist, sym, key, s in rows:
+    for _new, _dist, sym, key, s, side in rows:
         if budget <= 0:
             break
         if used_sym.get(sym, 0) + int(s.get("lots") or 0) >= per_sym:
             continue
         if sym not in active_syms and len(active_syms) >= max_syms:
             continue
+        if side_room is not None and side in side_room:
+            if used_side.get(side, 0) >= int(side_room[side]):
+                continue
+            used_side[side] = used_side.get(side, 0) + 1
         chosen.append((sym, key))
         used_sym[sym] = used_sym.get(sym, 0) + 1
         active_syms.add(sym)
