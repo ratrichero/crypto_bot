@@ -367,6 +367,46 @@ def write_stamp(value, *parts):
     os.replace(p + ".tmp", p)
 
 
+def _changed_path():
+    return _state_path("changed_at.json")
+
+
+def mark_changed(key, when=None):
+    """Ghi thoi diem moi truong chay doi (thu vien/build). App start TRUOC moc
+    nay phai restart - ke ca khi lan restart ngay sau do bi bo qua/loi (lan
+    git up sau van thay, khong phu thuoc 'da cai')."""
+    p = _changed_path()
+    try:
+        with open(p) as f:
+            data = json.load(f)
+    except (IOError, OSError, ValueError):
+        data = {}
+    data[key] = float(when if when is not None else time.time())
+    with open(p + ".tmp", "w") as f:
+        json.dump(data, f, indent=1, sort_keys=True)
+    os.replace(p + ".tmp", p)
+
+
+def env_changes_for(app):
+    """[(moc, mo_ta)] cac lan thu vien/build cua app doi."""
+    try:
+        with open(os.path.join(STATE_DIR, "changed_at.json")) as f:
+            data = json.load(f)
+    except (IOError, OSError, ValueError):
+        return []
+    out = []
+    ts = data.get("pip:" + app["python"])
+    if ts:
+        out.append((ts, "thu vien Python"))
+    cwd = os.path.normpath(app["cwd"])
+    for key, ts in data.items():
+        if key.startswith("build:"):
+            d = os.path.normpath(key[6:])
+            if d == "." or cwd == d or cwd.startswith(d + os.sep):
+                out.append((ts, "build %s" % key[6:]))
+    return out
+
+
 def tail_file(path, n=25):
     try:
         with open(path, "rb") as f:
@@ -517,14 +557,23 @@ def step_deps(cfg, apps, dry_run, force):
         cmd = [py, "-m", "pip", "install", "-q", "--disable-pip-version-check"]
         for r in reqs:
             cmd += ["-r", abspath(r)]
-        run(cmd, timeout=1800, capture=False)
+        try:
+            run(cmd, timeout=1800, capture=False)
+        except DeployError:
+            # cai duoc mot phan roi loi: van danh dau neu venv da doi, de app
+            # duoc restart sau khi sua (lan sau freeze khong con khac nua)
+            if run([py, "-m", "pip", "freeze", "--all"],
+                   check=False).stdout != before:
+                mark_changed("pip:" + py)
+            raise
         after = run([py, "-m", "pip", "freeze", "--all"], check=False).stdout
-        write_stamp(digest, *stamp_name)
         if before != after:
+            mark_changed("pip:" + py)     # TRUOC stamp: chet giua chung -> cai lai
             diff = sorted(set(after.splitlines()) - set(before.splitlines()))
             ok("da cai/nang cap: %s" % (", ".join(diff[:10]) or "?"))
             changed_apps.update(a["name"] for a in group)
-        else:
+        write_stamp(digest, *stamp_name)
+        if before == after:
             ok("da du thu vien, khong thay doi gi")
     return changed_apps
 
@@ -563,6 +612,7 @@ def step_build(apps, dry_run):
         if "build" in scripts:
             run(["npm", "run", "build"], cwd=abspath(d), timeout=1800,
                 capture=False)
+        mark_changed("build:" + d)
         write_stamp(digest, *stamp)
         ok("da build %s" % d)
         rebuilt.update(a["name"] for a in apps
@@ -571,7 +621,7 @@ def step_build(apps, dry_run):
     return rebuilt
 
 
-def plan_restarts(cfg, apps, head, deps_changed, force_names=()):
+def plan_restarts(cfg, apps, head, force_names=()):
     """-> list dict {app, action, reasons, recreate, info}."""
     procs = pm2_list(cfg)
     defs = ecosystem_defs(cfg)
@@ -613,8 +663,11 @@ def plan_restarts(cfg, apps, head, deps_changed, force_names=()):
                     more = " +%d" % (len(hit) - 4) if len(hit) > 4 else ""
                     item["reasons"].append("code doi: %s%s"
                                            % (", ".join(hit[:4]), more))
-        if name in deps_changed:
-            item["reasons"].append("thu vien da cai thay doi")
+        started = (p["uptime_ms"] or 0) / 1000.0
+        for ts, what in env_changes_for(a):
+            if started < ts:
+                item["reasons"].append("%s doi luc %s, sau khi app start" % (
+                    what, datetime.fromtimestamp(ts).strftime("%d/%m %H:%M")))
         if name in force_names:
             item["reasons"].append("--restart")
         if item["reasons"]:
@@ -748,7 +801,7 @@ def cmd_deploy(args, cfg):
     step("Kiem tra app can restart")
     if args.dry_run and head != git("rev-parse", "HEAD"):
         info(_c("2", "  (--dry-run: so voi commit %s chua pull)" % short(head)))
-    plan = plan_restarts(cfg, apps, head, deps_changed | rebuilt,
+    plan = plan_restarts(cfg, apps, head,
                          force_names=set(only or []) if args.restart else ())
     for item in plan:
         (skip if item["action"] == "skip" else warn)(describe(item, head))
@@ -817,7 +870,7 @@ def cmd_status(args, cfg):
     branch = git("symbolic-ref", "--short", "-q", "HEAD", check=False)
     step("Repo: nhanh %s, HEAD %s" % (branch or "(detached)", short(head)))
     procs = pm2_list(cfg)
-    plan = plan_restarts(cfg, apps, head, set())
+    plan = plan_restarts(cfg, apps, head)
     step("App")
     now = time.time()
     for item in plan:

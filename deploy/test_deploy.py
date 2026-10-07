@@ -242,10 +242,13 @@ def test_plan_restarts():
         d.ecosystem_defs = lambda cfg: defs
         d.reflog_entries = lambda: list(entries)
 
-        def plan(head, deps=()):
+        for a in apps:
+            a["python"] = "/py/" + a["name"]
+
+        def plan(head):
             with use_root(tmp):
                 return {i["app"]["name"]: i for i in
-                        d.plan_restarts({}, apps, head, set(deps))}
+                        d.plan_restarts({}, apps, head)}
 
         entries[:] = [(1000, c1)]
         procs.update(bot={"status": "online", "uptime_ms": 2000 * 1000},
@@ -281,8 +284,29 @@ def test_plan_restarts():
               p["web"]["reasons"][0], p["web"]["reasons"])
         procs["web"]["uptime_ms"] = 4500 * 1000
 
-        p = plan(c3, deps={"web"})
-        check("thu vien doi -> restart", p["web"]["action"] == "restart")
+        with use_root(tmp):
+            d.mark_changed("pip:/py/web", 5000)        # sau khi web start
+            d.mark_changed("pip:/py/bot", 1000)        # truoc khi bot start
+        p = plan(c3)
+        check("thu vien doi SAU khi app start -> restart",
+              p["web"]["action"] == "restart"
+              and "thu vien" in p["web"]["reasons"][0], p["web"]["reasons"])
+        check("thu vien doi TRUOC khi app start -> khong restart",
+              p["bot"]["action"] == "skip", p["bot"]["reasons"])
+        p = plan(c3)
+        check("restart bi bo qua -> lan git up sau van doi restart",
+              p["web"]["action"] == "restart")
+        procs["web"]["uptime_ms"] = 6000 * 1000         # da restart
+        p = plan(c3)
+        check("da restart sau moc -> het can restart",
+              p["web"]["action"] == "skip", p["web"]["reasons"])
+        with use_root(tmp):
+            d.mark_changed("build:web", 7000)
+        p = plan(c3)
+        check("build thu muc cua app doi -> restart app do",
+              p["web"]["action"] == "restart"
+              and p["bot"]["action"] == "skip")
+        procs["web"]["uptime_ms"] = 8000 * 1000
 
         defs["web"] = {"args": ["y", "--new"]}
         p = plan(c3)
@@ -479,12 +503,97 @@ def test_load_apps():
               for s in spec.values()))
 
 
+FAKE_PY = """#!/bin/bash
+# python gia: -m pip freeze|install. Trang thai venv trong $DIR/freeze.txt
+DIR="$(dirname "$0")"
+[ "$1 $2" = "-m pip" ] || exit 1
+case "$3" in
+  freeze) cat "$DIR/freeze.txt" ;;
+  install)
+    echo install >> "$DIR/calls.txt"
+    mode="$(cat "$DIR/mode.txt" 2>/dev/null)"
+    case "$mode" in
+      upgrade) echo "newlib==2" >> "$DIR/freeze.txt" ;;
+      partial) echo "half==1" >> "$DIR/freeze.txt"; exit 1 ;;
+      fail) exit 1 ;;
+    esac ;;
+esac
+"""
+
+
+def test_step_deps():
+    print("\n[thu vien: cai khi doi, danh dau moc]")
+    tmp = tempfile.mkdtemp()
+    try:
+        venv = os.path.join(tmp, "venv")
+        os.makedirs(venv)
+        py = os.path.join(venv, "python")
+        with open(py, "w") as f:
+            f.write(FAKE_PY)
+        os.chmod(py, 0o755)
+        write(venv, "freeze.txt", "a==1\n")
+        write(tmp, "app/requirements.txt", "a\n")
+        apps = [{"name": "x", "python": py, "cwd": "app",
+                 "requirements": ["app/requirements.txt"]}]
+
+        def calls():
+            try:
+                with open(os.path.join(venv, "calls.txt")) as f:
+                    return len(f.read().split())
+            except IOError:
+                return 0
+
+        def changed():
+            with use_root(tmp):
+                return d.env_changes_for(apps[0])
+
+        with use_root(tmp):
+            res = d.step_deps({}, apps, False, False)
+        check("lan dau: chay pip install, venv khong doi -> khong danh dau",
+              calls() == 1 and res == set() and changed() == [])
+        with use_root(tmp):
+            d.step_deps({}, apps, False, False)
+        check("requirements khong doi -> bo qua pip", calls() == 1)
+
+        write(tmp, "app/requirements.txt", "a\nnewlib\n")
+        write(venv, "mode.txt", "upgrade")
+        with use_root(tmp):
+            res = d.step_deps({}, apps, False, False)
+        check("requirements doi + venv doi -> danh dau moc",
+              calls() == 2 and res == {"x"} and changed()
+              and changed()[0][1] == "thu vien Python", changed())
+
+        write(tmp, "app/requirements.txt", "a\nnewlib\nhalf\n")
+        write(venv, "mode.txt", "partial")
+        before = changed()[0][0]
+        time_mark = None
+        with use_root(tmp):
+            try:
+                d.step_deps({}, apps, False, False)
+            except d.DeployError:
+                time_mark = changed()[0][0]
+        check("pip loi giua chung nhung venv da doi -> van danh dau moc",
+              time_mark is not None and time_mark >= before)
+        write(venv, "mode.txt", "")
+        with use_root(tmp):
+            d.step_deps({}, apps, False, False)
+        check("pip loi -> khong ghi stamp, lan sau cai lai", calls() == 4)
+
+        with use_root(tmp):
+            d.step_deps({}, apps, False, True)
+        check("--force-deps -> cai lai du requirements khong doi",
+              calls() == 5)
+    finally:
+        shutil.rmtree(tmp)
+
+
 def main():
     test_parse_env_and_run_app()
     test_ecosystem()
     test_commit_at()
     test_import_closure()
     test_plan_restarts()
+    test_step_deps()
     test_reflog_real()
     test_step_pull()
     test_pm2_list_normalize()
