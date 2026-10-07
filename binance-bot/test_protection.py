@@ -334,6 +334,61 @@ def test_detect_confirms_real_external_close():
     check("detect: lot bi xoa sau xac nhan", st["positions"] == [])
 
 
+# ===================================================================
+# 3. detect_exchange_closed: real exit price from the right fill
+# ===================================================================
+def confirm_detect(eng, marks=None):
+    return detect_round(eng, marks) + detect_round(eng, marks)
+
+
+def test_detect_price_ignores_opposite_leg_and_old_fills():
+    fake = FakeBinance()
+    eng, st = make_engine(fake, protection=False)
+    # An old long from yesterday closed at 50000 (must be ignored).
+    fake._fill("BTCUSDT", "buy", "LONG", 0.01, 51000)
+    fake._fill("BTCUSDT", "sell", "LONG", 0.01, 50000)
+    CLOCK.sleep(3600)
+    lot = open_lot(eng, "long", 60000, level="b1")
+    CLOCK.sleep(300)
+    manual_close(fake, "long", lot["qty"], 59700)       # real SL fill
+    CLOCK.sleep(1)
+    open_lot(eng, "short", 61200, level="s1")           # SELL opens SHORT
+    recs = confirm_detect(eng, {"BTCUSDT": 61000})
+    rec = recs[0] if recs else {}
+    check("gia that: bo qua SELL mo SHORT va fill cu",
+          rec.get("exit") == 59700, rec)
+    check("gia that: danh dau khong uoc tinh", rec.get("estimated") is False,
+          rec)
+
+
+def test_detect_price_grid_lots_get_their_own_fill():
+    fake = FakeBinance()
+    eng, st = make_engine(fake, protection=False)
+    a = open_lot(eng, "long", 60000, level="b1")
+    b = open_lot(eng, "long", 59700, level="b2", notional=1200.0)
+    CLOCK.sleep(300)
+    manual_close(fake, "long", a["qty"], 60300)
+    CLOCK.sleep(5)
+    manual_close(fake, "long", b["qty"], 60010)
+    recs = {r["id"]: r for r in confirm_detect(eng)}
+    check("grid: moi lot lay dung fill cua minh",
+          recs.get(a["id"], {}).get("exit") == 60300
+          and recs.get(b["id"], {}).get("exit") == 60010, recs)
+
+
+def test_detect_price_one_order_closing_whole_leg():
+    fake = FakeBinance()
+    eng, st = make_engine(fake, protection=False)
+    a = open_lot(eng, "long", 60000, level="b1")
+    b = open_lot(eng, "long", 59700, level="b2")
+    CLOCK.sleep(300)
+    manual_close(fake, "long", a["qty"] + b["qty"], 59900)   # close-all
+    recs = confirm_detect(eng)
+    check("close-all 1 lenh: ca 2 lot dung gia lenh do",
+          len(recs) == 2 and all(r["exit"] == 59900 and not r["estimated"]
+                                 for r in recs), recs)
+
+
 TESTS = [
     test_close_one_of_many_grid_lots,
     test_close_detects_real_partial,
@@ -341,6 +396,9 @@ TESTS = [
     test_detect_ignores_single_empty_read,
     test_detect_skips_fresh_lot,
     test_detect_confirms_real_external_close,
+    test_detect_price_ignores_opposite_leg_and_old_fills,
+    test_detect_price_grid_lots_get_their_own_fill,
+    test_detect_price_one_order_closing_whole_leg,
 ]
 
 

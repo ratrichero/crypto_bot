@@ -1060,6 +1060,10 @@ class BinanceEngine:
             pending.pop(stale, None)
         marks = mark_prices or {}
         recs = []
+        used_orders = set()
+        leg_closing = [p for p in self.state.get("positions", [])
+                       if exchange.get((p.get("symbol"), p.get("side")), 0.0)
+                       <= self._qty_tolerance(p.get("symbol"), p.get("qty"))]
         for pos in list(self.state.get("positions", [])):
             key = (pos.get("symbol"), pos.get("side"))
             local_qty = float(pos.get("qty", 0) or 0)
@@ -1119,22 +1123,15 @@ class BinanceEngine:
                     fired, exit_px = "TP?", tp
                 elif sl:
                     fired, exit_px = "SL?", sl
-            # Thu lay gia khop that tu lich su giao dich san
-            actual_exit = None
-            try:
-                trades = self._private_call(
-                    "private:account", self.ex.fetch_my_trades, symbol, None,
-                    5, _weight=5)
-                # Tim lenh dong gan nhat (nguoc chieu voi side)
-                close_side = "sell" if side == "long" else "buy"
-                for t in reversed(trades or []):
-                    if str(t.get("side", "")).lower() == close_side:
-                        actual_exit = float(t.get("price") or 0)
-                        if actual_exit > 0:
-                            fired = "EXCHANGE"
-                            break
-            except Exception:
-                pass
+            # Gia khop that: chi lay fill dong DUNG leg (positionSide), sau
+            # khi lot mo, va khop khoi luong lot (hoac ca leg neu 1 lenh dong
+            # tat ca). Khong tim thay -> giu gia uoc tinh, danh dau estimated.
+            group_qty = sum(float(p.get("qty", 0) or 0) for p in leg_closing
+                            if (p.get("symbol"), p.get("side")) == key)
+            actual_exit, close_order = self._exchange_exit_from_trades(
+                pos, used_orders, group_qty)
+            if actual_exit:
+                fired = "EXCHANGE"
             if actual_exit:
                 exit_px = actual_exit
             elif exit_px is None:
@@ -1165,6 +1162,7 @@ class BinanceEngine:
                 "closed_at": int(now),
                 "live": True, "dry": self.dry_run,
                 "estimated": fired != "EXCHANGE", "exit_fired": fired,
+                "close_ord": close_order,
             }
             self.state["positions"] = [p for p in self.state["positions"]
                                        if p.get("id") != pos["id"]]
@@ -1175,6 +1173,67 @@ class BinanceEngine:
                         net))
             recs.append(rec)
         return recs
+
+    def _exchange_exit_from_trades(self, pos, used_orders, group_qty):
+        """Average exit price of the exchange fill that closed ``pos``.
+
+        Hedge Mode trades on the same symbol include opens of the opposite
+        leg (a SELL also opens a SHORT) and fills of earlier positions, so a
+        trade is accepted only if it is on the closing side of this leg
+        (positionSide), executed after the lot opened, and its order quantity
+        equals this lot (or the whole leg when one order closed every lot).
+        Returns (price, order_id) or (None, None).
+        """
+        symbol, side = pos.get("symbol"), pos.get("side")
+        close_side = "sell" if side == "long" else "buy"
+        leg = "LONG" if side == "long" else "SHORT"
+        opened_ms = int(float(pos.get("opened_at", 0) or 0) * 1000)
+        try:
+            ccxt_symbol = self._ccxt_symbol(symbol) or symbol
+            trades = self._private_call(
+                "private:account", self.ex.fetch_my_trades, ccxt_symbol,
+                opened_ms or None, 100, _weight=5) or []
+        except binance_safety.BinanceSafetyStop:
+            raise
+        except Exception as exc:
+            self.log("WARNING userTrades %s: %s" %
+                     (symbol, binance_safety.redact_body(exc)))
+            return None, None
+        orders = {}
+        for trade in trades:
+            info = trade.get("info") or {}
+            if str(trade.get("side", "")).lower() != close_side:
+                continue
+            if str(info.get("positionSide", "")).upper() != leg:
+                continue
+            try:
+                ts = int(trade.get("timestamp") or info.get("time") or 0)
+                qty = float(trade.get("amount") or info.get("qty") or 0)
+                price = float(trade.get("price") or info.get("price") or 0)
+            except (TypeError, ValueError):
+                continue
+            if ts < opened_ms or qty <= 0 or price <= 0:
+                continue
+            oid = str(trade.get("order") or info.get("orderId") or "")
+            group = orders.setdefault(oid, {"qty": 0.0, "cost": 0.0, "ts": 0})
+            group["qty"] += qty
+            group["cost"] += qty * price
+            group["ts"] = max(group["ts"], ts)
+        ranked = sorted(orders.items(), key=lambda item: item[1]["ts"],
+                        reverse=True)
+        lot_qty = float(pos.get("qty", 0) or 0)
+        for oid, group in ranked:
+            if oid in used_orders:
+                continue
+            if abs(group["qty"] - lot_qty) <= self._qty_tolerance(symbol, lot_qty):
+                used_orders.add(oid)
+                return group["cost"] / group["qty"], oid
+        if group_qty and group_qty > lot_qty:
+            for oid, group in ranked:
+                if abs(group["qty"] - group_qty) <= self._qty_tolerance(
+                        symbol, group_qty):
+                    return group["cost"] / group["qty"], oid
+        return None, None
 
     def _reconcile_startup_open_orders(self):
         """Block resume when a previous normal order is still working."""
