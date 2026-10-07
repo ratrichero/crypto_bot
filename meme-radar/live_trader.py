@@ -101,6 +101,9 @@ DEFAULTS = {
     "fee_buffer_sol": 0.02,
     "daily_stop_pct": 0.20,
     "min_signal_usd": 300,
+    # Bo qua signal cu hon N giay (tinh tu thoi diem vi nguon giao dich,
+    # fallback detected_at). Ap dung ca khi retry va backlog sau restart.
+    "max_signal_age_seconds": 120,
     "skip_preflight": False,
     # duong dan signal: de trong -> dung file trong thu muc module.
     # Khi live_trader chay tren VPS con radar paper chay may khac,
@@ -154,6 +157,29 @@ def log(msg):
 
 def usd_to_lamports(usd, sol_usd):
     return int(usd / sol_usd * 1_000_000_000)
+
+
+def signal_event_ts(signal):
+    """Thoi diem su kien cua signal (unix giay): uu tien `ts` (blockTime /
+    luc ws nhan), fallback `detected_at`. Tu nhan dien ms. None neu khong co."""
+    for key in ("ts", "detected_at"):
+        try:
+            v = float(signal.get(key) or 0)
+        except (TypeError, ValueError):
+            continue
+        if v > 1e12:  # milliseconds
+            v /= 1000.0
+        if v > 0:
+            return v
+    return None
+
+
+def signal_age_seconds(signal, now):
+    """Tuoi signal (giay). Khong co timestamp -> inf (fail closed)."""
+    ts = signal_event_ts(signal)
+    if ts is None:
+        return float("inf")
+    return max(0.0, now - ts)
 
 
 def price_impact_pct(quote):
@@ -1148,6 +1174,15 @@ class LiveTrader:
             return False
         if not isinstance(s.get("token"), str) or not s.get("token"):
             self._mark_processed(tid, "skipped_invalid_token")
+            return False
+        # Signal cu (backlog sau restart, retry keo dai) -> khong mua duoi
+        age = signal_age_seconds(s, now)
+        max_age = float(self.cfg.get("max_signal_age_seconds", 120))
+        if age > max_age:
+            self._mark_processed(tid, "skipped_stale")
+            self.state.setdefault("pending_buys", {}).pop(tid, None)
+            log(f"signal {tid[:12]}... ({s.get('symbol', '?')}) cu "
+                f"{age:.0f}s > {max_age:.0f}s -> bo qua")
             return False
         # Dedup: khong mo vi the moi neu da co cung token dang mo
         mint = s.get("token")

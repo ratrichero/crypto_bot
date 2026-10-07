@@ -617,6 +617,46 @@ def test_price_impact_guard_blocks():
         check("dry-run 6% bi chan", True)
 
 
+
+# ---- tuoi signal ----
+
+def test_signal_age_helpers():
+    print("== tuoi signal ==")
+    check("uu tien ts", lt.signal_age_seconds({"ts": 900, "detected_at": 950}, 1000) == 100)
+    check("fallback detected_at", lt.signal_age_seconds({"detected_at": 950}, 1000) == 50)
+    check("ts ms nhan dien", abs(lt.signal_age_seconds({"ts": 1_700_000_000_000}, 1_700_000_060) - 60) < 1e-6)
+    check("khong co ts -> inf", lt.signal_age_seconds({}, 1000) == float("inf"))
+    check("ts tuong lai -> 0", lt.signal_age_seconds({"ts": 1100}, 1000) == 0)
+
+
+def test_stale_signal_skipped():
+    print("== signal > 120s bi bo qua, <= 120s duoc mua ==")
+    with isolated() as tmpd:
+        tr, jup = _dry_trader(tmpd, {"OLD": 0.001, "FRESH": 0.001})
+        with open(lt.SIG_P, "a") as f:
+            f.write(json.dumps(_sig("tid_old", "OLD", ts=1000)) + "\n")
+            f.write(json.dumps(_sig("tid_fresh", "FRESH", ts=1050)) + "\n")
+        tr.run_once(now=1170)   # OLD 170s, FRESH 120s
+        toks = {p["token"] for p in tr.positions}
+        check("OLD (170s) khong mua", "OLD" not in toks, str(toks))
+        check("FRESH (120s) duoc mua", "FRESH" in toks, str(toks))
+        check("OLD danh dau processed", "tid_old" in tr.state["processed"])
+
+
+def test_retry_stops_when_stale():
+    print("== signal loi tam thoi: retry trong 2p, qua 2p thi bo ==")
+    with isolated() as tmpd:
+        tr, jup = _dry_trader(tmpd, {"MINT_R": 0.001})
+        s = _sig("tid_r", "MINT_R", ts=1000)
+        tr._record_signal_failure(s, 1000, "no route tam thoi")
+        check("co trong failures", "tid_r" in tr.state["signal_failures"])
+        tr.run_once(now=1200)   # retry den han nhung signal da 200s
+        check("khong mua signal cu khi retry",
+              not any(p["token"] == "MINT_R" for p in tr.positions))
+        check("xoa khoi failures", "tid_r" not in tr.state["signal_failures"])
+        check("processed", "tid_r" in tr.state["processed"])
+
+
 if __name__ == "__main__":
     test_exit_tp_ladder()
     test_exit_sl()
@@ -642,5 +682,8 @@ if __name__ == "__main__":
     test_failed_tp1_then_tp2_same_poll()
     test_price_impact_fraction()
     test_price_impact_guard_blocks()
+    test_signal_age_helpers()
+    test_stale_signal_skipped()
+    test_retry_stops_when_stale()
     print(f"\n{PASS} pass, {FAIL} fail")
     sys.exit(1 if FAIL else 0)
