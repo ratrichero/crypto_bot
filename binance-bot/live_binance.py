@@ -699,6 +699,51 @@ class BinanceEngine:
                                 binance_safety.redact_body(cancel_error)))
             raise
 
+    @staticmethod
+    def _is_absent_error(exc):
+        message = str(exc).lower()
+        return ("-2011" in message or "-2013" in message
+                or "not found" in message or "does not exist" in message)
+
+    def _cancel_algo_quietly(self, symbol, algo_id=None, client_algo_id=None):
+        """Cancel one Algo order; return 'cancelled', 'absent' or 'error'.
+
+        Used when the lot is already gone (closed on the exchange): the
+        leftover sibling guard must not stay live, but failure to cancel is
+        logged instead of raised (orphan cleanup retries it later).
+        """
+        if self.dry_run or (not algo_id and not client_algo_id):
+            return "absent"
+        identifier = {"symbol": symbol}
+        if algo_id:
+            identifier["algoId"] = algo_id
+        else:
+            identifier["clientAlgoId"] = client_algo_id
+        try:
+            self._private_call("private:trade",
+                               self.ex.fapiPrivateDeleteAlgoOrder, identifier)
+            self.log("PROTECTION cancel %s algo=%s ok"
+                     % (symbol, algo_id or client_algo_id))
+            return "cancelled"
+        except binance_safety.BinanceSafetyStop:
+            raise
+        except Exception as exc:
+            if self._is_absent_error(exc):
+                return "absent"
+            self.log("WARNING PROTECTION cancel %s algo=%s failed: %s"
+                     % (symbol, algo_id or client_algo_id,
+                        binance_safety.redact_body(exc)))
+            return "error"
+
+    def _cancel_leftover_guards(self, pos, skip_label=None):
+        """Cancel every remaining guard of a lot that no longer exists."""
+        for label in ("sl", "tp"):
+            if label == skip_label:
+                continue
+            self._cancel_algo_quietly(pos.get("symbol"),
+                                      pos.get("%s_algo_id" % label),
+                                      pos.get("%s_client_algo_id" % label))
+
     def _cancel_exchange_protection(self, pos):
         if self.dry_run:
             return
@@ -1166,6 +1211,9 @@ class BinanceEngine:
             }
             self.state["positions"] = [p for p in self.state["positions"]
                                        if p.get("id") != pos["id"]]
+            # TP/SL tren Binance khong phai OCO: lot da mat thi guard con lai
+            # van treo va co the dong nham lot moi cung leg -> huy ngay.
+            self._cancel_leftover_guards(pos)
             self._db_insert_trade(rec)
             self.log("EXCHANGE_CLOSE #%s %s %s: khong con tren san, uoc tinh "
                      "dong @%s (%s) pnl=%+.2f [estimated]"

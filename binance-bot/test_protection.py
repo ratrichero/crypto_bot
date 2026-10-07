@@ -389,6 +389,22 @@ def test_detect_price_one_order_closing_whole_leg():
                                  for r in recs), recs)
 
 
+# ===================================================================
+# 4. detect_exchange_closed: leftover guards are cancelled
+# ===================================================================
+def test_detect_cancels_leftover_guards():
+    fake = FakeBinance()
+    eng, st = make_engine(fake, protection=True)
+    lot = open_lot(eng, "long", 60000, level="b1")
+    check("guard: lot co du SL+TP tren san", len(fake.open_algos()) == 2)
+    CLOCK.sleep(300)
+    manual_close(fake, "long", lot["qty"], 60100)      # closed by hand
+    recs = confirm_detect(eng)
+    check("detect + protection: ghi nhan dong", len(recs) == 1)
+    check("detect + protection: khong con algo treo", fake.open_algos() == [],
+          fake.open_algos())
+
+
 TESTS = [
     test_close_one_of_many_grid_lots,
     test_close_detects_real_partial,
@@ -399,6 +415,7 @@ TESTS = [
     test_detect_price_ignores_opposite_leg_and_old_fills,
     test_detect_price_grid_lots_get_their_own_fill,
     test_detect_price_one_order_closing_whole_leg,
+    test_detect_cancels_leftover_guards,
 ]
 
 
