@@ -731,3 +731,71 @@ quote và **bán** thất bại (ví dụ `COPY_EXIT THAT BAI`).
   vào `.env` gốc thì bot tự dùng lại ở lần thử tiếp theo, không cần restart.
 - Chỉ áp dụng cho 401. Lỗi 429/5xx vẫn xử lý như cũ. Tắt bằng `jupiter_fallback_base: ""`.
 - `lite-api` đang bị Jupiter khai tử. Vẫn cần tạo key hợp lệ tại portal.jup.ag.
+
+### 10.11 Grid mở quá nhiều long khi thị trường giảm → lọc chiều xu hướng + trần cùng chiều
+
+**Sự cố (07/10, ~18:20):** 9 lot grid LONG trên 8 altcoin (PUMP×2, SUI, HYPE, ETH,
+XRP, SOL, ZEC, ENA) bị đóng bởi DAILY_STOP / GRID_BASKET_STOP, tổng ≈ −$108
+(≈ 10% vốn $1k).
+
+**Nguyên nhân:**
+1. Grid về bản chất **mua khi giá giảm**. Classic: giá ≤ anchor×(1−k·step) →
+   long. Range: nửa dưới biên chỉ có long. Thị trường trôi một chiều xuống thì chỉ
+   tầng long khớp.
+2. Classic chỉ lọc bằng ADX 15m của từng coin. Khi giá trôi giảm chậm, ADX vẫn
+   thấp nên bot coi là đi ngang. Không nhìn khung lớn hơn, không nhìn BTC. Scanner
+   ở chế độ `observe` không chặn gì.
+3. Không có trần lệnh cùng chiều. Altcoin chạy theo BTC → 9 lot × $1000 ≈ $9000
+   long trên vốn $1k, thực chất là một lệnh cược lớn. (Cấu hình đang lưu trong DB
+   phải có `grid.max_positions` ≥ 9.)
+
+**Sửa (đều chỉ chặn MỞ MỚI; lot đang mở vẫn chạy tới TP/SL/basket):**
+
+| | Tham số (dashboard) | Mặc định | Tác dụng |
+|---|---|---|---|
+| A | `trend.market_filter` | bật | BTC giảm → không long grid mới trên **mọi** coin; BTC tăng → không short |
+| C | `trend.symbol_filter` | bật | Như trên, theo xu hướng riêng từng coin |
+| B | `grid.max_same_side` | 2 | Tối đa N lot grid cùng chiều trên mọi coin (lệnh chờ LIMIT tính như lot); 0 = tắt |
+| D | `scanner.mode` | `filter` | Classic chỉ mở trên top K coin đi ngang |
+
+- Xu hướng (`binance-bot/trend_filter.py`), tính trên nến 1h **đã đóng** cùng giá
+  hiện tại:
+  - **down:** giá < EMA50 **và** EMA dốc xuống ≥ `slope_min_atr` (0.5) × ATR(14)
+    sau `slope_bars` (6) nến. **up:** ngược lại.
+  - Riêng BTC: giảm/tăng ≥ `market_move_pct` (1.5%) trong `market_move_hours` (4h)
+    → có xu hướng ngay, vì EMA phản ứng chậm với cú dump.
+  - Luật "giảm nhanh" không áp cho từng coin, vì grid cần giá giảm 1–2 step mới
+    vào lệnh.
+- Độ dốc chuẩn hoá theo ATR để coin biến động mạnh và yếu dùng chung một ngưỡng.
+  Mô phỏng với 0.5 ATR: thị trường đi ngang chỉ bị chặn **một phía** ~10–18% thời
+  gian; trôi giảm 0.1–0.2%/h bị chặn long 57–79% thời gian. Phần còn lại do luật
+  BTC giảm nhanh và trần B xử lý.
+- Lấy nến 1h với limit 99 (weight 1), mỗi 5 phút, tối đa 2 symbol mỗi slow tick.
+  BTCUSDT được lấy kể cả khi không nằm trong universe. Thiếu hoặc hết hạn dữ liệu
+  → chặn (fail-closed); sau khi khởi động khoảng 1–2 phút mới đủ dữ liệu.
+- Range LIMIT: lệnh chờ ở phía bị chặn bị huỷ với lý do "lọc xu hướng". Phần vượt
+  trần B bị huỷ theo `plan_slots(side_room=…)`.
+- Log: `TREND BTCUSDT (thi truong): neutral -> down …`,
+  `GRID ETHUSDT khong mo LONG: BTC xu hướng giảm (…)`, `GRID (moi symbol) khong mo
+  LONG: trần 2 lot …` (log một lần mỗi khi lý do đổi).
+- Dashboard:
+  - Tab **Cấu hình**: thêm nhóm "Xu hướng" và tham số `grid.max_same_side`. Có cảnh
+    báo khi cấu hình dễ ôm nhiều lot cùng chiều (không có trần, tắt cả hai lớp lọc,
+    classic + scanner không lọc, `max_positions` > 3). Có dòng "Tối đa cùng một
+    chiều: N lot ≈ $X".
+  - Tab **Scanner**: thêm bảng "Lọc xu hướng grid" (BTC đứng đầu, phía bị chặn,
+    lý do).
+- `backtest_v2.py` mô phỏng A/B/C. So sánh trên dữ liệu thật (cần
+  `BTCUSDT-5m.jsonl` trong `--data-dir`):
+
+```bash
+python3 backtest_v2.py run --data-dir data --entry market --json-out /tmp/loc.json
+python3 backtest_v2.py run --data-dir data --entry market \
+  --set trend.market_filter=false --set trend.symbol_filter=false \
+  --set grid.max_same_side=0 --json-out /tmp/khong_loc.json
+```
+
+**Sau deploy:** tham số mới (`trend.*`, `grid.max_same_side`) chưa có trong
+version DB nên nhận mặc định, tức **bật ngay**. Tham số đã lưu (`grid.max_positions`,
+`scanner.mode`) **không** tự đổi. Vào dashboard để đặt `max_positions` = 3 và
+scanner = `filter`.

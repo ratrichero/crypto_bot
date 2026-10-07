@@ -31,6 +31,8 @@ backtest.py         Historical simulator + public data/funding downloader +
 test_backtest.py    Regression tests for closed candles, fills, costs and OOS.
 test_binance.py     Smoke test offline.
 test_protection.py  Kich ban vong doi SL/TP voi san gia lap (offline).
+trend_filter.py     Loc chieu xu huong grid (BTC + tung coin, nen 1h).
+test_trend_filter.py Test loc xu huong + tran lot cung chieu (offline).
 ```
 
 `strategy.py` và `indicators.py` là bản copy verbatim từ `trading-bot/` để
@@ -51,6 +53,10 @@ Nếu sửa logic chiến thuật, sửa cả hai nơi.
   basket stop mặc định 2% mark-to-market equity; khi giá lệch anchor quá
   6 step thì freeze level mới cho tới khi basket cũ flat, không xóa mapping
   position đang sống; mỗi cycle tối đa 1 level mới. Tối đa 7 lệnh grid.
+- **Lọc chiều grid (task 34)**: grid về bản chất mua khi giá giảm. BTC (hoặc
+  chính coin đó) đang giảm trên nến 1h → không mở lot grid LONG mới; đang tăng
+  → không mở SHORT mới. Tối đa `grid.max_same_side` (mặc định 2) lot grid cùng
+  chiều trên mọi coin. Chi tiết: `docs/upgrade.md` mục 10.11.
 - **Size hiện tại**: mỗi lệnh 100 USDT margin ×10 = 1000 USDT notional;
   tối đa 10 vị thế. Position sizing theo risk/ATR vẫn là bước P1 tiếp theo.
 - **Daily stop**: lỗ mark-to-market ≥10% equity đầu ngày → đóng hết và nghỉ
