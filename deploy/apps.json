@@ -55,6 +55,16 @@
       "kill_timeout": 60000,
       "health_seconds": 45,
       "state_file": "binance-bot/state.json"
+    },
+    "muse-live-equity": {
+      "label": "Equity vi live (Solana, snapshot 15s)",
+      "cwd": "meme-radar",
+      "entry": "live_equity_snap.py",
+      "search_path": ["meme-radar"],
+      "requirements": ["meme-radar/requirements.txt"],
+      "live": false,
+      "kill_timeout": 5000,
+      "health_seconds": 20
     }
   }
 }

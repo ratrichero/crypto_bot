@@ -189,3 +189,11 @@ ghi $0 / chi phi mua sai). Khong doc duoc tx sau 3 lan -> dung so du nhu cu (log
 "dung so du"). Moi lenh/leg co `fee_usd` (phi mang) va `acct` (tx|balance); ban ghi
 dong lenh co `fee_usd` + `fee_known` -> dashboard hien cot "Phi mang" va "Truoc phi".
 Tat: `"tx_accounting": false` trong config.live.json.
+
+## Equity ví live (live_equity_snap.py, app pm2 muse-live-equity)
+
+Mỗi 15s ghi `equity_snapshots(system='radar_live')` = SOL trong ví × giá SOL + token
+của vị thế đang mở (giá Jupiter; thiếu giá → giá vào). Tab Live Radar vẽ "Equity ví
+6h qua" giống tab Binance LIVE. Chỉ đọc (Helius getBalance + Jupiter price), không
+cần private key. Lần đầu: `git up setup --only muse-live-equity`; log:
+`pm2 logs muse-live-equity`.

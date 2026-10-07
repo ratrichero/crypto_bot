@@ -105,6 +105,9 @@ Bỏ qua mọi dấu "đã làm": chạy lại `pip install`, migrate, build, v�
 
 Tên app giữ nguyên tên service systemd cũ: `muse-dashboard`, `muse-radar`,
 `muse-live-trader`, `muse-binance`.
+App mới (10/2026): `muse-live-equity` (snapshot equity ví Solana live mỗi 15s cho
+tab Live Radar; chỉ đọc, không cần private key). Lần đầu khởi động:
+`git up setup --only muse-live-equity`.
 
 - Dừng sạch: pm2 gửi SIGINT. Bot làm nốt vòng lặp hoặc swap đang chạy, lưu
   state rồi thoát. `kill_timeout` là 60s cho Binance, 180s cho Live Trader.
