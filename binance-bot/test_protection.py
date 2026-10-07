@@ -288,9 +288,9 @@ def make_engine(fake=None, protection=True, **cfg_overrides):
 
 
 def open_lot(eng, side, price, tag="grid", level=None, sl_pct=0.03,
-             tp_pct=0.005, notional=600.0):
-    eng.ex.prices["BTCUSDT"] = price
-    pos, why = eng.open("BTCUSDT", side, notional, price, sl_pct, tp_pct, tag,
+             tp_pct=0.005, notional=600.0, symbol="BTCUSDT"):
+    eng.ex.prices[symbol] = price
+    pos, why = eng.open(symbol, side, notional, price, sl_pct, tp_pct, tag,
                         level=level)
     assert pos is not None, why
     CLOCK.sleep(1)
@@ -1448,6 +1448,90 @@ def test_unknown_fill_price_is_resolved_later():
           and not st.get("halted"), (lot, st.get("halt_reason")))
 
 
+# ===================================================================
+# Kiem soat rui ro LUON chay (halt chi chan mo lenh moi)
+# ===================================================================
+def test_basket_runs_during_reconcile_hold():
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    bot_state(st)
+    st["mark_equity"] = 1000.0
+    open_lot(eng, "long", 60000, level="b1")
+    open_lot(eng, "long", 59700, level="b2")
+    st["halted"] = True
+    st["halt_reason"] = "exchange position reconciliation mismatch"
+    marks = {"BTCUSDT": 57500}               # lo ~$43 > basket $20
+    binance_bot.run_risk_controls(eng, st, marks, marks, True)
+    check("hold: basket stop van cat lot grid",
+          st["positions"] == [] and st["grids"]["BTCUSDT"].get("risk_halted"),
+          (st["positions"], eng.logs[-3:]))
+    check("hold: halt_reason giu nguyen (van chan mo lenh moi)",
+          st["halted"] and st["halt_reason"]
+          == "exchange position reconciliation mismatch")
+
+
+def test_basket_evaluates_risk_halted_symbol_with_lots():
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    bot_state(st)
+    st["mark_equity"] = 1000.0
+    open_lot(eng, "long", 60000, level="b1")
+    open_lot(eng, "long", 59700, level="b2")
+    st["grids"]["BTCUSDT"] = {"anchor": 60300, "taken": {},
+                              "risk_halted": True}
+    binance_bot.manage_grid_risk(eng, st, {"BTCUSDT": 57500})
+    check("risk_halted + con lot: van danh gia va cat khi lo vuot basket",
+          st["positions"] == [], st["positions"])
+
+
+def test_grid_total_stop_across_symbols():
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    bot_state(st)
+    st["mark_equity"] = 1000.0
+    old_risk = dict(binance_bot.CFG["risk"])
+    binance_bot.CFG["risk"].update(grid_basket_max_loss_pct=0.02,
+                                   grid_total_max_loss_pct=0.03)
+    try:
+        open_lot(eng, "long", 60000, level="b1")                    # 0.01 BTC
+        open_lot(eng, "long", 3000, level="b1", symbol="ETHUSDT")   # 0.2 ETH
+        marks = {"BTCUSDT": 58800, "ETHUSDT": 2940}   # moi symbol -$12
+        binance_bot.manage_grid_risk(eng, st, marks)
+        check("tong grid: duoi tran tong (-$24 > -$30) -> giu",
+              len(st["positions"]) == 2)
+        marks = {"BTCUSDT": 58400, "ETHUSDT": 2920}   # moi symbol -$16
+        binance_bot.manage_grid_risk(eng, st, marks)
+        check("tong grid: tung symbol < basket $20 nhung tong -$32 -> dong het",
+              st["positions"] == [] and all(
+                  st["grids"][s].get("risk_halted")
+                  for s in ("BTCUSDT", "ETHUSDT")), st["positions"])
+        check("tong grid: trade ghi ly do GRID_TOTAL_STOP",
+              sorted(r["reason"] for r in eng.db_rows)
+              == ["GRID_TOTAL_STOP", "GRID_TOTAL_STOP"],
+              [r["reason"] for r in eng.db_rows])
+    finally:
+        binance_bot.CFG["risk"].clear()
+        binance_bot.CFG["risk"].update(old_risk)
+
+
+def test_position_symbols_outside_universe_are_watched():
+    saved_syms = list(binance_bot.SYMBOLS)
+    saved_mo = set(binance_bot.MANAGE_ONLY)
+    try:
+        st = {"positions": [{"symbol": "OLDCOINUSDT"},
+                            {"symbol": saved_syms[0] if saved_syms
+                             else "BTCUSDT"}]}
+        extra = binance_bot.include_position_symbols(st)
+        check("symbol ngoai universe duoc them (manage-only)",
+              extra == ["OLDCOINUSDT"]
+              and "OLDCOINUSDT" in binance_bot.SYMBOLS
+              and "OLDCOINUSDT" in binance_bot.MANAGE_ONLY)
+    finally:
+        binance_bot.SYMBOLS[:] = saved_syms
+        binance_bot.MANAGE_ONLY.clear()
+        binance_bot.MANAGE_ONLY.update(saved_mo)
+
+
 TESTS = [
     test_close_one_of_many_grid_lots,
     test_close_detects_real_partial,
@@ -1505,6 +1589,10 @@ TESTS = [
     test_ambiguous_open_never_accepted_expires,
     test_failed_close_rearms_guards_and_recovers,
     test_unknown_fill_price_is_resolved_later,
+    test_basket_runs_during_reconcile_hold,
+    test_basket_evaluates_risk_halted_symbol_with_lots,
+    test_grid_total_stop_across_symbols,
+    test_position_symbols_outside_universe_are_watched,
 ]
 
 

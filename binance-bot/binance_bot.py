@@ -297,6 +297,65 @@ def acquire_instance_lock():
     return fh
 
 
+# Symbol co lot dang mo nhung khong (con) nam trong universe: van theo doi
+# gia/rui ro, KHONG mo lenh moi (universe build lai theo volume 24h).
+MANAGE_ONLY = set()
+
+
+def include_position_symbols(st):
+    """Them symbol cua lot dang mo vao SYMBOLS (manage-only) truoc khi tao
+    engine/WS. Truoc day lot cua coin rot khoi universe sau restart khong co
+    gia mark -> mat ca basket stop lan SL/TP local."""
+    extra = sorted({p.get("symbol") for p in st.get("positions", [])
+                    if p.get("symbol")} - set(SYMBOLS))
+    for symbol in extra:
+        SYMBOLS.append(symbol)
+        MANAGE_ONLY.add(symbol)
+    if extra:
+        log("WARNING lot dang mo tren symbol ngoai universe: %s -> theo doi "
+            "rui ro, khong mo lenh moi" % ", ".join(extra))
+    return extra
+
+
+def run_risk_controls(engine, st, mark_prices, prices, reconcile_hold):
+    """Moi co che CAT LO chay moi vong, khong phu thuoc halt.
+
+    - Grid basket stop theo symbol + tran lo tong grid (manage_grid_risk).
+    - SL/TP local (fallback khi guard san chua khop / chua co).
+    - Dang reconcile hold: dat lai SL/TP thieu (arm_only).
+    Lenh dong o Hedge Mode luon theo positionSide (chi giam vi the) nen an
+    toan ca khi state lech san. Moi buoc boc rieng: 1 buoc loi khong chan
+    buoc khac. Tra ve True neu state thay doi."""
+    changed = False
+    try:
+        if manage_grid_risk(engine, st, mark_prices):
+            changed = True
+    except binance_safety.BinanceSafetyStop:
+        raise
+    except Exception:
+        log("manage_grid_risk loi:\n" + traceback.format_exc())
+    symbols = list(dict.fromkeys(
+        list(SYMBOLS) + [p.get("symbol") for p in st.get("positions", [])]))
+    for symbol in symbols:
+        mark = mark_prices.get(symbol, prices.get(symbol))
+        if mark is None:
+            continue
+        try:
+            if update_positions(engine, st, symbol, mark):
+                changed = True
+        except binance_safety.BinanceSafetyStop:
+            raise
+        except Exception:
+            log("update_positions %s loi:\n%s" % (symbol,
+                                                  traceback.format_exc()))
+    if reconcile_hold:
+        # State lech san: khong don lenh/khong ep dong theo deadline, nhung
+        # lot thieu SL/TP van phai duoc dat chan (dong-only, giam rui ro).
+        if protect_during_hold(engine):
+            changed = True
+    return changed
+
+
 def manage_grid_risk(engine, st, mark_prices):
     """Stop a grid basket before an unbounded one-way move consumes equity."""
     limit_pct = float(CFG["risk"].get("grid_basket_max_loss_pct", 0.0))
@@ -331,12 +390,14 @@ def manage_grid_risk(engine, st, mark_prices):
                 log("GRID BASKET STOP %s: da dong het lot" % symbol)
                 changed = True
             continue
-        if grid.get("risk_halted"):
-            continue
+        # risk_halted chi chan MO lenh moi (manage_grid); lot con ton tai
+        # (dong loi, nhan lai tu lenh mo ho...) van phai duoc danh gia.
         if not positions:
             continue
         price = mark_prices.get(symbol)
         if price is None:
+            log("WARNING grid basket %s: khong co gia mark -> khong danh gia "
+                "duoc (SL tren san van con)" % symbol)
             continue
         pnl = 0.0
         for pos in positions:
@@ -362,7 +423,52 @@ def manage_grid_risk(engine, st, mark_prices):
             log("GRID BASKET STOP %s: con lot chua dong -> thu lai moi vong"
                 % symbol)
         grid["taken"] = {}
+    if enforce_grid_total_stop(engine, st, mark_prices, base_equity):
+        changed = True
     return changed
+
+
+def enforce_grid_total_stop(engine, st, mark_prices, base_equity):
+    """Tran lo TONG cua moi lot grid (moi symbol cong lai), theo % equity.
+
+    Basket stop theo tung symbol khong chan duoc lo tuong quan (thi truong
+    sap -> nhieu symbol cung lo). Cham tran -> dong moi lot grid, dung grid
+    moi symbol (risk_halted) toi ngay moi. risk.grid_total_max_loss_pct
+    (mac dinh 0.10; 0 = tat)."""
+    limit_pct = float(CFG["risk"].get("grid_total_max_loss_pct", 0.10))
+    if limit_pct <= 0 or base_equity <= 0:
+        return False
+    positions = [p for p in st["positions"] if p.get("tag") == "grid"]
+    if not positions:
+        return False
+    pnl = 0.0
+    for pos in positions:
+        price = mark_prices.get(pos["symbol"])
+        if price is None:
+            continue
+        if pos["side"] == "long":
+            pnl += (price - pos["entry"]) * pos["qty"]
+        else:
+            pnl += (pos["entry"] - price) * pos["qty"]
+    limit = base_equity * limit_pct
+    if pnl > -limit:
+        return False
+    log("GRID TOTAL STOP pnl=%+.2f limit=-%.2f lots=%d -> dong moi lot grid"
+        % (pnl, limit, len(positions)))
+    for symbol in sorted({p["symbol"] for p in positions}):
+        grid = st["grids"].setdefault(symbol, {"anchor": None, "taken": {}})
+        grid["risk_halted"] = True
+        grid["rebuild_pending"] = True
+        grid["taken"] = {}
+        for pos in [p for p in positions if p["symbol"] == symbol]:
+            price = mark_prices.get(symbol, pos["entry"])
+            rec = engine.close(pos, price, "GRID_TOTAL_STOP")
+            if rec:
+                _record_close(st, rec)
+        if [p for p in st["positions"] if p.get("tag") == "grid"
+                and p.get("symbol") == symbol]:
+            grid["basket_stopping"] = True     # thu lai moi vong
+    return True
 
 
 def manage_grid(engine, st, symbol, price):
@@ -516,6 +622,7 @@ def main():
         return
 
     st = load_state()
+    include_position_symbols(st)
     try:
         engine = make_engine(st)
     except binance_safety.BinanceSafetyStop as e:
@@ -740,20 +847,13 @@ def main():
                  "unmanaged ", "position ")
             )
             if not DATA_ONLY:
-                if reconcile_hold:
-                    # State lech san: khong mo/dong/don lenh, nhung lot thieu
-                    # SL/TP van phai duoc dat chan (dong-only, giam rui ro).
-                    if protect_during_hold(engine):
-                        dirty = True
+                # Kiem soat rui ro (basket, tran lo tong grid, SL/TP local)
+                # LUON chay, ke ca khi halt/reconcile hold: halt chi chan mo
+                # lenh moi, khong duoc tat co che cat lo.
+                if run_risk_controls(engine, st, mark_prices, prices,
+                                     reconcile_hold):
+                    dirty = True
                 if not reconcile_hold:
-                    if manage_grid_risk(engine, st, mark_prices):
-                        dirty = True
-                    for symbol in SYMBOLS:
-                        mark = mark_prices.get(symbol, prices.get(symbol))
-                        if mark is None:
-                            continue
-                        if update_positions(engine, st, symbol, mark):
-                            dirty = True
                     # Retry dat protection cho vi the chua co SL/TP tren san
                     try:
                         if engine.retry_protection():
@@ -789,7 +889,8 @@ def main():
                         if px is None or not cc:
                             continue
                         regime = st["regimes"].get(symbol, {}).get("regime", "ranging")
-                        if regime == "ranging" and not is_disabled(symbol):
+                        if (regime == "ranging" and not is_disabled(symbol)
+                                and symbol not in MANAGE_ONLY):
                             if manage_grid(engine, st, symbol, px):
                                 dirty = True
 
@@ -874,7 +975,8 @@ def main():
                         st["grids"].setdefault(
                             symbol, {"anchor": None, "taken": {}})["step"] = astep
                         if (not DATA_ONLY and regime == "trending"
-                                and not is_disabled(symbol)):
+                                and not is_disabled(symbol)
+                                and symbol not in MANAGE_ONLY):
                             if manage_scalp(engine, st, symbol,
                                             px, cc["5m"], cc["15m"]):
                                 dirty = True
