@@ -54,8 +54,15 @@ def make_engine(st):
         return DataOnlyEngine(log=log)
     if MODE in ("dry_run", "live"):
         from live_binance import BinanceEngine
-        return BinanceEngine(CFG, st, dry_run=(MODE == "dry_run"),
-                             log=log, symbols=SYMBOLS)
+        eng = BinanceEngine(CFG, st, dry_run=(MODE == "dry_run"),
+                            log=log, symbols=SYMBOLS)
+        # Khoi tao ket noi Postgres de ghi trade truc tiep
+        # (khong fail neu DB khong dung duoc; JSONL van la backup)
+        try:
+            eng.init_db()
+        except Exception as e:
+            log(f"DB init warning: {e}")
+        return eng
     raise SystemExit(
         "config 'mode' khong hop le: %r (chon data_only|dry_run|live)" %
         (MODE,))

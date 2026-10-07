@@ -128,6 +128,10 @@ class BinanceEngine:
         self._last_order_response = None
         self._cooldown_base = float(cfg.get("order_failure_cooldown_seconds", 30))
         self._cooldown_max = float(cfg.get("order_failure_cooldown_max_seconds", 900))
+        # Postgres: ghi trade truc tiep, khong qua JSONL+sync.
+        # Lazy connect; None = chua co / khong dung duoc.
+        self._db_conn = None
+        self._db_ok = False
         if dry_run:
             self.ex = None
             self.log("BinanceEngine DRY_RUN: khong can key, KHONG goi bat ky "
@@ -158,6 +162,73 @@ class BinanceEngine:
             self._reconcile_startup()
 
     # ------------------------------------------------------------ helpers
+
+    def _db_connect(self):
+        """Lazy Postgres connection. Tra ve None neu khong dung duoc."""
+        if self._db_conn is not None:
+            return self._db_conn
+        url = os.environ.get("DATABASE_URL")
+        if not url:
+            return None
+        try:
+            import psycopg
+            conn = psycopg.connect(url)
+            conn.autocommit = True
+            self._db_conn = conn
+            return conn
+        except Exception as e:
+            self.log("DB warning: khong ket noi duoc Postgres: %s" % e)
+            return None
+
+    def init_db(self):
+        """Khoi tao DB 1 lan khi start bot. Khong fail neu DB loi."""
+        conn = self._db_connect()
+        if conn is not None:
+            self._db_ok = True
+            self.log("DB: da ket noi Postgres; trade se ghi truc tiep "
+                     "vao binance_trades (JSONL van giu lam backup)")
+        else:
+            self.log("DB warning: khong co DATABASE_URL hoac ket noi that "
+                     "bai; chi ghi JSONL")
+
+    def _db_insert_trade(self, rec):
+        """Ghi 1 trade da dong truc tiep vao Postgres.
+
+        Dung ON CONFLICT DO NOTHING de tranh trung. Khong bao gio raise:
+        neu DB loi thi log warning va tra False, JSONL van la backup.
+        """
+        try:
+            conn = self._db_connect()
+            if conn is None:
+                return False
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO binance_trades
+                       (id, symbol, side, tag, entry, exit, notional, pnl,
+                        reason, closed_at, live, dry, close_ord)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                               to_timestamp(%s), %s,%s,%s)
+                       ON CONFLICT (id) DO NOTHING""",
+                    (rec["id"], rec["symbol"], rec["side"], rec["tag"],
+                     rec["entry"], rec["exit"], rec["notional"], rec["pnl"],
+                     rec["reason"], rec["closed_at"],
+                     rec.get("live", True), rec.get("dry", False),
+                     rec.get("close_ord")),
+                )
+            self._db_ok = True
+            return True
+        except Exception as e:
+            self.log("DB warning: insert trade #%s that bai: %s "
+                     "(JSONL van co du lieu)" % (rec.get("id"), e))
+            # Dong connection hong de lan sau ket noi lai
+            try:
+                if self._db_conn is not None:
+                    self._db_conn.close()
+            except Exception:
+                pass
+            self._db_conn = None
+            self._db_ok = False
+            return False
     def _next_id(self):
         self._pid += 1
         self.state["_pid"] = self._pid
@@ -1534,6 +1605,9 @@ class BinanceEngine:
             self.log("%s CLOSE #%d %s %s %s pnl=%+.2f ord=%s" %
                      ("DRY_RUN" if self.dry_run else "LIVE",
                       rec["id"], symbol, side, reason, net, oid))
+            # Ghi truc tiep vao Postgres (khong block neu DB loi;
+            # JSONL van duoc ghi o _record_close lam backup).
+            self._db_insert_trade(rec)
             if not self.dry_run:
                 self.refresh_equity()
             return rec
