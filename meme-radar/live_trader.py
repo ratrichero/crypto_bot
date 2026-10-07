@@ -110,6 +110,9 @@ DEFAULTS = {
     # Bo qua signal cu hon N giay (tinh tu thoi diem vi nguon giao dich,
     # fallback detected_at). Ap dung ca khi retry va backlog sau restart.
     "max_signal_age_seconds": 120,
+    # Intent BUY cua bot ma vi khong co token va tx khong land/khong ton tai
+    # sau N giay (blockhash Solana het han ~60-90s) -> bo, go block entry.
+    "pending_buy_expire_seconds": 180,
     "skip_preflight": False,
     # duong dan signal: de trong -> dung file trong thu muc module.
     # Khi live_trader chay tren VPS con radar paper chay may khac,
@@ -482,12 +485,22 @@ class Swapper:
                 "priorityLevel": pf.get("level", "veryHigh")}}
         return int(pf)
 
-    def _sign_and_send(self, swap_b64):
+    def _sign_and_send(self, swap_b64, on_signed=None):
         from solders.transaction import VersionedTransaction
         tx = VersionedTransaction.from_bytes(base64.b64decode(swap_b64))
         signed = VersionedTransaction(tx.message, [self.kp])
         raw_b64 = base64.b64encode(bytes(signed)).decode()
+        if on_signed is not None:
+            # Signature = chu ky dau tien, biet TRUOC khi gui. Ghi ben vung
+            # truoc sendTransaction: neu send timeout/crash sau khi validator
+            # da nhan, reconcile van tra duoc tx that cua bot.
+            on_signed(str(signed.signatures[0]))
         return self.rpc.send_transaction(raw_b64, self.cfg["skip_preflight"])
+
+    def _buy_signed(self, sig):
+        hook = getattr(self, "on_buy_sent", None)
+        if hook is not None:
+            hook(sig)
 
     def _confirm(self, sig):
         deadline = time.time() + float(self.cfg.get("confirm_timeout_seconds", 90))
@@ -641,7 +654,7 @@ class Swapper:
                 f"khong doc duoc token balance truoc BUY {symbol}: {e}")
         q, txb64 = self._quote_swap(SOL_MINT, mint, lamports)
         try:
-            sig = self._sign_and_send(txb64)
+            sig = self._sign_and_send(txb64, on_signed=self._buy_signed)
         except Exception as e:
             # sendTransaction can time out after the validator accepted it.
             # Verify the token delta before deciding that BUY failed.
@@ -1075,6 +1088,10 @@ class LiveTrader:
             log(f"CRITICAL reconcile token balances loi: {e} -> block entry")
             return False
         known = self._recent_signal_by_token()
+        for rec in (self.state.get("pending_buys") or {}).values():
+            sig_row = (rec or {}).get("signal") or {}
+            if sig_row.get("token"):
+                known.setdefault(sig_row["token"], sig_row)
         self.onchain_tokens = {
             mint for mint, bal in balances.items()
             if int(bal.get("amount", 0) or 0) > 0
@@ -1163,6 +1180,8 @@ class LiveTrader:
         log(f"RECONCILE occupancy={self._occupied_token_count()}/"
             f"{self.cfg['max_positions']} (bo qua {len(ignored)} token "
             f"airdrop/dust khong co signal)")
+        if self._resolve_pending_buys(balances, now):
+            changed = True
         pending_uncertain = bool(pending)
         self.entry_blocked = bool(unmanaged or pending_uncertain)
         # Ghi ly do block de dashboard hien thi
@@ -1187,6 +1206,74 @@ class LiveTrader:
             # Cap nhat block status ngay ca khi khong co thay doi khac
             self.save()
         return not self.entry_blocked
+
+    def _resolve_pending_buys(self, balances, now):
+        """Giai quyet intent BUY cua bot theo du lieu on-chain.
+
+        Truoc day pending chi duoc go khi token VE vi (position/recover);
+        lenh mua KHONG land -> khong duong nao go -> block entry vinh vien.
+        - Vi co token: de recover/position xu ly (khong dong o day).
+        - Co tx cua bot: failed on-chain -> bo; da confirm ma vi khong co
+          token -> GIU block + CRITICAL (can kiem tra tay); khong tim thay
+          tx sau pending_buy_expire_seconds (blockhash het han) -> bo.
+        - Chua co tx (chua ky/gui, hoac pending cu truoc ban sua nay): qua
+          pending_buy_expire_seconds ma vi khong co token -> bo.
+        Tra ve True neu state thay doi."""
+        pending = self.state.setdefault("pending_buys", {})
+        if not pending:
+            return False
+        expire = float(self.cfg.get("pending_buy_expire_seconds", 180))
+        tracked = {str(p.get("signal_tid") or "") for p in self.positions}
+        changed = False
+        for tid, rec in list(pending.items()):
+            rec = rec or {}
+            sig_row = rec.get("signal") or {}
+            mint = sig_row.get("token")
+            symbol = sig_row.get("symbol", "?")
+            if tid in tracked:
+                pending.pop(tid, None)
+                changed = True
+                continue
+            if mint and int((balances.get(mint) or {}).get("amount", 0)
+                            or 0) > 0:
+                continue                       # recover xu ly
+            age = now - float(rec.get("sent_at") or rec.get("started_at")
+                              or now)
+            tx = rec.get("tx")
+            status = None
+            if tx:
+                try:
+                    status = self.swapper.rpc.get_sig_status(tx)
+                except Exception as e:
+                    log(f"pending BUY {symbol}: khong doc duoc status tx "
+                        f"{tx[:12]}...: {redact(e)[:120]} -> giu")
+                    continue
+            if status == "failed":
+                why = f"tx {tx[:12]}... failed on-chain"
+            elif status in ("processed", "confirmed", "finalized"):
+                if not rec.get("landed_warned"):
+                    log(f"CRITICAL pending BUY {symbol}: tx {tx[:12]}... "
+                        f"{status} nhung vi KHONG co token -> giu block, can "
+                        "kiem tra tay")
+                    rec["landed_warned"] = True
+                    rec["status"] = "landed_no_balance"
+                    changed = True
+                continue
+            elif age >= expire:
+                why = (f"tx {tx[:12]}... khong ton tai on-chain" if tx
+                       else "khong co tx cua bot") + \
+                    f", vi khong co token sau {age:.0f}s"
+            else:
+                continue
+            pending.pop(tid, None)
+            processed = self.state.setdefault("processed", [])
+            if tid not in processed:
+                processed.append(tid)
+            self.state["processed"] = processed[-3000:]
+            log(f"RESOLVE pending BUY {symbol} ({tid[:12]}...): {why} -> "
+                "lenh mua KHONG land, go block")
+            changed = True
+        return changed
 
     def _mark_processed(self, tid, status="opened"):
         processed = self.state.setdefault("processed", [])
@@ -1287,9 +1374,19 @@ class LiveTrader:
                 s, now, "entry blocked: on-chain reconciliation pending")
             return False
         pending = self.state.setdefault("pending_buys", {})
+        # Intent cua CHINH bot (khong phai signal cua vi smart money; "signal"
+        # chi luu de recover). Ghi truoc khi gui tx; signature cua bot duoc
+        # them ngay khi ky (on_buy_sent) -> _resolve_pending_buys doi chieu.
         pending[tid] = {"signal": s, "started_at": int(now),
                         "status": "buy_intent"}
         self.save()  # durable intent before a network side effect
+
+        def _on_sent(sig, rec=pending[tid]):
+            rec["tx"] = sig
+            rec["sent_at"] = int(time.time())
+            rec["status"] = "buy_sent"
+            self.save()
+        self.swapper.on_buy_sent = _on_sent
         try:
             self._open_from_signal(s, now)
         except SwapUncertain as e:
@@ -1310,6 +1407,8 @@ class LiveTrader:
             self.save()
             log(f"BUY {tid[:12]}... khong chac ket qua -> block entry: {e}")
             return False
+        finally:
+            self.swapper.on_buy_sent = None
         pending.pop(tid, None)
         self._mark_processed(tid, "opened")
         return True

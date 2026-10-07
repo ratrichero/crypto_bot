@@ -1054,6 +1054,154 @@ def test_no_dead_sells_source():
               "sells_jsonl" not in lt.DEFAULTS)
 
 
+# ---- pending BUY: chi la intent cua bot, phai tu giai quyet theo on-chain ----
+
+class PendRpc(BalRpc):
+    def __init__(self, balances, statuses=None):
+        super().__init__(balances)
+        self.statuses = statuses or {}
+        self.sig_calls = []
+
+    def get_sig_status(self, sig):
+        self.sig_calls.append(sig)
+        return self.statuses.get(sig)
+
+
+def _pending_trader(tmpd, balances, pend, statuses=None):
+    tr = _live_trader_stub(tmpd, balances)
+    tr.swapper = LiveSwapperStub(PendRpc(balances, statuses))
+    tr.state["pending_buys"] = pend
+    return tr
+
+
+def _claudia(started_at, **extra):
+    sig = _sig("tid_claudia", "CLAUDIA", ts=started_at)
+    sig["amount_usd"] = 982.8           # size cua VI NGUON, khong phai bot
+    rec = {"signal": sig, "started_at": started_at, "status": "buy_uncertain"}
+    rec.update(extra)
+    return {"tid_claudia": rec}
+
+
+def test_pending_buy_legacy_not_landed_unblocks():
+    print("== pending BUY cu (khong tx), vi khong co token -> tu go block ==")
+    with isolated() as tmpd:
+        tr = _pending_trader(tmpd, {}, _claudia(1000))
+        ok = tr.reconcile_onchain(now=1100, force=True)
+        check("chua qua han (100s) -> van block",
+              ok is False and "tid_claudia" in tr.state["pending_buys"])
+        ok = tr.reconcile_onchain(now=1000 + 600, force=True)
+        check("qua han, vi khong co token -> go pending + unblock",
+              ok is True and tr.state["pending_buys"] == {}
+              and tr.entry_blocked is False
+              and tr.state.get("block_reason") is None,
+              str(tr.state.get("block_reason")))
+        check("signal danh dau processed (khong mua lai)",
+              "tid_claudia" in tr.state["processed"])
+
+
+def test_pending_buy_with_tx_resolved_by_chain():
+    print("== pending BUY co tx cua bot: doi chieu status on-chain ==")
+    with isolated() as tmpd:
+        tr = _pending_trader(tmpd, {}, _claudia(1000, tx="SIGFAIL",
+                                                sent_at=1000),
+                             {"SIGFAIL": "failed"})
+        ok = tr.reconcile_onchain(now=1010, force=True)
+        check("tx failed on-chain -> go ngay, khong cho het han",
+              ok is True and tr.state["pending_buys"] == {})
+    with isolated() as tmpd:
+        tr = _pending_trader(tmpd, {}, _claudia(1000, tx="SIGOK",
+                                                sent_at=1000),
+                             {"SIGOK": "finalized"})
+        ok = tr.reconcile_onchain(now=5000, force=True)
+        check("tx da land ma vi khong co token -> GIU block (kiem tra tay)",
+              ok is False and "tid_claudia" in tr.state["pending_buys"]
+              and tr.state["pending_buys"]["tid_claudia"]["status"]
+              == "landed_no_balance")
+    with isolated() as tmpd:
+        tr = _pending_trader(tmpd, {}, _claudia(1000, tx="SIGLOST",
+                                                sent_at=1000))
+        ok = tr.reconcile_onchain(now=1060, force=True)
+        check("tx chua thay, chua het han -> giu",
+              ok is False and tr.state["pending_buys"])
+        ok = tr.reconcile_onchain(now=1200, force=True)
+        check("tx khong ton tai sau han blockhash -> go",
+              ok is True and tr.state["pending_buys"] == {})
+
+
+def test_pending_buy_landed_token_recovered():
+    print("== pending BUY: token DA ve vi -> recover vi the, khong mat ==")
+    with isolated() as tmpd:
+        bal = {"CLAUDIA": {"amount": 7_000_000, "decimals": 6}}
+        tr = _pending_trader(tmpd, bal, _claudia(1000))
+        ok = tr.reconcile_onchain(now=5000, force=True)
+        pos = tr.positions[0] if tr.positions else {}
+        check("recover tu signal trong pending (signals.jsonl khong co)",
+              pos.get("token") == "CLAUDIA" and pos.get("recovered")
+              and pos.get("tokens_base") == 7_000_000, str(pos))
+        check("pending go + unblock",
+              ok is True and tr.state["pending_buys"] == {})
+
+
+class BuyRpc:
+    def __init__(self):
+        self.pending = None
+        self.sent = []
+
+    def get_balance_lamports(self, owner):
+        return 10 * 10 ** 9
+
+    def get_token_balance_base(self, owner, mint):
+        return 0, 6
+
+    def send_transaction(self, raw_b64, skip_preflight=False):
+        self.sent.append(raw_b64)
+        raise RuntimeError("sendTransaction timeout")
+
+
+def test_buy_signature_saved_before_send():
+    print("== BUY: signature cua bot ghi ben vung TRUOC sendTransaction ==")
+    from solders.hash import Hash
+    from solders.keypair import Keypair
+    from solders.message import MessageV0
+    from solders.transaction import VersionedTransaction
+    import base64
+    kp = Keypair()
+    msg = MessageV0.try_compile(kp.pubkey(), [], [], Hash.default())
+    unsigned = VersionedTransaction(msg, [kp])
+    txb64 = base64.b64encode(bytes(unsigned)).decode()
+    expected = str(unsigned.signatures[0])
+    with isolated() as tmpd:
+        tr, _ = _dry_trader(tmpd, {"NEWTOK": 0.001})
+        tr.dry = False
+        rpc = BuyRpc()
+        cfg = dict(tr.cfg, mode="live", buy_balance_verify_attempts=1,
+                   buy_balance_verify_seconds=0)
+        jup = SellJup(price_map={"NEWTOK": 0.001})
+        jup.swap_tx = lambda q, pk, fee: txb64
+        sw = lt.Swapper(rpc, jup, kp, cfg, dry_run=False)
+        sw.pubkey = "PUB"
+        tr.swapper = sw
+        seen = {}
+        real_save = tr.save
+
+        def save_spy():
+            rec = tr.state["pending_buys"].get("tid_buy") or {}
+            if rec.get("tx") and not rpc.sent:
+                seen["saved_before_send"] = rec["tx"]
+            real_save()
+        tr.save = save_spy
+        tr.entry_blocked = False
+        sig = _sig("tid_buy", "NEWTOK", ts=1000)
+        tr._attempt_signal(sig, 1000)
+        rec = tr.state["pending_buys"].get("tid_buy") or {}
+        check("signature ghi + save truoc khi gui",
+              seen.get("saved_before_send") == expected, str(seen))
+        check("send timeout -> pending giu tx cua bot, status uncertain",
+              rec.get("tx") == expected and rec.get("status")
+              == "buy_uncertain" and rpc.sent, str(rec))
+        check("hook duoc go sau lenh", sw.on_buy_sent is None)
+
+
 if __name__ == "__main__":
     test_exit_tp_ladder()
     test_exit_sl()
@@ -1098,5 +1246,9 @@ if __name__ == "__main__":
     test_exits_before_buys()
     test_age_uses_real_time_after_slow_buy()
     test_radar_stop_does_not_stop_live()
+    test_pending_buy_legacy_not_landed_unblocks()
+    test_pending_buy_with_tx_resolved_by_chain()
+    test_pending_buy_landed_token_recovered()
+    test_buy_signature_saved_before_send()
     print(f"\n{PASS} pass, {FAIL} fail")
     sys.exit(1 if FAIL else 0)

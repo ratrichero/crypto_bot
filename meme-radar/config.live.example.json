@@ -21,6 +21,7 @@
  "max_positions": 10,
  "_signal_age_note": "Bo qua signal cu hon max_signal_age_seconds (tinh tu ts giao dich cua vi nguon). Ap dung ca backlog sau restart va retry. Can dong ho may radar va VPS dong bo (NTP).",
  "max_signal_age_seconds": 120,
+ "pending_buy_expire_seconds": 180,
  "max_price_impact_pct": 5.0,
  "max_swap_retries": 3,
  "min_signal_usd": 300,
