@@ -578,6 +578,73 @@ def step_deps(cfg, apps, dry_run, force):
     return changed_apps
 
 
+MIGRATE_CODE = """
+import os, sys
+import psycopg
+sql = open(sys.argv[1], encoding="utf-8").read()
+# 1 transaction: loi giua chung -> rollback het. lock_timeout: khong treo
+# sau lenh ghi cua bot; that bai thi lan git up sau thu lai.
+with psycopg.connect(os.environ["DEPLOY_MIGRATE_URL"], connect_timeout=15) as c:
+    c.execute("SET LOCAL lock_timeout = '15s'")
+    c.execute("SET LOCAL statement_timeout = '300s'")
+    c.execute(sql)
+print("ok")
+"""
+
+
+def step_migrate(cfg, dry_run, force=False):
+    """Ap dung file SQL idempotent (MIGRATE_SQL) khi doi, TRUOC khi restart.
+
+    -> 'off' | 'skip' | 'pending' (dry-run) | 'applied'. Loi -> DeployError,
+    KHONG ghi stamp (lan sau chay lai)."""
+    step("Kiem tra migrate DB")
+    files = (cfg.get("MIGRATE_SQL") or "").split()
+    if not files:
+        skip("tat (MIGRATE_SQL rong)")
+        return "off"
+    var = cfg.get("MIGRATE_DB_ENV") or "DATABASE_URL"
+    env_file = cfg.get("MIGRATE_ENV_FILE") or cfg.get("ENV_FILE") or ""
+    url = os.environ.get(var) or \
+        (parse_env_file(abspath(env_file)).get(var) if env_file else None)
+    py = abspath(cfg.get("MIGRATE_PYTHON") or cfg.get("PYTHON"))
+    url_tag = hashlib.sha256((url or "").encode()).hexdigest()
+    status = "skip"
+    for rel in files:
+        path = abspath(rel)
+        if not os.path.exists(path):
+            raise DeployError("MIGRATE_SQL: khong thay %s" % rel)
+        with open(path, "rb") as f:
+            digest = hashlib.sha256(f.read() + b"\0" + url_tag.encode())
+        digest = digest.hexdigest()
+        stamp = ("migrate", hashlib.sha1(rel.encode()).hexdigest()[:12])
+        if not force and read_stamp(*stamp) == digest:
+            skip("%s khong doi" % rel)
+            continue
+        if not url:
+            raise DeployError(
+                "%s doi nhung khong co %s (moi truong hoac %s) -> khong "
+                "migrate duoc. Dat MIGRATE_SQL= trong deploy.local.env neu "
+                "khong dung DB" % (rel, var, env_file or "ENV_FILE"))
+        if dry_run:
+            info("  %s can ap dung vao DB (--dry-run: bo qua)" % rel)
+            status = "pending"
+            continue
+        if not os.path.exists(py):
+            raise DeployError("khong thay python %s de migrate" % py)
+        env = dict(os.environ, DEPLOY_MIGRATE_URL=url)
+        res = run([py, "-c", MIGRATE_CODE, path], check=False, timeout=600,
+                  env=env)
+        if res.returncode != 0:
+            err = ((res.stderr or "") + (res.stdout or "")).strip()
+            err = err.replace(url, "***")[-1500:]
+            raise DeployError("migrate %s LOI (chua ghi nhan, lan sau chay "
+                              "lai):\n%s" % (rel, err))
+        write_stamp(digest, *stamp)
+        ok("da ap dung %s" % rel)
+        status = "applied"
+    return status
+
+
 def step_build(apps, dry_run):
     """Build web neu co package.json (hien chua co: dashboard la Streamlit)."""
     step("Kiem tra build web")
@@ -796,6 +863,12 @@ def cmd_deploy(args, cfg):
 
     head = new if args.dry_run else git("rev-parse", "HEAD")
     deps_changed = step_deps(cfg, apps_all, args.dry_run, args.force_deps)
+    migrate_error = None
+    try:
+        migrated = step_migrate(cfg, args.dry_run)
+    except DeployError as e:
+        bad(str(e))
+        migrate_error, migrated = str(e), "error"
     rebuilt = step_build(apps_all, args.dry_run)
 
     step("Kiem tra app can restart")
@@ -808,13 +881,20 @@ def cmd_deploy(args, cfg):
 
     todo = [i for i in plan if i["action"] == "restart"]
     results = {}
+    failed = False
+    if migrate_error and todo:
+        bad("migrate DB loi -> KHONG restart app nao (code moi co the can "
+            "schema moi; ban dang chay van giu nguyen). Sua roi chay lai git up")
+        todo = []
+        failed = True
+    elif migrate_error:
+        failed = True
     if args.no_restart or args.dry_run:
         if todo:
             skip("%s: khong restart" % ("--dry-run" if args.dry_run
                                         else "--no-restart"))
         todo = []
     tree = TreeReader(head) if todo else None
-    failed = False
     for item in todo:
         a = item["app"]
         name = a["name"]
@@ -851,7 +931,8 @@ def cmd_deploy(args, cfg):
         pm2(cfg, "save", check=False, timeout=60)
     if not args.dry_run:
         append_history({"branch": branch, "from": old, "to": head,
-                        "deps": sorted(deps_changed), "results": results})
+                        "deps": sorted(deps_changed), "migrate": migrated,
+                        "results": results})
     step("Ket qua")
     info("  HEAD %s%s" % (short(head), "" if old == head
                          else " (truoc: %s)" % short(old)))

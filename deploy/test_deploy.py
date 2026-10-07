@@ -587,6 +587,144 @@ def test_step_deps():
         shutil.rmtree(tmp)
 
 
+def test_step_migrate():
+    print("\n[migrate DB (Postgres that qua pgserver)]")
+    try:
+        import pgserver
+        import psycopg
+    except ImportError:
+        print("  SKIP: can pgserver + psycopg (chay bang python cua venv)")
+        return
+    tmp = tempfile.mkdtemp()
+    srv = pgserver.get_server(os.path.join(tmp, "pg"), cleanup_mode="stop")
+    try:
+        with psycopg.connect(srv.get_uri(), autocommit=True) as c:
+            c.execute("ALTER USER CURRENT_USER WITH PASSWORD 'bimat123'")
+        base = srv.get_uri()
+        write(tmp, ".env", "DATABASE_URL=%s\n" % base)
+        cfg = {"MIGRATE_SQL": "db/s.sql", "ENV_FILE": ".env",
+               "PYTHON": sys.executable}
+        sql_v1 = ("CREATE TABLE IF NOT EXISTS t (id INT PRIMARY KEY);\n"
+                  "CREATE INDEX IF NOT EXISTS t_id ON t (id);\n")
+        write(tmp, "db/s.sql", sql_v1)
+
+        def cols():
+            with psycopg.connect(base) as c:
+                return sorted(r[0] for r in c.execute(
+                    "select column_name from information_schema.columns "
+                    "where table_name='t'"))
+
+        def tables():
+            with psycopg.connect(base) as c:
+                return sorted(r[0] for r in c.execute(
+                    "select tablename from pg_tables where schemaname="
+                    "'public'"))
+
+        with use_root(tmp):
+            check("MIGRATE_SQL rong -> tat",
+                  d.step_migrate(dict(cfg, MIGRATE_SQL=""), False) == "off")
+            check("--dry-run: bao can ap dung, khong dong DB",
+                  d.step_migrate(cfg, True) == "pending"
+                  and "t" not in tables())
+            check("lan dau: ap dung", d.step_migrate(cfg, False) == "applied"
+                  and cols() == ["id"])
+            check("khong doi -> bo qua", d.step_migrate(cfg, False) == "skip")
+            check("force -> chay lai (idempotent)",
+                  d.step_migrate(cfg, False, force=True) == "applied")
+            write(tmp, "db/s.sql", sql_v1 + "ALTER TABLE t ADD COLUMN IF NOT "
+                  "EXISTS fee DOUBLE PRECISION;\n")
+            check("file doi -> ap dung, co cot moi",
+                  d.step_migrate(cfg, False) == "applied"
+                  and cols() == ["fee", "id"])
+            write(tmp, "db/s.sql", sql_v1 + "CREATE TABLE IF NOT EXISTS "
+                  "moi (x INT);\nSELECT khong_co_cot FROM t;\n")
+            err = ""
+            try:
+                d.step_migrate(cfg, False)
+            except d.DeployError as e:
+                err = str(e)
+            check("SQL loi -> DeployError", "LOI" in err, err[:200])
+            check("SQL loi -> rollback ca file (khong tao bang moi)",
+                  "moi" not in tables(), tables())
+            check("loi khong lo URL/mat khau",
+                  "bimat123" not in err and base not in err, err[-300:])
+            try:
+                d.step_migrate(cfg, False)
+                check("loi -> khong ghi stamp, lan sau chay lai", False)
+            except d.DeployError:
+                check("loi -> khong ghi stamp, lan sau chay lai", True)
+            write(tmp, "db/s.sql", sql_v1)
+            d.step_migrate(cfg, False)
+            write(tmp, ".env", "DATABASE_URL=%s&application_name=x\n"
+                  % base if "?" in base else
+                  "DATABASE_URL=%s?application_name=x\n" % base)
+            check("doi DB (URL khac) -> ap dung lai",
+                  d.step_migrate(cfg, False) == "applied")
+            write(tmp, ".env", "OTHER=1\n")
+            try:
+                d.step_migrate(dict(cfg, MIGRATE_SQL="db/s.sql"), False,
+                               force=True)
+                check("thieu DATABASE_URL -> loi ro rang", False)
+            except d.DeployError as e:
+                check("thieu DATABASE_URL -> loi ro rang",
+                      "DATABASE_URL" in str(e))
+    finally:
+        try:
+            srv.cleanup()
+        except Exception:
+            pass
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_migrate_error_blocks_restart():
+    print("\n[migrate loi -> khong restart app nao]")
+    tmp = _fake_repo()
+    commit(tmp, "c1")
+    names = ("check_branch", "step_pull", "step_deps", "step_migrate",
+             "step_build", "plan_restarts", "start_or_restart", "pm2",
+             "acquire_lock", "health_check", "check_syntax")
+    saved = {n: getattr(d, n) for n in names}
+    restarted = []
+    try:
+        head = sh(["git", "rev-parse", "HEAD"], tmp)
+        app = {"name": "muse-dashboard", "confirm": False}
+        d.check_branch = lambda cfg: "main"
+        d.step_pull = lambda cfg, b, dry: (head, head, False)
+        d.step_deps = lambda *a: set()
+        d.step_build = lambda *a: set()
+        d.plan_restarts = lambda *a, **k: [
+            {"app": app, "info": {}, "reasons": ["code doi"],
+             "recreate": False, "action": "restart", "running": head}]
+        d.start_or_restart = lambda cfg, a, r, e: restarted.append(a["name"])
+        d.health_check = lambda *a: True
+        d.check_syntax = lambda a, t: (True, "")
+        d.pm2 = lambda *a, **k: None
+        d.acquire_lock = lambda: None
+
+        def boom(cfg, dry, force=False):
+            raise d.DeployError("migrate db/schema.sql LOI")
+        d.step_migrate = boom
+
+        class A(object):
+            only = None
+            dry_run = no_restart = restart = yes = force_deps = False
+            resume_from = None
+        cfg = {"APPS": "muse-dashboard"}
+        with use_root(tmp):
+            rc = d.cmd_deploy(A(), cfg)
+        check("migrate loi -> khong restart, ma loi 1",
+              restarted == [] and rc == 1, (restarted, rc))
+        d.step_migrate = lambda cfg, dry, force=False: "applied"
+        with use_root(tmp):
+            rc = d.cmd_deploy(A(), cfg)
+        check("migrate ok -> restart binh thuong",
+              restarted == ["muse-dashboard"] and rc == 0, (restarted, rc))
+    finally:
+        for n, f in saved.items():
+            setattr(d, n, f)
+        shutil.rmtree(tmp)
+
+
 def main():
     test_parse_env_and_run_app()
     test_ecosystem()
@@ -594,6 +732,8 @@ def main():
     test_import_closure()
     test_plan_restarts()
     test_step_deps()
+    test_step_migrate()
+    test_migrate_error_blocks_restart()
     test_reflog_real()
     test_step_pull()
     test_pm2_list_normalize()
