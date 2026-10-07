@@ -1326,6 +1326,17 @@ class LiveTrader:
                 "module KHONG tu dong dong.")
             self.save()
             return "stop"
+        # PAUSE: khong mo lenh moi, van quan ly vi the cu
+        paused = os.path.exists(os.path.join(os.path.dirname(__file__), "PAUSE"))
+        if paused:
+            # Van chay reconcile va quan ly vi the, chi skip mo moi
+            try:
+                self.reconcile_onchain(now)
+                self.manage_positions(now)
+            except Exception as e:
+                log(f"PAUSE loop loi: {e}")
+            self.save()
+            return None
         try:
             self.reconcile_onchain(now)
         except Exception:

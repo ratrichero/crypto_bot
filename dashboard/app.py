@@ -620,39 +620,41 @@ def tab_monitor():
 
     st.divider()
 
-    # Dieu khien bot chu dong: Pause/Resume
+    # Dieu khien bot chu dong: Pause/Resume - TACH RIENG
     st.markdown("### ⏯️ Điều khiển bot")
+
+    # --- Binance Live ---
+    st.markdown("#### 🔴 Binance Futures LIVE")
     pause_file = "/home/ubuntu/muse_bot/binance-bot/PAUSE"
     is_paused = os.path.exists(pause_file)
     col1, col2 = st.columns(2)
     with col1:
         if is_paused:
-            st.warning("⏸️ Bot đang PAUSE (không mở lệnh mới)")
-            if st.button("▶️ Resume bot", key="resume_binance"):
+            st.warning("⏸️ Đang PAUSE")
+            if st.button("▶️ Resume", key="resume_binance"):
                 try:
                     os.remove(pause_file)
-                    st.success("Đã resume - bot sẽ mở lệnh mới trở lại")
+                    st.success("Đã resume")
                     st.rerun()
                 except Exception as e:
                     st.error(f"Lỗi: {e}")
         else:
-            st.info("▶️ Bot đang chạy bình thường")
-            if st.button("⏸️ Pause bot", key="pause_binance"):
+            st.info("▶️ Đang chạy")
+            if st.button("⏸️ Pause", key="pause_binance"):
                 try:
                     open(pause_file, 'w').write(
                         f"Paused at {datetime.now(TZINFO).isoformat()}\n")
-                    st.warning("Đã pause - bot không mở lệnh mới nữa")
+                    st.warning("Đã pause")
                     st.rerun()
                 except Exception as e:
                     st.error(f"Lỗi: {e}")
     with col2:
-        # Xoa halt
         try:
             with open(BINANCE_STATE) as f:
                 bs = json.load(f)
             if bs.get("halted"):
                 st.error(f"🛑 HALT: {bs.get('halt_reason')}")
-                if st.button("✅ Xác nhận & xóa halt", key="clear_halt"):
+                if st.button("✅ Xóa halt", key="clear_halt_binance"):
                     bs["halted"] = False
                     bs["halt_reason"] = None
                     bs.pop("halted_at", None)
@@ -663,6 +665,53 @@ def tab_monitor():
             else:
                 st.success("✅ Không halt")
         except Exception as e:
+            st.info(f"Không đọc được state: {e}")
+
+    st.divider()
+
+    # --- Radar Live (Solana) ---
+    st.markdown("#### ☀️ Radar Live (Solana tiền thật)")
+    radar_pause = "/home/ubuntu/muse_bot/meme-radar/PAUSE"
+    radar_paused = os.path.exists(radar_pause)
+    rcol1, rcol2 = st.columns(2)
+    with rcol1:
+        if radar_paused:
+            st.warning("⏸️ Đang PAUSE")
+            if st.button("▶️ Resume", key="resume_radar"):
+                try:
+                    os.remove(radar_pause)
+                    st.success("Đã resume")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Lỗi: {e}")
+        else:
+            st.info("▶️ Đang chạy")
+            if st.button("⏸️ Pause", key="pause_radar"):
+                try:
+                    open(radar_pause, 'w').write(
+                        f"Paused at {datetime.now(TZINFO).isoformat()}\n")
+                    st.warning("Đã pause")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Lỗi: {e}")
+    with rcol2:
+        # Radar halt (neu co file halt)
+        radar_halt = "/home/ubuntu/muse_bot/meme-radar/HALT"
+        if os.path.exists(radar_halt):
+            try:
+                reason = open(radar_halt).read().strip()
+            except:
+                reason = "unknown"
+            st.error(f"🛑 HALT: {reason}")
+            if st.button("✅ Xóa halt", key="clear_halt_radar"):
+                try:
+                    os.remove(radar_halt)
+                    st.success("Đã xóa halt")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Lỗi: {e}")
+        else:
+            st.success("✅ Không halt")
             st.info(f"Không đọc được state: {e}")
 
     st.divider()
