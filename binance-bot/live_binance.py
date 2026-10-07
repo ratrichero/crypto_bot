@@ -532,6 +532,10 @@ class BinanceEngine(EntryOrdersMixin):
 
     # NEW/PARTIALLY_FILLED (ccxt: "open") la lenh DANG khop - chua phai ket
     # qua. Lenh MARKET quet nhieu muc gia phat PARTIALLY_FILLED truoc FILLED.
+    # Halt do lenh MO khong ro ket qua -> tu go khi da doi chieu xong.
+    _FILL_RECONCILE_HALTS = ("ambiguous ", "order fill reconciliation",
+                             "partial market order")
+
     _IN_PROGRESS = frozenset({"NEW", "PARTIALLY_FILLED", "PARTIAL", "OPEN",
                               "PENDING_NEW"})
 
@@ -1372,15 +1376,24 @@ class BinanceEngine(EntryOrdersMixin):
         # doi chieu xong khi san khop state VA moi lot da du SL/TP tren san
         # (retry_protection dat lai chan da huy); lenh dong van duoc
         # update_positions thu lai theo cooldown.
-        if (self.state.get("halted") and self.state.get("halt_reason")
-                == "close action requires reconciliation"
+        # Tuong tu cho halt do lenh MO khong ro ket qua (khop mot phan /
+        # khong doc duoc gia / timeout): khi khong con lenh nao cho
+        # resolve_ambiguous_orders VA san khop state VA du SL/TP thi khong con
+        # gi de doi chieu (truoc day halt 'partial market order...' treo vinh
+        # vien du lot da duoc nhan).
+        reason = str(self.state.get("halt_reason") or "")
+        recoverable = (
+            reason == "close action requires reconciliation"
+            or (reason.startswith(self._FILL_RECONCILE_HALTS)
+                and not self.state.get("ambiguous_orders")))
+        if (self.state.get("halted") and recoverable
                 and not any(self._missing_guards(p)
                             for p in self.state.get("positions", [])
                             if p.get("live"))):
             self.state["halted"] = False
             self.state["halt_reason"] = None
-            self.log("RECOVERY: lenh dong loi da doi chieu - san khop state, "
-                     "moi lot du SL/TP -> unhalt")
+            self.log("RECOVERY: '%s' da doi chieu - san khop state, khong con "
+                     "lenh cho doi chieu, moi lot du SL/TP -> unhalt" % reason)
         # Tu phuc hoi: neu truoc do halt vi mismatch ma gio het -> unhalt
         if (self.state.get("halted") and
                 self.state.get("halt_reason") == "exchange position reconciliation mismatch"):
@@ -2941,7 +2954,7 @@ class BinanceEngine(EntryOrdersMixin):
         self.state["ambiguous_orders"] = keep
         if (not keep and self.state.get("halted") and str(
                 self.state.get("halt_reason") or "").startswith(
-                    ("ambiguous ", "order fill reconciliation"))):
+                    self._FILL_RECONCILE_HALTS)):
             self.state["halted"] = False
             self.state["halt_reason"] = None
             self.log("RECOVERY: da doi chieu xong lenh mo mo ho -> unhalt "

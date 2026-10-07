@@ -1546,6 +1546,65 @@ def test_validate_reads_ws_cumulative_fields():
           st.get("halt_reason"))
 
 
+def test_terminal_partial_open_is_adopted_and_unhalted():
+    """Lenh MARKET ket thuc EXPIRED sau khi khop 1/2: nhan lot voi qty THAT
+    (co SL/TP), roi tu go halt 'partial market order...'."""
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    real_fill = fake._fill
+
+    def half_expired(symbol, side, position_side, qty, price=None, **kw):
+        order = real_fill(symbol, side, position_side, qty / 2, price, **kw)
+        order.update(status="expired", amount=qty, _raw_status="EXPIRED")
+        return order
+    fake._fill = half_expired
+    pos, why = eng.open("BTCUSDT", "long", 600.0, 60000, 0.03, 0.005, "grid",
+                        level="b1")
+    fake._fill = real_fill
+    check("partial that: halt + ghi lenh can doi chieu (khong bo tran)",
+          pos is None and st.get("halt_reason")
+          == "partial market order requires exchange reconciliation"
+          and len(st.get("ambiguous_orders", [])) == 1, (why, st))
+    eng.resolve_ambiguous_orders(force=True)
+    lot = st["positions"][0] if st["positions"] else {}
+    check("partial that: nhan lot qty that 0.005 + du SL/TP",
+          lot.get("qty") == 0.005 and len(guards_of(fake, lot)) == 2, lot)
+    check("partial that: resolve xong -> tu unhalt",
+          not st.get("halted") and st["ambiguous_orders"] == [],
+          st.get("halt_reason"))
+    check("partial that: san khop state",
+          eng.reconcile_positions(force=True) and not st.get("halted"))
+
+
+def test_stuck_partial_halt_recovers_on_reconcile():
+    """Tinh huong VPS: lot da duoc nhan, ambiguous_orders rong nhung halt
+    'partial market order...' van con -> reconcile tu go khi an toan."""
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    lot = open_lot(eng, "long", 60000)
+    halt = "partial market order requires exchange reconciliation"
+    st.update(halted=True, halt_reason=halt,
+              ambiguous_orders=[{"symbol": "BTCUSDT", "client_order_id": "x"}])
+    eng.reconcile_positions(force=True)
+    check("stuck partial: con lenh cho doi chieu -> chua unhalt",
+          st.get("halt_reason") == halt)
+    st["ambiguous_orders"] = []
+    sl_id = lot.pop("sl_algo_id")
+    eng.reconcile_positions(force=True)
+    check("stuck partial: lot thieu SL -> chua unhalt",
+          st.get("halt_reason") == halt)
+    lot["sl_algo_id"] = sl_id
+    fake.positions[("BTCUSDT", "long")] += 0.01
+    eng.reconcile_positions(force=True)
+    check("stuck partial: san lech state -> doi sang mismatch, khong unhalt",
+          st.get("halt_reason") == "exchange position reconciliation mismatch")
+    fake.positions[("BTCUSDT", "long")] -= 0.01
+    st["halt_reason"] = halt
+    ok = eng.reconcile_positions(force=True)
+    check("stuck partial: san khop + du SL/TP + khong cho -> unhalt",
+          ok and not st.get("halted"), st.get("halt_reason"))
+
+
 # ===================================================================
 # Kiem soat rui ro LUON chay (halt chi chan mo lenh moi)
 # ===================================================================
@@ -1690,6 +1749,8 @@ TESTS = [
     test_market_partial_event_then_filled_ws,
     test_market_partial_snapshot_rest_poll_waits,
     test_validate_reads_ws_cumulative_fields,
+    test_terminal_partial_open_is_adopted_and_unhalted,
+    test_stuck_partial_halt_recovers_on_reconcile,
     test_basket_runs_during_reconcile_hold,
     test_basket_evaluates_risk_halted_symbol_with_lots,
     test_grid_total_stop_across_symbols,
