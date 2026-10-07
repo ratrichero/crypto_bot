@@ -33,7 +33,33 @@ if not _HK:
            if os.path.exists("/home/ubuntu/muse_bot/.helius_key")
            else os.path.expanduser("~/workspace/meme-radar/.helius_key"))
 HELIUS_KEY_FILE = _HK
-SOL_WALLET = "7jUg6PKSj5xgsTM7dLMGnFFS45yohVfgvhbXPTUKfC8q"
+LIVE_CFG_P = os.environ.get("LIVE_CFG_P",
+                            "/home/ubuntu/muse_bot/meme-radar/config.live.json")
+# Vi live cua meme-radar/live_trader.py (khop DEFAULTS.wallet_address).
+DEFAULT_SOL_WALLET = "DxYkrsJA6YdS1cqJ9ocPCYRBacd7Xan3DeYWZva89dLd"
+
+
+def resolve_sol_wallet(env=None, cfg_path=None):
+    """Vi hien thi tren dashboard = vi live_trader dang giao dich.
+
+    Thu tu: env SOL_WALLET -> wallet_address trong config.live.json cua
+    live_trader -> vi live mac dinh. Chi doc pubkey, khong bao gio doc key.
+    """
+    env = os.environ if env is None else env
+    w = (env.get("SOL_WALLET") or "").strip()
+    if w:
+        return w
+    try:
+        with open(cfg_path or LIVE_CFG_P) as f:
+            w = (json.load(f).get("wallet_address") or "").strip()
+        if w:
+            return w
+    except Exception:
+        pass
+    return DEFAULT_SOL_WALLET
+
+
+SOL_WALLET = resolve_sol_wallet()
 LIVE_POS_P = os.environ.get("LIVE_POS_P",
                             "/home/ubuntu/muse_bot/meme-radar/live_positions.json")
 LIVE_TRADES_P = os.environ.get("LIVE_TRADES_P",
