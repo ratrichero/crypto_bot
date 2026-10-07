@@ -30,6 +30,7 @@ backtest.py         Historical simulator + public data/funding downloader +
                     rolling train/test walk-forward.
 test_backtest.py    Regression tests for closed candles, fills, costs and OOS.
 test_binance.py     Smoke test offline.
+test_protection.py  Kich ban vong doi SL/TP voi san gia lap (offline).
 ```
 
 `strategy.py` và `indicators.py` là bản copy verbatim từ `trading-bot/` để
@@ -102,8 +103,31 @@ Nếu sửa logic chiến thuật, sửa cả hai nơi.
 - Mặc định `exchange_protection=false`: SL/TP do process canh. Sau khi
   testnet/mock validation đạt, có thể bật `exchange_protection=true` để tạo
   Algo Order `STOP_MARKET`/`TAKE_PROFIT_MARKET` theo từng position; bot hủy
-  algo còn lại trước khi market-close và halt entry nếu tạo protection thất
-  bại. Không bật flag này trên mainnet khi chưa kiểm tra payload Hedge Mode.
+  algo còn lại trước khi market-close. Không bật flag này trên mainnet khi
+  chưa kiểm tra payload Hedge Mode.
+- Vòng đời SL/TP trên sàn (`exchange_protection=true`):
+  - **Mở lệnh:** chỉ đặt chân còn thiếu, chân đã đặt được luôn được giữ.
+    `retry_protection` đặt lại chân thiếu mỗi 10s nếu thiếu SL, mỗi 30s nếu
+    chỉ thiếu TP. Thiếu SL quá `protection_sl_deadline_seconds` (120s) thì
+    đóng lot. Chỉ thiếu TP thì không ép đóng, TP local vẫn canh. POST mơ hồ
+    được nhận lại theo `clientAlgoId`, không đặt trùng.
+  - **Sàn tự khớp TP/SL:** `sync_exchange_protection` chạy mỗi
+    `protection_sync_seconds` (10s), hoặc ngay khi có `ALGO_UPDATE`. Nó đọc
+    trạng thái algo theo id (WS, dự phòng REST) và giá khớp thật của lệnh
+    MARKET sinh ra, ghi trade reason TP/SL vào JSONL/DB, rồi huỷ guard còn
+    lại (TP/SL Binance không phải OCO). Guard bị huỷ/hết hạn/từ chối mà lot
+    còn mở thì lot chuyển sang đặt lại.
+  - **Không đua với sàn:** khi guard đang armed, bot chờ sàn thực thi trong
+    `protection_grace_seconds` (15s) rồi mới tự market-close. Nếu `close()`
+    thấy guard đã khớp thì ghi nhận fill của sàn thay vì halt.
+  - **Lệnh mồ côi:** `cleanup_orphan_orders` chạy mỗi
+    `orphan_cleanup_seconds` (60s) và lúc khởi động. Nó huỷ algo do bot tạo
+    (`clientAlgoId` dạng `b<SYMBOL><L|S><n>`) mà không lot nào tham chiếu,
+    và chỉ khi leg trên sàn khớp tổng lot local. Lệnh đặt tay luôn được giữ.
+  - **Đóng ngoài sàn (tay, thanh lý, ADL):** `detect_exchange_closed` chỉ
+    ghi nhận khi lot đã mở ≥ `exchange_close_min_age_seconds` và hai lần quét
+    liên tiếp đều thấy leg về 0. Giá lấy từ fill đúng positionSide, sau lúc
+    mở, đúng khối lượng; không tìm thấy thì đánh dấu `estimated`.
 - Startup luôn đối chiếu open normal orders và open Algo Orders theo các
   symbol bot quản lý; nếu protection bật còn kiểm tra
   symbol/positionSide/side/type/quantity của từng guard. Mismatch hoặc không
@@ -188,6 +212,7 @@ nhuận; chỉ xem xét Testnet sau khi OOS trên dữ liệu thật và cost/fu
 pip install -r requirements.txt
 cp config.example.json config.json
 python3 test_binance.py          # smoke test offline, khong can key
+python3 test_protection.py       # vong doi SL/TP, lenh mo coi (offline)
 python3 build_universe.py        # tao universe.json (public API, 1 lan)
 # lan dau: sua mode thanh data_only, sau do chay mot minh bot
 python3 binance_bot.py           # chi public data/candles, khong mo vi the
