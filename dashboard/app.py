@@ -20,6 +20,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))), "db"))
 import bot_config as bc  # noqa: E402  (config runtime + tai khoan)
 
+try:  # logic thuan dung chung voi bot (so tang range grid moi symbol)
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "binance-bot"))
+    import range_grid  # noqa: E402
+except Exception:  # pragma: no cover - dashboard van chay neu thieu
+    range_grid = None
+
 st.set_page_config(page_title="Crypto Bots Dashboard", layout="wide")
 
 # ---------------- cau hinh ----------------
@@ -1601,12 +1608,20 @@ def _tab_scanner():
     if not scans:
         st.info("Chưa có kết quả quét (bot cần chạy bản mới và kết nối DB).")
         return
+    gcfg = {k.split(".", 1)[1]: v for k, v in cfg.items()
+            if k.startswith("grid.")}
+    need = range_grid.min_levels_required(gcfg) if range_grid else None
     rows = []
     for r in scans:
         m = r["metrics"] or {}
         pct = lambda x: None if x is None else round(x * 100, 2)  # noqa
-        rows.append({"Symbol": r["symbol"], "Đạt": "✅" if r["passed"] else "—",
-                     "Điểm": r["score"], "ADX 1h": m.get("adx_1h"),
+        lv = range_grid.levels_per_side(m, gcfg) if range_grid else None
+        ok = "✅" if r["passed"] else "—"
+        if r["passed"] and lv is not None and lv < need:
+            ok = "⚠️ hẹp"
+        rows.append({"Symbol": r["symbol"], "Đạt": ok,
+                     "Điểm": r["score"], "Tầng/phía": lv,
+                     "ADX 1h": m.get("adx_1h"),
                      "ADX 15m": m.get("adx_15m"), "BB %": pct(m.get("bbw_pct")),
                      "BB pctile": m.get("bbw_pctile"),
                      "Biên %": pct(m.get("range_pct")),
@@ -1620,6 +1635,10 @@ def _tab_scanner():
     st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
     st.caption("Vị trí = giá trong biên (0 = đáy, 1 = đỉnh), chỉ cộng điểm. "
                "CHOP cao + ER thấp = dao động qua lại; ADX thấp = không trend.")
+    if need is not None:
+        st.caption("Tầng/phía = số tầng range grid dựng được từ biên + độ "
+                   "giãn hiện tại. ⚠️ hẹp = đạt chuẩn nhưng < %d tầng/phía "
+                   "→ range grid bỏ khi chọn top K." % need)
 
 
 def _tab_admin():

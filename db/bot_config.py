@@ -89,6 +89,13 @@ PARAMS: Tuple[Param, ...] = (
     Param("grid.max_lots_per_symbol", "int", 2, "Grid v2",
           "Số lot tối đa mỗi symbol (range)", 1, 20,
           help="Cùng với 'Số lot grid tối đa' và 'Số symbol grid cùng lúc'."),
+    Param("grid.range_min_levels", "int", 1, "Grid v2",
+          "Số tầng tối thiểu mỗi phía để vào top K (range)", 1, 10,
+          help="Symbol đạt chuẩn scanner nhưng biên quá hẹp so với độ giãn "
+               "(dựng được ít hơn N tầng mỗi phía) bị bỏ khi chọn top K, "
+               "nhường chỗ cho symbol xếp sau. 1 = chỉ bỏ symbol không dựng "
+               "được tầng nào; 2 = đòi đủ 2 tầng (biên > 4 × độ giãn). "
+               "Không vượt 'Số tầng mỗi phía'."),
     Param("grid.boundary_sl_buffer", "float", 0.005, "Grid v2",
           "SL ngoài biên (%)", 0.0, 0.05, pct=True,
           help="SL long = đáy biên × (1 − x), short = đỉnh × (1 + x); không "
@@ -279,6 +286,9 @@ def validate(flat: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
         errors.append("Số lot grid tối đa phải ≤ tổng số lot tối đa")
     if clean["grid.entry_mode"] == "limit" and clean["grid.engine"] != "range":
         errors.append("Vào lệnh LIMIT chỉ hỗ trợ kiểu grid range")
+    if clean["grid.range_min_levels"] > clean["grid.levels_each_side"]:
+        errors.append("Số tầng tối thiểu để vào top K phải ≤ số tầng mỗi "
+                      "phía")
     if clean["grid.engine"] == "range":
         if not clean["scanner.enabled"]:
             errors.append("Range grid cần bật scanner (biên lấy từ scanner)")

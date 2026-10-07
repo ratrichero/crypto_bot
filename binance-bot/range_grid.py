@@ -25,6 +25,9 @@ DEFAULTS = {
     "trend_exit_adx": 25.0, "derisk_on_trend": False,
     "derisk_loss_pct": 0.01, "max_symbols": 0, "max_lots_per_symbol": 2,
     "max_positions": 3, "limit_min_gap_pct": 0.0005,
+    # Chon top K: bo symbol ma bien hep so voi step -> duoi N tang/phia
+    # (dat chuan scanner nhung khong dung duoc luoi, chiem cho top K vo ich).
+    "range_min_levels": 1,
 }
 
 
@@ -77,6 +80,31 @@ def build_range(metrics: dict, grid_cfg: dict, ts: float,
     return {"low": low, "high": high, "mid": mid, "step": step,
             "ts": float(ts), "levels": levels,
             "sl_long": low * (1 - buf), "sl_short": high * (1 + buf)}
+
+
+def levels_per_side(metrics: Optional[dict], grid_cfg: Optional[dict]) -> int:
+    """So tang moi phia ma build_range dung duoc tu metrics scanner (cung
+    step/bien nhu luc bot dung luoi that). 0 = khong dung duoc luoi."""
+    rng = build_range(metrics or {}, gcfg(grid_cfg), 0.0)
+    if not rng:
+        return 0
+    longs = sum(1 for lv in rng["levels"] if lv["side"] == "long")
+    shorts = sum(1 for lv in rng["levels"] if lv["side"] == "short")
+    return min(longs, shorts)
+
+
+def min_levels_required(grid_cfg: Optional[dict]) -> int:
+    """range_min_levels, chan trong [1, levels_each_side] (dat cao hon so
+    tang cau hinh thi khong symbol nao dat -> bot dung im)."""
+    g = gcfg(grid_cfg)
+    need = max(1, int(g.get("range_min_levels") or 1))
+    return min(need, max(1, int(g["levels_each_side"])))
+
+
+def range_tradable(metrics: Optional[dict],
+                   grid_cfg: Optional[dict]) -> bool:
+    """Symbol du tang de vao top K range grid?"""
+    return levels_per_side(metrics, grid_cfg) >= min_levels_required(grid_cfg)
 
 
 def lot_exits(rng: dict, side: str, entry: float,

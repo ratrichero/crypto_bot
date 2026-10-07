@@ -624,8 +624,30 @@ def range_allowed_symbols():
     uni = set(SYMBOLS)
     res = {k: v for k, v in SCANNER.results.items()
            if k in uni and not is_disabled(k) and k not in MANAGE_ONLY}
-    return set(range_scanner.allowed_symbols(
-        res, int(sc["top_k"]), SCANNER.clock(), SCANNER.max_age()))
+    g = CFG["grid"]
+    thin = set()
+
+    def eligible(r):
+        # Dat chuan nhung bien qua hep so voi step -> duoi range_min_levels
+        # tang/phia: khong cho chiem cho top K.
+        ok = range_grid.range_tradable(r.get("metrics") or {}, g)
+        if not ok:
+            thin.add(r.get("symbol"))
+        return ok
+    out = set(range_scanner.allowed_symbols(
+        res, int(sc["top_k"]), SCANNER.clock(), SCANNER.max_age(),
+        eligible=eligible))
+    global _RANGE_THIN
+    if thin != _RANGE_THIN:
+        added = sorted(s for s in thin - _RANGE_THIN if s)
+        if added:
+            log("RANGE: bo khoi top K (bien hep, < %d tang/phia): %s"
+                % (range_grid.min_levels_required(g), ", ".join(added)))
+        _RANGE_THIN = thin
+    return out
+
+
+_RANGE_THIN: set = set()
 
 
 def range_slot_ok(st, symbol, pending=None):

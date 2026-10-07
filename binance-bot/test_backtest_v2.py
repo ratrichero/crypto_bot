@@ -366,5 +366,56 @@ with tempfile.TemporaryDirectory() as d:
     check("cli study: dung lai cache, ghi report",
           rc == 0 and "verdict" in json.load(open(out)))
 
+# ------------------------------------------- range_min_levels (phuong an C)
+G1 = dict(G, levels_each_side=2, step_min=0.01, step_max=0.015,
+          step_mult=0.8)
+
+
+def mm(w, atr=None):
+    return {"range_low": 100 * (1 - w / 2), "range_high": 100 * (1 + w / 2),
+            "atr15_pct": atr}
+
+
+check("levels_per_side: bien 2.5%, step 1% -> 1 tang",
+      rg.levels_per_side(mm(0.025), G1) == 1)
+check("levels_per_side: bien 2.5%, step 1.5% (ATR 2%) -> 0 tang",
+      rg.levels_per_side(mm(0.025, 0.02), G1) == 0)
+check("levels_per_side: bien 4.0% step 1% -> 1 (dung bien chua co tang 2)",
+      rg.levels_per_side(mm(0.040), G1) == 1)
+check("levels_per_side: bien 4.5% step 1% -> 2",
+      rg.levels_per_side(mm(0.045), G1) == 2)
+check("levels_per_side: thieu bien -> 0", rg.levels_per_side({}, G1) == 0)
+check("range_tradable mac dinh (1): chi loai 0 tang",
+      rg.range_tradable(mm(0.025), G1)
+      and not rg.range_tradable(mm(0.025, 0.02), G1))
+check("range_min_levels=2: bien 4% bi loai, 4.5% dat",
+      not rg.range_tradable(mm(0.04), dict(G1, range_min_levels=2))
+      and rg.range_tradable(mm(0.045), dict(G1, range_min_levels=2)))
+check("range_min_levels > levels_each_side -> chan ve levels_each_side",
+      rg.min_levels_required(dict(G1, range_min_levels=9)) == 2)
+
+_judge = bt.scanner.judge
+try:
+    # judge gia: raw = (passed, score, metrics, reasons)
+    bt.scanner.judge = lambda raw, sc: raw
+    scans = {"A": {0: (True, 90, mm(0.025, 0.02), [])},   # 0 tang
+             "B": {0: (True, 80, mm(0.05), [])},
+             "C": {0: (True, 70, mm(0.03), [])},
+             "D": {0: (False, 99, mm(0.05), [])}}
+    cfg = dict(CFG, grid=dict(G1), scanner={"top_k": 2})
+    ps = bt.PortfolioSim({k: mk([(100, 100, 100, 100)]) for k in scans},
+                         scans, cfg, "market")
+    ps._update_scans(0)
+    check("backtest top K: bo symbol 0 tang, nhuong cho symbol xep sau",
+          ps.allowed == ["B", "C"], ps.allowed)
+    cfg["grid"]["range_min_levels"] = 2
+    ps = bt.PortfolioSim({k: mk([(100, 100, 100, 100)]) for k in scans},
+                         scans, cfg, "market")
+    ps._update_scans(0)
+    check("backtest top K: range_min_levels=2 chi giu bien du 2 tang",
+          ps.allowed == ["B"], ps.allowed)
+finally:
+    bt.scanner.judge = _judge
+
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
 sys.exit(1 if FAIL else 0)

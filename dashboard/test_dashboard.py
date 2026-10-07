@@ -190,7 +190,60 @@ def test_config_helpers():
           and "INSERT INTO dashboard_users" not in SRC)
 
 
-TESTS = [test_sol_wallet, test_live_radar_halt_status, test_config_helpers]
+def test_scanner_tab_levels():
+    print("== Scanner tab: cot Tang/phia + canh bao bien hep ==")
+    import sys
+    root = os.path.dirname(HERE)
+    for sub in ("db", "binance-bot"):
+        if os.path.join(root, sub) not in sys.path:
+            sys.path.insert(0, os.path.join(root, sub))
+    import bot_config as bc
+    import range_grid
+
+    class FakeSt:
+        def __init__(self):
+            self.frames, self.captions = [], []
+
+        def caption(self, t):
+            self.captions.append(t)
+
+        def dataframe(self, df, **kw):
+            self.frames.append(df)
+
+        def markdown(self, *a, **k):
+            pass
+
+        warning = info = markdown
+
+    def scan(sym, w, passed=True):
+        return {"symbol": sym, "passed": passed, "score": 70, "reasons": [],
+                "ts": 0, "metrics": {"range_low": 100 * (1 - w / 2),
+                                     "range_high": 100 * (1 + w / 2),
+                                     "atr15_pct": None, "range_pct": w}}
+    scans = [scan("WIDE", 0.05), scan("THIN", 0.015), scan("FAIL", 0.05,
+                                                           False)]
+
+    def db_call(fn, *a):
+        return scans if fn is bc.latest_scans else None
+    fst = FakeSt()
+    ns = load("_tab_scanner", extra={
+        "bc": bc, "range_grid": range_grid, "st": fst, "db_call": db_call,
+        "pd": type("PD", (), {"DataFrame": staticmethod(lambda r: r)}),
+        "_ts_local": lambda t: t})
+    ns["_tab_scanner"]()
+    rows = {r["Symbol"]: r for r in fst.frames[0]}
+    check("cot Tang/phia (step 1%, 2 tang cau hinh)",
+          rows["WIDE"]["Tầng/phía"] == 2 and rows["THIN"]["Tầng/phía"] == 0,
+          rows)
+    check("dat chuan nhung 0 tang -> canh bao hep",
+          rows["THIN"]["Đạt"] == "⚠️ hẹp" and rows["WIDE"]["Đạt"] == "✅"
+          and rows["FAIL"]["Đạt"] == "—", rows)
+    check("chu thich so tang toi thieu", any("< 1 tầng/phía" in c
+                                             for c in fst.captions))
+
+
+TESTS = [test_sol_wallet, test_live_radar_halt_status, test_config_helpers,
+         test_scanner_tab_levels]
 
 if __name__ == "__main__":
     for t in TESTS:

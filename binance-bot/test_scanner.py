@@ -143,6 +143,9 @@ check("rank: dat chuan truoc roi diem",
 check("allowed: top K, bo truot + het han",
       sc.allowed_symbols(res, 1, now=150, max_age_seconds=100) == ["B"]
       and sc.allowed_symbols(res, 5, 150, 100) == ["B", "A"])
+check("allowed: eligible loc TRUOC khi cat top K",
+      sc.allowed_symbols(res, 1, 150, 100,
+                         eligible=lambda r: r["symbol"] != "B") == ["A"])
 
 # ----------------------------------------------- ScannerRunner
 clock = [10000.0]

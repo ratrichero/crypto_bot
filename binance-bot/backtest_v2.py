@@ -340,7 +340,9 @@ class PortfolioSim:
             return
         fresh = [(sym, s["scan"]) for sym, s in self.sym.items()
                  if s["scan"] and s["scan"]["passed"]
-                 and ts - s["scan"]["ts"] <= self.max_age_ms]
+                 and ts - s["scan"]["ts"] <= self.max_age_ms
+                 # nhu live: bo symbol duoi range_min_levels tang/phia
+                 and range_grid.range_tradable(s["scan"]["metrics"], self.g)]
         fresh.sort(key=lambda x: -x[1]["score"])
         self.allowed = [sym for sym, _ in fresh[:int(self.sc["top_k"])]]
 

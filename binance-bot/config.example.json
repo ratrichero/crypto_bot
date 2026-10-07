@@ -81,6 +81,7 @@
   "max_symbols": 0,
   "order_notional": 1000.0,
   "partial_fill_timeout_seconds": 60,
+  "range_min_levels": 1,
   "range_steps": 6,
   "sl_pct": 0.03,
   "step_max": 0.015,

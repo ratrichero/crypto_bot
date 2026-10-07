@@ -131,6 +131,25 @@ try:
     check("allowed: symbol MANAGE_ONLY bi loai",
           bb.range_allowed_symbols() == {"BTCUSDT"})
     bb.MANAGE_ONLY.discard("ETHUSDT")
+    # Phuong an C: dat chuan nhung bien qua hep so voi step -> bo khoi top K
+    saved_results = copy.deepcopy(bb.SCANNER.results)
+    bb.SCANNER.results["SOLUSDT"] = scan("SOLUSDT", score=95, low=99.4,
+                                         high=100.6)       # 1.2% < 2 step
+    logs.clear()
+    check("allowed: bien hep 0 tang bi bo, nhuong cho top K cho ETH",
+          bb.range_allowed_symbols() == {"BTCUSDT", "ETHUSDT"})
+    check("allowed: log symbol bi bo (1 lan)",
+          any("SOLUSDT" in x and "bien hep" in x for x in logs), logs)
+    n = len(logs)
+    bb.range_allowed_symbols()
+    check("allowed: khong log lap moi vong", len(logs) == n, logs[n:])
+    bb.SCANNER.results["ETHUSDT"] = scan("ETHUSDT", score=60, low=97,
+                                         high=103)          # 2 tang/phia
+    G["range_min_levels"] = 3
+    check("allowed: range_min_levels=3 -> ETH (2 tang) bi bo",
+          bb.range_allowed_symbols() == {"BTCUSDT"})
+    G["range_min_levels"] = 1
+    bb.SCANNER.results = saved_results
 
     allowed = {"BTCUSDT", "ETHUSDT"}
     # ------------------------------------------------ build + entries

@@ -234,11 +234,14 @@ def rank(results: Sequence[dict]) -> List[dict]:
 
 
 def allowed_symbols(results: Dict[str, dict], top_k: int, now: float,
-                    max_age_seconds: float) -> List[str]:
-    """Symbol dat chuan, con moi, top K (che do filter)."""
+                    max_age_seconds: float, eligible=None) -> List[str]:
+    """Symbol dat chuan, con moi, top K (che do filter).
+
+    eligible(result) -> bool: loc them TRUOC khi cat top K (range grid: bo
+    symbol khong du tang de cho cho symbol xep sau)."""
     fresh = [r for r in results.values()
              if r.get("passed") and now - float(r.get("ts", 0))
-             <= max_age_seconds]
+             <= max_age_seconds and (eligible is None or eligible(r))]
     return [r["symbol"] for r in rank(fresh)[:max(0, int(top_k))]]
 
 
