@@ -21,6 +21,8 @@ venv/
 .db_url
 config.live.json
 .solana_key
+.env
+.jupiter_key
 
 # Binance bot runtime guards
 binance-bot/*.lock
