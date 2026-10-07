@@ -1003,6 +1003,137 @@ class BinanceEngine:
                      self.state.get("halted_at", "unknown"))
         return True
 
+    def detect_exchange_closed(self, mark_prices=None):
+        """Phat hien vi the da bi dong tren san (TP/SL algo khop) ma bot chua biet.
+
+        Xay ra khi bot dang halt hoac miss tin WS: algo order tren san khop,
+        vi the bien mat nhung state van giu. Moi lot thuoc (symbol, side) ma
+        san con ~0 duoc ghi trade uoc tinh (exit = TP/SL gan nhat, danh dau
+        estimated=True), day vao DB, xoa khoi state. Tra ve list rec de main
+        loop goi _record_close (JSONL + grid bookkeeping).
+
+        Chi xu ly truong hop san ve ~0 hoan toan; dong mot phan thi de
+        reconcile_positions halt nhu cu.
+        """
+        if self.dry_run:
+            return []
+        now = time.time()
+        if now - getattr(self, "_last_detect_closed", 0) < 10:
+            return []
+        self._last_detect_closed = now
+        try:
+            rows = self._private_call("private:account",
+                                      self.ex.fetch_positions, _weight=5)
+        except binance_safety.BinanceSafetyStop:
+            raise
+        except Exception as exc:
+            self.log("WARNING detect_exchange_closed: khong lay duoc "
+                     "positions: %s" % binance_safety.redact_body(exc))
+            return []
+        exchange = self._aggregate_positions(rows)
+        marks = mark_prices or {}
+        recs = []
+        for pos in list(self.state.get("positions", [])):
+            key = (pos.get("symbol"), pos.get("side"))
+            local_qty = float(pos.get("qty", 0) or 0)
+            if local_qty <= 0:
+                continue
+            actual = exchange.get(key, 0.0)
+            try:
+                step = float((self._filters_for(key[0]) or (0,))[0] or 0)
+            except Exception:
+                step = 0.0
+            tolerance = max(step * 1.1, abs(local_qty) * 0.001, 1e-10)
+            if abs(local_qty - actual) <= tolerance:
+                continue  # khop voi san
+            if actual > tolerance:
+                continue  # dong mot phan -> de reconcile_positions halt nhu cu
+            # San ve ~0 trong khi state van co -> da bi dong ngoai
+            symbol, side = key
+            entry = float(pos.get("entry", 0) or 0)
+            tp = pos.get("tp")
+            sl = pos.get("sl")
+            mark = marks.get(symbol)
+            try:
+                mark = float(mark) if mark is not None else None
+            except (TypeError, ValueError):
+                mark = None
+            fired, exit_px = "?", None
+            if side == "long":
+                if tp and mark is not None and mark >= tp:
+                    fired, exit_px = "TP", tp
+                elif sl and mark is not None and mark <= sl:
+                    fired, exit_px = "SL", sl
+                elif tp:
+                    fired, exit_px = "TP?", tp
+                elif sl:
+                    fired, exit_px = "SL?", sl
+            else:
+                if tp and mark is not None and mark <= tp:
+                    fired, exit_px = "TP", tp
+                elif sl and mark is not None and mark >= sl:
+                    fired, exit_px = "SL", sl
+                elif tp:
+                    fired, exit_px = "TP?", tp
+                elif sl:
+                    fired, exit_px = "SL?", sl
+            # Thu lay gia khop that tu lich su giao dich san
+            actual_exit = None
+            try:
+                trades = self._private_call(
+                    "private:account", self.ex.fetch_my_trades, symbol, None,
+                    5, _weight=5)
+                # Tim lenh dong gan nhat (nguoc chieu voi side)
+                close_side = "sell" if side == "long" else "buy"
+                for t in reversed(trades or []):
+                    if str(t.get("side", "")).lower() == close_side:
+                        actual_exit = float(t.get("price") or 0)
+                        if actual_exit > 0:
+                            fired = "EXCHANGE"
+                            break
+            except Exception:
+                pass
+            if actual_exit:
+                exit_px = actual_exit
+            elif exit_px is None:
+                exit_px = mark if mark else entry
+            if side == "long":
+                pnl = (exit_px - entry) * local_qty
+            else:
+                pnl = (entry - exit_px) * local_qty
+            fee = self._fees(pos.get("notional", 0) or 0)
+            net = pnl - fee
+            self.state["equity"] = float(self.state.get("equity", 0) or 0) + net
+            self.state["stats"]["fees"] = float(
+                self.state["stats"].get("fees", 0) or 0) + fee
+            self.state["stats"]["trades"] = int(
+                self.state["stats"].get("trades", 0) or 0) + 1
+            if net > 0:
+                self.state["stats"]["wins"] = int(
+                    self.state["stats"].get("wins", 0) or 0) + 1
+            else:
+                self.state["stats"]["losses"] = int(
+                    self.state["stats"].get("losses", 0) or 0) + 1
+            rec = {
+                "id": pos["id"], "symbol": symbol, "side": side,
+                "tag": pos.get("tag"), "entry": round(entry, 6),
+                "exit": round(exit_px, 6),
+                "notional": round(float(pos.get("notional", 0) or 0), 2),
+                "pnl": round(net, 2), "reason": "CLOSED_ON_EXCHANGE",
+                "closed_at": int(now),
+                "live": True, "dry": self.dry_run,
+                "estimated": fired != "EXCHANGE", "exit_fired": fired,
+            }
+            self.state["positions"] = [p for p in self.state["positions"]
+                                       if p.get("id") != pos["id"]]
+            self._db_insert_trade(rec)
+            self.log("EXCHANGE_CLOSE #%s %s %s: khong con tren san, uoc tinh "
+                     "dong @%s (%s) pnl=%+.2f [estimated]"
+                     % (pos["id"], symbol, side, round(exit_px, 6), fired,
+                        net))
+            recs.append(rec)
+        return recs
+
     def _reconcile_startup_open_orders(self):
         """Block resume when a previous normal order is still working."""
         if self.dry_run:
