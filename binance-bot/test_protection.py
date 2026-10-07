@@ -820,6 +820,66 @@ def test_startup_lot_without_guard_is_rearmed_not_halted():
           and len(fake.open_algos()) == 2, fake.open_algos())
 
 
+# ===================================================================
+# Close dung qty lot (khong de bui) + quet bui cu khi lot cuoi cua leg
+# ===================================================================
+def test_close_exact_qty_leaves_no_dust():
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    st["equity"] = 1e7   # lot lon de tai hien sai so float, tranh exposure_cap
+    # 125400 / 60000 = 2.09 dung; dong o 8254.3181: qty_for(2.09*px, px)
+    # cu lam tron xuong thanh 2.089 (sai so float) -> bui 0.001.
+    a = open_lot(eng, "long", 60000, notional=125400.0, sl_pct=0.9,
+                 tp_pct=0.9)
+    check("dust: lot mo dung 2.09", a["qty"] == 2.09, a["qty"])
+    check("dust: qty_for cu se hut 1 step",
+          live_binance.qty_for(2.09 * 8254.3181, 8254.3181, 0.001) == 2.089)
+    fake.prices["BTCUSDT"] = 8254.3181
+    rec = eng.close(a, 8254.3181, "SL")
+    check("dust: close tra record", rec is not None, eng.logs[-3:])
+    check("dust: san ve 0, khong con bui",
+          fake.positions.get(("BTCUSDT", "long"), 0) == 0, fake.positions)
+    # lan 2 tren cung leg: code cu se tich 2 step bui -> reconcile halt
+    b = open_lot(eng, "long", 60000, notional=125400.0, sl_pct=0.9,
+                 tp_pct=0.9)
+    fake.prices["BTCUSDT"] = 8254.3181
+    eng.close(b, 8254.3181, "SL")
+    ok = eng.reconcile_positions(force=True)
+    check("dust: 2 lan dong lien tiep -> reconcile OK, khong halt",
+          ok and not st.get("halted"), (st.get("halt_reason"), fake.positions))
+
+
+def test_close_last_lot_sweeps_old_dust_only():
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    a = open_lot(eng, "long", 60000)
+    fake.positions[("BTCUSDT", "long")] += 0.002   # bui 2 step tu lan cu
+    eng.close(a, 60100, "TP")
+    check("sweep: lot cuoi dong ca bui <= 2 step",
+          fake.positions.get(("BTCUSDT", "long"), 0) == 0, fake.positions)
+    check("sweep: khong halt", not st.get("halted"), st.get("halt_reason"))
+    b = open_lot(eng, "long", 60000)
+    fake.positions[("BTCUSDT", "long")] += 0.5      # vi the tay lon
+    eng.close(b, 60100, "TP")
+    check("sweep: KHONG dong phan lon (vi the tay)",
+          abs(fake.positions.get(("BTCUSDT", "long"), 0) - 0.5) < 1e-9,
+          fake.positions)
+
+
+def test_close_with_sibling_never_sweeps():
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    a = open_lot(eng, "long", 60000, level="b1")
+    open_lot(eng, "long", 59700, level="b2")
+    fake.positions[("BTCUSDT", "long")] += 0.001
+    fake.calls.clear()
+    eng.close(a, 60300, "TP")
+    check("sibling: con lot khac -> khong doc leg truoc / khong quet",
+          fake.calls.count("fetch_positions") == 1
+          and abs(fake.positions[("BTCUSDT", "long")] - 0.011) < 1e-9,
+          (fake.calls, fake.positions))
+
+
 TESTS = [
     test_close_one_of_many_grid_lots,
     test_close_detects_real_partial,
@@ -852,6 +912,9 @@ TESTS = [
     test_orphan_after_exchange_tp_never_hits_new_lot,
     test_startup_orphans_cancelled_instead_of_halt,
     test_startup_lot_without_guard_is_rearmed_not_halted,
+    test_close_exact_qty_leaves_no_dust,
+    test_close_last_lot_sweeps_old_dust_only,
+    test_close_with_sibling_never_sweeps,
 ]
 
 

@@ -33,7 +33,7 @@ import re
 import threading
 import time
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 
 import binance_safety
 
@@ -77,6 +77,19 @@ def qty_for(notional, price, step_size, min_qty=0.0, min_notional=0.0):
         return None
     if float(q) * float(price) < float(min_notional):
         return None
+    return float(q)
+
+
+def normalize_qty(qty, step_size):
+    """Lam tron qty ve boi so GAN NHAT cua stepSize (khu sai so float).
+
+    Dung cho qty da hop le (lot da mo / vi the san), khong dung de size lenh
+    moi (lenh moi lam tron XUONG bang qty_for)."""
+    if not step_size or float(step_size) <= 0:
+        return float(qty or 0)
+    step = Decimal(str(step_size))
+    q = (Decimal(str(qty or 0)) / step).to_integral_value(
+        rounding=ROUND_HALF_UP) * step
     return float(q)
 
 
@@ -2399,10 +2412,17 @@ class BinanceEngine:
                 filters = self._filters_for(symbol)
                 if filters is None:
                     raise RuntimeError("unknown_symbol: %s" % symbol)
-                step, minq, minn = filters
-                qty = qty_for(pos["qty"] * price, price, step, minq, minn)
-                if qty is None:
-                    qty = minq  # vi the qua nho -> thu dong voi minQty
+                step = filters[0]
+                # Dong DUNG qty cua lot (da hop le stepSize luc mo). Truoc day
+                # qty_for(qty*price, price) lam tron XUONG sau phep nhan/chia
+                # float -> ~16% lan dong hut 1 step, de lai bui khong TP/SL
+                # tren san; bui tich luy -> reconcile mismatch -> halt.
+                qty = normalize_qty(pos["qty"], step)
+                if qty <= 0:
+                    raise RuntimeError("close qty khong hop le: %s"
+                                       % pos["qty"])
+                if remaining_expected <= 1e-12:  # khong con lot nao khac
+                    qty = self._sweep_leg_dust(symbol, side, qty, step)
             oid, client_order_id = self._place_market(
                 symbol, bside, qty, ps, reduce_only=True, ref_price=price
             )
@@ -2488,6 +2508,29 @@ class BinanceEngine:
             self.state["halt_reason"] = "close action requires reconciliation"
             self._mark_action_failure(key, e)
             return None
+
+    def _sweep_leg_dust(self, symbol, side, qty, step):
+        """Lot cuoi cua leg: neu san con du <= 2 step (bui tu lan dong cu),
+        dong luon phan du trong cung lenh. Khong bao gio dong phan lon hon
+        (co the la vi the nguoi dung tu mo). Loi doc san -> giu qty lot."""
+        try:
+            leg = self._aggregate_positions(self._private_call(
+                "private:account", self.ex.fetch_positions, _weight=5)
+            ).get((symbol, side), 0.0)
+        except binance_safety.BinanceSafetyStop:
+            raise
+        except Exception as exc:
+            self.log("WARNING close %s %s: khong doc duoc leg truoc khi dong "
+                     "(%s) -> dong dung qty lot" %
+                     (symbol, side, binance_safety.redact_body(exc)))
+            return qty
+        leg = normalize_qty(leg, step)
+        dust = leg - qty
+        if 0 < dust <= float(step) * 2 + 1e-12:
+            self.log("CLEANUP close %s %s: san con %s, lot %s -> dong ca bui "
+                     "%s" % (symbol, side, leg, qty, normalize_qty(dust, step)))
+            return leg
+        return qty
 
     def unrealized(self, prices):
         u = 0.0
