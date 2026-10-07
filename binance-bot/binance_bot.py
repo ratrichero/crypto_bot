@@ -587,6 +587,17 @@ def main():
 
 
             if MODE == "live":
+                # Vong doi SL/TP tren san (ALGO_UPDATE + query theo algoId):
+                # guard khop -> ghi PnL that tu fill + huy guard con lai;
+                # guard bi huy/het han/tu choi -> danh dau dat lai.
+                try:
+                    for rec in engine.sync_exchange_protection():
+                        _record_close(st, rec)
+                        dirty = True
+                except binance_safety.BinanceSafetyStop:
+                    raise
+                except Exception as e:
+                    log(f"sync_exchange_protection loi: {e}")
                 # Phat hien vi the bi TP/SL tren san dong ma bot chua biet
                 # (VD khi dang halt hoac miss WS): ghi trade uoc tinh truoc
                 # khi reconcile, de mismatch tu het thay vi treo halt.

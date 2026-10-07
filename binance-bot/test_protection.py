@@ -435,6 +435,90 @@ def test_detect_reason_unknown_when_estimated():
           and recs[0]["estimated"] is True, recs)
 
 
+# ===================================================================
+# 6. Algo lifecycle: Binance closes a lot via its own TP/SL
+# ===================================================================
+def sync(eng, advance=11):
+    CLOCK.sleep(advance)
+    return eng.sync_exchange_protection()
+
+
+def test_sync_books_exchange_tp_with_real_fill():
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    a = open_lot(eng, "long", 60000, level="b1")
+    b = open_lot(eng, "long", 59700, level="b2")
+    fake.fire(a["tp_algo_id"], price=60305.5)          # Binance TP fills
+    recs = sync(eng)
+    rec = recs[0] if recs else {}
+    check("sync: TP khop tren san duoc ghi nhan", len(recs) == 1, eng.logs[-5:])
+    check("sync: dung lot, reason TP", rec.get("id") == a["id"]
+          and rec.get("reason") == "TP", rec)
+    check("sync: gia = fill that cua lenh TP", rec.get("exit") == 60305.5
+          and rec.get("estimated") is False, rec)
+    check("sync: PnL ghi vao DB", eng.db_rows and eng.db_rows[-1]["id"] == a["id"])
+    check("sync: SL anh em cua lot da dong bi huy",
+          fake.algos[a["sl_algo_id"]]["algoStatus"] == "CANCELED")
+    check("sync: guard cua lot con lai giu nguyen",
+          fake.algos[b["sl_algo_id"]]["algoStatus"] == "NEW"
+          and fake.algos[b["tp_algo_id"]]["algoStatus"] == "NEW")
+    check("sync: state chi con lot b2",
+          [p["id"] for p in st["positions"]] == [b["id"]])
+    check("sync: reconcile khop sau khi ghi nhan",
+          eng.reconcile_positions(force=True) and not st.get("halted"),
+          st.get("halt_reason"))
+
+
+def test_sync_uses_ws_algo_event():
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    lot = open_lot(eng, "short", 60000, tag="scalp", sl_pct=0.004,
+                   tp_pct=0.01)
+    order = fake.fire(lot["sl_algo_id"], price=60252.0)
+    eng.on_user_event({"e": "ALGO_UPDATE", "o": {
+        "s": "BTCUSDT", "aid": lot["sl_algo_id"], "X": "FINISHED",
+        "ai": str(order["orderId"]), "ap": "60252.0",
+        "aq": str(lot["qty"]), "ps": "SHORT"}})
+    before = list(fake.calls)
+    recs = eng.sync_exchange_protection()        # due immediately via WS
+    new_calls = fake.calls[len(before):]
+    check("ws: ALGO_UPDATE kich hoat sync ngay", len(recs) == 1, recs)
+    check("ws: reason SL + gia ap tu event",
+          recs and recs[0]["reason"] == "SL" and recs[0]["exit"] == 60252.0,
+          recs)
+    check("ws: khong can query REST algo/order",
+          "get_algo" not in new_calls and "fetch_order" not in new_calls,
+          new_calls)
+
+
+def test_sync_guard_cancelled_keeps_lot_and_rearms():
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    lot = open_lot(eng, "long", 60000, level="b1")
+    fake.fapiPrivateDeleteAlgoOrder({"algoId": lot["sl_algo_id"]})  # by hand
+    recs = sync(eng)
+    check("guard bi huy: khong ghi dong lot", recs == [] and
+          len(st["positions"]) == 1)
+    check("guard bi huy: lot chuyen sang dat lai",
+          st["positions"][0]["protection_status"] == "retrying"
+          and st["positions"][0]["sl_algo_id"] is None)
+
+
+def test_sync_unknown_status_changes_nothing():
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    lot = open_lot(eng, "long", 60000, level="b1")
+    fake.fire(lot["tp_algo_id"])
+
+    def broken(params):
+        raise BinanceError("timeout")
+    fake.fapiPrivateGetAlgoOrder = broken
+    recs = sync(eng)
+    check("query loi: khong doan, khong xoa lot", recs == []
+          and len(st["positions"]) == 1
+          and st["positions"][0]["protection_status"] == "armed")
+
+
 TESTS = [
     test_close_one_of_many_grid_lots,
     test_close_detects_real_partial,
@@ -448,6 +532,10 @@ TESTS = [
     test_detect_cancels_leftover_guards,
     test_detect_reason_from_real_fill,
     test_detect_reason_unknown_when_estimated,
+    test_sync_books_exchange_tp_with_real_fill,
+    test_sync_uses_ws_algo_event,
+    test_sync_guard_cancelled_keeps_lot_and_rearms,
+    test_sync_unknown_status_changes_nothing,
 ]
 
 

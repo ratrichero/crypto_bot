@@ -120,6 +120,10 @@ class BinanceEngine:
         self._action_cooldowns = {}
         self._symbol_cooldowns = {}
         self._order_events = {}
+        # ALGO_UPDATE events keyed "SYMBOL:algoId" (algoId is per symbol).
+        self._algo_events = {}
+        self._protection_sync_due = True
+        self._last_protection_sync = 0.0
         self._order_condition = threading.Condition()
         self._last_account_event = 0.0
         self._account_position_snapshot = {}
@@ -415,6 +419,25 @@ class BinanceEngine:
                      "positionSide=%s"
                      % (order.get("s"), order.get("i"), order.get("X"),
                         order.get("x"), order.get("ps")))
+        elif kind == "ALGO_UPDATE":
+            order = event.get("o") or {}
+            symbol = str(order.get("s") or "").upper()
+            algo_id = order.get("aid")
+            status = str(order.get("X") or "").upper()
+            if algo_id is not None and symbol:
+                with self._order_condition:
+                    self._algo_events["%s:%s" % (symbol, algo_id)] = order
+                    if len(self._algo_events) > 4096:
+                        for _ in range(1024):
+                            self._algo_events.pop(next(iter(self._algo_events)))
+            if status not in ("NEW", "TRIGGERING"):
+                # A guard finished/was cancelled: resolve it on the next loop
+                # instead of waiting for the periodic protection sync.
+                self._protection_sync_due = True
+            self.log("USER ALGO event symbol=%s algo=%s status=%s ap=%s aq=%s "
+                     "positionSide=%s rm=%s"
+                     % (symbol, algo_id, status, order.get("ap"),
+                        order.get("aq"), order.get("ps"), order.get("rm")))
         elif kind == "ACCOUNT_UPDATE":
             self._last_account_event = time.time()
             for position in (event.get("a") or {}).get("P", []):
@@ -653,13 +676,15 @@ class BinanceEngine:
                     # The POST may have reached Binance before the transport
                     # failed. Reconcile by clientAlgoId before cleanup; an
                     # unknown Algo id must never become an invisible orphan.
-                    algo_id = self._find_open_algo_by_client_id(client_algo_id)
+                    algo_id = self._find_open_algo_by_client_id(
+                        client_algo_id, pos["symbol"])
                     if not algo_id:
                         raise
                 if not algo_id:
                     # A successful HTTP response without an id is also
                     # ambiguous; query the idempotency key once.
-                    algo_id = self._find_open_algo_by_client_id(client_algo_id)
+                    algo_id = self._find_open_algo_by_client_id(
+                        client_algo_id, pos["symbol"])
                 if not algo_id:
                     raise RuntimeError("Binance algo order missing algoId")
                 orders[label] = algo_id
@@ -1310,6 +1335,252 @@ class BinanceEngine:
                     return group["cost"] / group["qty"], oid
         return None, None
 
+    # ------------------------------------------- protection lifecycle
+    _ALGO_IN_FLIGHT = ("NEW", "TRIGGERING", "TRIGGERED")
+    _ALGO_LOST = ("CANCELED", "CANCELLED", "EXPIRED", "REJECTED")
+
+    @staticmethod
+    def _float_or_none(value):
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+        return value
+
+    def _algo_outcome(self, pos, label):
+        """What happened to one guard of ``pos``.
+
+        Returns {"status", "order_id", "avg", "qty", "reason"} or None when
+        it cannot be determined (caller must then change nothing).  The
+        private-stream ALGO_UPDATE is preferred; REST Query Algo Order is the
+        fallback after a stream gap or restart.  For a FINISHED guard the
+        resulting MARKET order is read for the real average fill/quantity.
+        """
+        symbol = str(pos.get("symbol") or "").upper()
+        algo_id = pos.get("%s_algo_id" % label)
+        client_algo_id = pos.get("%s_client_algo_id" % label)
+        if not algo_id and not client_algo_id:
+            return None
+        with self._order_condition:
+            event = self._algo_events.get("%s:%s" % (symbol, algo_id))
+        outcome = None
+        if event is not None:
+            outcome = {
+                "status": str(event.get("X") or "").upper(),
+                "order_id": event.get("ai") or None,
+                "avg": self._float_or_none(event.get("ap")),
+                "qty": self._float_or_none(event.get("aq")),
+                "reason": event.get("rm"),
+            }
+            if outcome["status"] in self._ALGO_IN_FLIGHT:
+                outcome = None   # stale snapshot; ask REST for the latest
+        if outcome is None:
+            params = ({"clientAlgoId": client_algo_id} if client_algo_id
+                      else {"algoId": algo_id})
+            try:
+                row = self._private_call("private:order_status",
+                                         self.ex.fapiPrivateGetAlgoOrder,
+                                         params)
+            except binance_safety.BinanceSafetyStop:
+                raise
+            except Exception as exc:
+                self.log("WARNING query algo %s %s: %s" %
+                         (symbol, algo_id or client_algo_id,
+                          binance_safety.redact_body(exc)))
+                return None
+            row = row or {}
+            if str(row.get("symbol") or symbol).upper() != symbol or (
+                    algo_id and row.get("algoId") is not None
+                    and str(row.get("algoId")) != str(algo_id)):
+                self.log("WARNING query algo %s returned another order %s/%s"
+                         % (algo_id, row.get("symbol"), row.get("algoId")))
+                return None
+            outcome = {
+                "status": str(row.get("algoStatus") or "").upper(),
+                "order_id": row.get("actualOrderId") or None,
+                "avg": self._float_or_none(row.get("actualPrice")),
+                "qty": None,
+                "reason": row.get("rejectReason") or row.get("rm"),
+            }
+        if outcome["avg"] is not None and outcome["avg"] <= 0:
+            outcome["avg"] = None
+        if (outcome["status"] == "FINISHED" and outcome["order_id"]
+                and (outcome["avg"] is None or outcome["qty"] is None)):
+            try:
+                order = self._private_call(
+                    "private:order_status", self.ex.fetch_order,
+                    str(outcome["order_id"]),
+                    self._ccxt_symbol(symbol) or symbol)
+                outcome["avg"] = outcome["avg"] or self._order_average(order)
+                outcome["qty"] = self._float_or_none(
+                    (order or {}).get("filled")
+                    or (order or {}).get("executedQty"))
+            except binance_safety.BinanceSafetyStop:
+                raise
+            except Exception as exc:
+                self.log("WARNING fetch algo fill order %s: %s" %
+                         (outcome["order_id"],
+                          binance_safety.redact_body(exc)))
+        # qty None = unknown fill (fail closed: caller changes nothing);
+        # qty 0 = Binance explicitly reports no execution.
+        return outcome
+
+    def _mark_guard_lost(self, pos, label, outcome):
+        """A guard ended without closing the lot: forget it and re-arm."""
+        now = time.time()
+        self.log("WARNING PROTECTION #%s %s %s guard %s algo=%s ket thuc "
+                 "status=%s reason=%s nhung lot van mo -> dat lai"
+                 % (pos.get("id"), pos.get("symbol"), pos.get("side"),
+                    label.upper(), pos.get("%s_algo_id" % label),
+                    outcome.get("status"), outcome.get("reason")))
+        pos["%s_algo_id" % label] = None
+        pos["%s_client_algo_id" % label] = None
+        pos["protection_status"] = "retrying"
+        pos["protection_retry_at"] = now
+        pos.setdefault("protection_deadline", now + 120)
+
+    def _finalize_exchange_close(self, pos, label, outcome):
+        """Book a lot that Binance closed through its own TP/SL guard."""
+        symbol, side = pos["symbol"], pos["side"]
+        lot_qty = float(pos.get("qty", 0) or 0)
+        filled = outcome.get("qty")
+        if filled is not None and abs(filled - lot_qty) > self._qty_tolerance(
+                symbol, lot_qty):
+            self.state["halted"] = True
+            self.state["halt_reason"] = (
+                "exchange protection partial fill requires reconciliation")
+            self.log("CRITICAL PROTECTION #%s %s guard %s khop %s / lot %s "
+                     "-> halt" % (pos["id"], symbol, label.upper(), filled,
+                                  lot_qty))
+            return None
+        exit_px = outcome.get("avg")
+        estimated = not exit_px
+        if estimated:
+            exit_px = float(pos.get(label) or pos.get("entry"))
+        entry = float(pos.get("entry", 0) or 0)
+        pnl = ((exit_px - entry) if side == "long" else (entry - exit_px)) \
+            * lot_qty
+        fee = self._fees(pos.get("notional", 0) or 0)
+        net = pnl - fee
+        self.state["equity"] = float(self.state.get("equity", 0) or 0) + net
+        stats = self.state["stats"]
+        stats["fees"] = float(stats.get("fees", 0) or 0) + fee
+        stats["trades"] = int(stats.get("trades", 0) or 0) + 1
+        if net > 0:
+            stats["wins"] = int(stats.get("wins", 0) or 0) + 1
+        else:
+            stats["losses"] = int(stats.get("losses", 0) or 0) + 1
+        rec = {
+            "id": pos["id"], "symbol": symbol, "side": side,
+            "tag": pos.get("tag"), "entry": round(entry, 6),
+            "exit": round(exit_px, 6),
+            "notional": round(float(pos.get("notional", 0) or 0), 2),
+            "pnl": round(net, 2), "reason": label.upper(),
+            "closed_at": int(time.time()), "live": True, "dry": self.dry_run,
+            "close_ord": (str(outcome["order_id"]) if outcome.get("order_id")
+                          else None),
+            "exit_source": "exchange_algo",
+            "algo_id": pos.get("%s_algo_id" % label),
+            "estimated": estimated,
+        }
+        self.state["positions"] = [p for p in self.state["positions"]
+                                   if p.get("id") != pos["id"]]
+        sibling = "tp" if label == "sl" else "sl"
+        result = self._cancel_algo_quietly(
+            symbol, pos.get("%s_algo_id" % sibling),
+            pos.get("%s_client_algo_id" % sibling))
+        if result == "absent" and pos.get("%s_algo_id" % sibling):
+            other = self._algo_outcome(pos, sibling)
+            if (other and other["status"] == "FINISHED"
+                    and (other.get("qty") or 0) > 0):
+                self.state["halted"] = True
+                self.state["halt_reason"] = (
+                    "exchange protection double fill requires reconciliation")
+                self.log("CRITICAL PROTECTION #%s ca SL va TP deu khop -> halt"
+                         % pos["id"])
+        self._db_insert_trade(rec)
+        self.log("EXCHANGE %s #%s %s %s khop tren san @%s pnl=%+.2f ord=%s%s"
+                 % (label.upper(), pos["id"], symbol, side, round(exit_px, 6),
+                    net, rec["close_ord"],
+                    " [gia uoc tinh]" if estimated else ""))
+        return rec
+
+    def _protection_sync_soon(self, seconds=2.0):
+        """Re-check an in-flight guard shortly, without a 0.5s REST loop."""
+        interval = float(self.cfg.get("protection_sync_seconds", 10))
+        self._last_protection_sync = min(self._last_protection_sync,
+                                         time.time() - interval + seconds)
+
+    def sync_exchange_protection(self, force=False):
+        """Resolve every lot guard against Binance; return closed records.
+
+        For each symbol with guarded lots: one open-Algo query (weight 1).
+        A guard that is no longer open is looked up (WS event or REST):
+        FINISHED with a fill -> the lot was closed by Binance: book the real
+        fill, cancel the sibling guard.  CANCELED/EXPIRED/REJECTED (or
+        FINISHED without fill) -> the lot is unguarded: mark it for re-arm.
+        Anything unknown changes nothing (fail closed).
+        """
+        if self.dry_run or not self.cfg.get("exchange_protection", False):
+            return []
+        now = time.time()
+        interval = float(self.cfg.get("protection_sync_seconds", 10))
+        if (not force and not self._protection_sync_due
+                and now - self._last_protection_sync < interval):
+            return []
+        self._protection_sync_due = False
+        self._last_protection_sync = now
+        recs = []
+        symbols = sorted({p.get("symbol") for p in self.state["positions"]
+                          if p.get("live") and (p.get("sl_algo_id")
+                                                or p.get("tp_algo_id"))})
+        for symbol in symbols:
+            try:
+                open_rows = self._fetch_open_algo_orders(symbol)
+            except binance_safety.BinanceSafetyStop:
+                raise
+            except Exception as exc:
+                self.log("WARNING protection sync %s: %s" %
+                         (symbol, binance_safety.redact_body(exc)))
+                continue
+            open_ids = set()
+            for row in open_rows:
+                if not isinstance(row, dict):
+                    continue
+                if str(row.get("symbol") or symbol).upper() != symbol:
+                    continue
+                if row.get("algoId") is not None:
+                    open_ids.add(str(row.get("algoId")))
+            for pos in [p for p in list(self.state["positions"])
+                        if p.get("symbol") == symbol]:
+                for label in ("sl", "tp"):
+                    algo_id = pos.get("%s_algo_id" % label)
+                    if not algo_id or str(algo_id) in open_ids:
+                        continue
+                    outcome = self._algo_outcome(pos, label)
+                    if outcome is None:
+                        continue
+                    status = outcome["status"]
+                    if status in self._ALGO_IN_FLIGHT:
+                        self._protection_sync_soon()
+                        continue
+                    if status == "FINISHED":
+                        filled = outcome.get("qty")
+                        if filled is None:
+                            # Fill not readable yet: never guess either way.
+                            self._protection_sync_soon()
+                            continue
+                        if filled > 0:
+                            rec = self._finalize_exchange_close(pos, label,
+                                                                outcome)
+                            if rec:
+                                recs.append(rec)
+                            break
+                        self._mark_guard_lost(pos, label, outcome)
+                    elif status in self._ALGO_LOST:
+                        self._mark_guard_lost(pos, label, outcome)
+        return recs
+
     def _reconcile_startup_open_orders(self):
         """Block resume when a previous normal order is still working."""
         if self.dry_run:
@@ -1369,15 +1640,20 @@ class BinanceEngine:
             return False
         return True
 
-    def _fetch_open_algo_orders(self):
+    def _fetch_open_algo_orders(self, symbol=None):
         """Return normalized open USD-M Algo Orders from the exchange."""
         query = getattr(self.ex, "fapiPrivateGetOpenAlgoOrders", None)
         if query is None:
             raise RuntimeError("CCXT has no open Algo Order query")
-        # Binance charges weight 40 when symbol is omitted; keeping the
-        # all-symbol startup scan in the governor prevents a false local
+        # Binance charges weight 40 when symbol is omitted (1 with symbol);
+        # keeping the all-symbol scan in the governor prevents a false local
         # estimate from hiding the real IP budget.
-        response = self._private_call("private:trade", query, {}, _weight=40)
+        if symbol:
+            response = self._private_call("private:trade", query,
+                                          {"symbol": symbol}, _weight=1)
+        else:
+            response = self._private_call("private:trade", query, {},
+                                          _weight=40)
         if isinstance(response, list):
             open_orders = response
         elif isinstance(response, dict):
@@ -1397,8 +1673,8 @@ class BinanceEngine:
             raise RuntimeError("unexpected open Algo Order response")
         return open_orders
 
-    def _find_open_algo_by_client_id(self, client_algo_id):
-        for order in self._fetch_open_algo_orders():
+    def _find_open_algo_by_client_id(self, client_algo_id, symbol=None):
+        for order in self._fetch_open_algo_orders(symbol):
             if not isinstance(order, dict):
                 continue
             candidate = (order.get("clientAlgoId")
