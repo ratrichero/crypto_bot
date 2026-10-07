@@ -14,8 +14,10 @@ An toan:
   - mode live: bat buoc private key (env SOLANA_PRIVATE_KEY, nap tu file .env
     chmod 600 — uu tien) hoac file .solana_key ton tai + pubkey khop
     wallet_address, thieu -> fail closed (dung chuong trinh)
-  - kill switch: file STOP trong thu muc nay -> dung nhe nhang.
-    CHU Y: STOP KHONG tu dong dong vi the dang mo — phai xu ly tay.
+  - kill switch: file STOP_LIVE trong thu muc nay -> dung nhe nhang
+    (file STOP la cua radar paper, live trader chi canh bao, khong dung).
+    CHU Y: STOP_LIVE KHONG tu dong dong vi the dang mo — phai xu ly tay.
+  - PAUSE: ngung mo moi, van quan ly exit cac vi the dang mo.
   - daily stop: dung mo moi khi lo thuc te trong ngay < -daily_stop_pct
   - khong bao gio log private key
 
@@ -51,7 +53,10 @@ POS_P = os.path.join(BASE, "live_positions.json")
 STATE_P = os.path.join(BASE, "live_state.json")
 TRADES_P = os.path.join(BASE, "live_trades.jsonl")
 LOG_P = os.path.join(BASE, "live_trader.log")
-STOP_P = os.path.join(BASE, "STOP")
+# Kill switch RIENG cho live trader. File STOP chung thu muc la cua radar.py
+# (paper) — truoc day ca 2 cung doc STOP nen dung 1 cai la tat ca 2.
+STOP_P = os.path.join(BASE, "STOP_LIVE")
+RADAR_STOP_P = os.path.join(BASE, "STOP")
 PAUSE_P = os.path.join(BASE, "PAUSE")
 CFG_P = os.path.join(BASE, "config.live.json")
 ENV_P = os.path.join(BASE, ".env")
@@ -1688,10 +1693,18 @@ class LiveTrader:
         thuong."""
         now = now or time.time()
         if os.path.exists(STOP_P):
-            log("STOP file -> shutdown. VI THE LIVE VAN MO — tu dong tay, "
-                "module KHONG tu dong dong.")
+            log("STOP_LIVE file -> shutdown. VI THE LIVE VAN MO — tu dong "
+                "tay, module KHONG tu dong dong.")
             self.save()
             return "stop"
+        if os.path.exists(RADAR_STOP_P):
+            if not getattr(self, "_warned_radar_stop", False):
+                log("CANH BAO: thay file STOP (cua radar paper) — live trader "
+                    "VAN CHAY. Muon dung live trader: tao file STOP_LIVE; "
+                    "chi ngung mo moi: tao file PAUSE.")
+                self._warned_radar_stop = True
+        else:
+            self._warned_radar_stop = False
         paused = os.path.exists(PAUSE_P)
         try:
             self.reconcile_onchain(now)

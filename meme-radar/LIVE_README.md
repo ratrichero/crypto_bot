@@ -43,8 +43,10 @@ trailing → SL → smart exit → time stop (giống paper).
   không cần key. Dùng để kiểm tra logic trước.
 - **`live` fail-closed**: thiếu file `.solana_key`, key sai định dạng,
   hoặc pubkey không khớp `wallet_address` → chương trình TỰ DỪNG.
-- **Kill switch**: tạo file `STOP` trong thư mục này → vòng lặp dừng
-  nhẹ nhàng. ⚠️ **STOP không tự đóng vị thế đang mở** — phải xử lý tay.
+- **Kill switch**: tạo file `STOP_LIVE` trong thư mục này → vòng lặp dừng
+  nhẹ nhàng. ⚠️ **STOP_LIVE không tự đóng vị thế đang mở** — phải xử lý tay.
+  File `STOP` là kill switch của `radar.py` (paper): live trader chỉ log
+  cảnh báo, KHÔNG dừng (trước đây dùng chung → tắt radar là tắt luôn live).
 - **PAUSE**: tạo file `PAUSE` trong thư mục này → ngừng MỞ MỚI nhưng vẫn
   reconcile ví, nhận smart exit (sell_cluster) và chạy đủ exit ladder
   (TP/SL/trailing/time stop). Tín hiệu đến trong lúc PAUSE bị đánh dấu
@@ -85,7 +87,7 @@ cp config.live.example.json config.live.json   # sua neu can
 - [ ] Chạy thử với `trade_size_usd` nhỏ ($10) và `max_positions` nhỏ
 - [ ] Ví có đủ SOL: tiền trade + `fee_buffer_sol` + phí tx (~0.0001 SOL/lệnh)
 - [ ] Đã chạy dry-run và đối chiếu logic exit với paper
-- [ ] Hiểu rõ: STOP không đóng vị thế; smart contract/pool rủi ro là
+- [ ] Hiểu rõ: STOP_LIVE không đóng vị thế; smart contract/pool rủi ro là
       của mình; meme có thể về 0 trong vài phút
 - [ ] Đổi `"mode": "live"` trong `config.live.json` (cần restart)
 

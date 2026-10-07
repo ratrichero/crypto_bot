@@ -34,7 +34,7 @@ def isolated():
     tmpd = tempfile.mkdtemp()
     olds = {}
     for name in ("SIG_P", "ALERT_P", "SELL_P", "POS_P", "STATE_P",
-                 "TRADES_P", "LOG_P", "STOP_P", "PAUSE_P"):
+                 "TRADES_P", "LOG_P", "STOP_P", "RADAR_STOP_P", "PAUSE_P"):
         olds[name] = getattr(lt, name)
         setattr(lt, name, os.path.join(tmpd, name.lower()))
     olds["BASE"] = lt.BASE
@@ -1020,6 +1020,22 @@ def test_age_uses_real_time_after_slow_buy():
         check("B skipped", "tid_b" in tr.state["processed"])
 
 
+
+# ---- kill switch rieng ----
+
+def test_radar_stop_does_not_stop_live():
+    print("== STOP (radar) khong tat live; STOP_LIVE moi tat ==")
+    with isolated() as tmpd:
+        tr, _ = _dry_trader(tmpd, {})
+        open(lt.RADAR_STOP_P, "w").write("")
+        check("STOP radar -> live van chay", tr.run_once(now=1000) == "ok")
+        open(lt.STOP_P, "w").write("")
+        check("STOP_LIVE -> stop", tr.run_once(now=1010) == "stop")
+    check("duong dan that la STOP_LIVE",
+          os.path.basename(lt.STOP_P) == "STOP_LIVE"
+          and os.path.basename(lt.RADAR_STOP_P) == "STOP")
+
+
 if __name__ == "__main__":
     test_exit_tp_ladder()
     test_exit_sl()
@@ -1062,5 +1078,6 @@ if __name__ == "__main__":
     test_slow_buy_does_not_block_exits()
     test_exits_before_buys()
     test_age_uses_real_time_after_slow_buy()
+    test_radar_stop_does_not_stop_live()
     print(f"\n{PASS} pass, {FAIL} fail")
     sys.exit(1 if FAIL else 0)
