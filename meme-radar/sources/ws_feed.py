@@ -110,17 +110,20 @@ class WSFeed(threading.Thread):
             if b:
                 self.q.put({
                     "tid": sig, "wallet": wallet, "token": b["mint"],
-                    "sol_spent": b["sol_spent"],
+                    "sol_spent": b["sol_spent"], "tokens": b.get("tokens"),
                     "ts": int(time.time()), "src": "ws", "side": "buy",
                 })
                 self.log(f"ws BUY: {wallet[:6]}.. {b['sol_spent']:.2f} SOL -> "
                          f"{b['mint'][:10]}..")
                 return
-            sl = parse_sell(tx, wallet, self.cfg.get("min_sol_spent", 0.3))
+            min_sol = self.cfg.get("min_sol_spent", 0.3)
+            sl = parse_sell(tx, wallet,
+                            self.cfg.get("min_sell_sol", min(0.05, min_sol)))
             if sl:
                 self.q.put({
                     "tid": sig, "wallet": wallet, "token": sl["mint"],
                     "sol_amount": sl["sol_received"],
+                    "sold_frac": sl.get("sold_frac"),
                     "ts": int(time.time()), "src": "ws", "side": "sell",
                 })
                 self.log(f"ws SELL: {wallet[:6]}.. {sl['sol_received']:.2f} SOL <- "

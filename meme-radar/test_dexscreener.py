@@ -104,7 +104,7 @@ def load_ds_token(fake_requests):
     src = open(os.path.join(HERE, "radar.py"), encoding="utf-8").read()
     tree = ast.parse(src)
     body = [n for n in tree.body
-            if isinstance(n, ast.FunctionDef) and n.name in ("ds_token", "ds_price")]
+            if isinstance(n, ast.FunctionDef) and n.name in ("ds_info", "ds_token", "ds_price")]
     ns = {"time": time, "requests": fake_requests, "pick_pair": pick_pair,
           "_price_cache": {}}
     exec(compile(ast.Module(body=body, type_ignores=[]), "radar.py", "exec"), ns)

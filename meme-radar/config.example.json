@@ -64,5 +64,16 @@
   "scale_in_frac": 0.5,
   "exit_on_wallet_sell": true,
   "log_file": "paper_trades_holder.jsonl"
- }
+ },
+ "_feasibility_note": "Paper kiem tra kha thi voi thanh khoan/volume that (DexScreener): chi mo khi liquidity >= size * min_liquidity_mult (khong thi skipped_low_liquidity trong paper_entries.jsonl); slippage = min(size/liquidity*slippage_coef, max_slippage_pct)% tru vao gia vao va ra; leg ban > volume 5 phut / min_exit_volume_mult -> exit_constrained, cho toi da max_exit_waits vong roi thoat voi slippage toi da (exit_failed_liquidity). feasibility_enabled=false -> paper nhu cu.",
+ "feasibility_enabled": true,
+ "min_liquidity_mult": 20,
+ "slippage_coef": 50,
+ "max_slippage_pct": 15,
+ "min_exit_volume_mult": 5,
+ "max_exit_waits": 3,
+ "_copy_exit_note": "Moi lenh ban cua vi theo doi (>= min_sell_sol) -> alert wallet_sell (live copy exit); paper thoat khi vi nguon da ban cong don >= copy_exit_min_sold_frac. sell_cluster van chi tinh lenh >= min_sol_spent.",
+ "min_sell_sol": 0.05,
+ "copy_exit": true,
+ "copy_exit_min_sold_frac": 0.5
 }

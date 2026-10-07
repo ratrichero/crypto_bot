@@ -26,8 +26,18 @@ def _liq(row):
         return 0.0
 
 
+def _vol(v):
+    """Volume USD (>= 0). Khong co / sai -> None (khong biet)."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if f >= 0 and f == f and f != float("inf") else None
+
+
 def pick_pair(rows, mint):
-    """Tra ve dict {price, symbol, mcap, liquidity_usd, as_base, pair} hoac
+    """Tra ve dict {price, symbol, mcap, liquidity_usd, volume_m5, volume_h24,
+    as_base, pair} hoac
     None. mcap chi co khi mint la base (pair quote khong cho mcap cua mint ->
     0 = khong biet)."""
     if not isinstance(rows, list) or not mint:
@@ -64,6 +74,10 @@ def pick_pair(rows, mint):
         else:
             continue
         if rank > best_rank:
-            cand.update(liquidity_usd=liq, pair=row.get("pairAddress"))
+            vol = row.get("volume") if isinstance(row.get("volume"),
+                                                  dict) else {}
+            cand.update(liquidity_usd=liq, pair=row.get("pairAddress"),
+                        volume_m5=_vol(vol.get("m5")),
+                        volume_h24=_vol(vol.get("h24")))
             best, best_rank = cand, rank
     return best

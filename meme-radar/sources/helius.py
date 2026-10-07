@@ -120,11 +120,42 @@ def parse_sell(tx, wallet, min_sol):
             pre_amt = float((p.get("uiTokenAmount") or {}).get("uiAmount") or 0) if p else 0
             post_amt = float((t.get("uiTokenAmount") or {}).get("uiAmount") or 0)
             if pre_amt - post_amt > 0:
+                # sold_frac: phan luong token vi dang giu bi ban trong tx nay
+                # (copy exit cong don qua nhieu lenh ban).
                 return {"mint": mint, "sol_received": round(sol_received, 4),
-                        "tokens": pre_amt - post_amt}
+                        "tokens": pre_amt - post_amt,
+                        "sold_frac": round((pre_amt - post_amt) / pre_amt, 6)}
+        # Ban SACH + dong token account trong cung tx: account bien mat khoi
+        # postTokenBalances -> vong tren khong thay. Day lai la ca quan trong
+        # nhat cho copy exit (vi xa het).
+        post_keys = {(t.get("accountIndex"), t.get("mint"))
+                     for t in (meta.get("postTokenBalances") or [])}
+        for key, p in pre_t.items():
+            if p.get("owner") != wallet or key in post_keys:
+                continue
+            mint = key[1] or ""
+            if mint in STABLES or mint == SOL_MINT or not mint:
+                continue
+            pre_amt = float((p.get("uiTokenAmount") or {}).get("uiAmount") or 0)
+            if pre_amt > 0:
+                return {"mint": mint, "sol_received": round(sol_received, 4),
+                        "tokens": pre_amt, "sold_frac": 1.0}
         return None
     except Exception:
         return None
+
+
+def wallet_price_usd(buy, sol_usd):
+    """Gia vi nguon khop (USD/token) = SOL vi chi / token nhan * gia SOL.
+    SOL chi gom ca phi/tip/rent cua vi -> gia hoi CAO hon thuc (guard chong
+    mua duoi vi vay hoi long hon, khong chat hon). None neu khong tinh duoc."""
+    try:
+        tokens = float(buy.get("tokens") or 0)
+        sol = float(buy.get("sol_spent") or 0)
+        px = sol * float(sol_usd or 0) / tokens if tokens > 0 else 0
+    except (TypeError, ValueError):
+        return None
+    return px if px > 0 and px == px and px != float("inf") else None
 
 
 def load_wallets(cfg, base):
@@ -160,6 +191,9 @@ def poll_wallet_txs(cfg, st, log, ds_token_fn, sol_usd, base):
     sigs = []
     sells = []
     min_sol = cfg.get("min_sol_spent", 0.3)
+    # Lenh ban nho hon van can cho copy exit (vi xa het sau khi coin sap chi
+    # con vai chuc $). sell_cluster/holder van loc theo min_sol_spent.
+    min_sell = cfg.get("min_sell_sol", min(0.05, min_sol))
     for addr in wallets:
         try:
             res = h.rpc("getSignaturesForAddress",
@@ -190,7 +224,11 @@ def poll_wallet_txs(cfg, st, log, ds_token_fn, sol_usd, base):
             b = parse_buy(tx, addr, min_sol)
             if b:
                 price_usd, symbol, mcap = ds_token_fn(b["mint"])
+                wpx = wallet_price_usd(b, sol_usd)
                 sigs.append({
+                    "wallet_price_usd": wpx,
+                    "wallet_tokens": b.get("tokens"),
+                    "sol_spent": b["sol_spent"],
                     "tid": s["signature"],
                     "wallet": addr,
                     "token": b["mint"],
@@ -206,11 +244,12 @@ def poll_wallet_txs(cfg, st, log, ds_token_fn, sol_usd, base):
                 log(f"BUY phat hien: {symbol} ${b['sol_spent']*sol_usd:.0f} "
                     f"vi {addr[:6]}..")
                 continue
-            sl = parse_sell(tx, addr, min_sol)
+            sl = parse_sell(tx, addr, min_sell)
             if sl:
                 sells.append({
                     "tid": s["signature"], "wallet": addr, "token": sl["mint"],
                     "sol_amount": sl["sol_received"],
+                    "sold_frac": sl.get("sold_frac"),
                     "amount_usd": round(sl["sol_received"] * sol_usd, 1),
                     "ts": s.get("blockTime") or int(time.time()),
                     "src": "poll", "side": "sell",

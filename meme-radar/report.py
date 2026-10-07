@@ -1,10 +1,135 @@
 #!/usr/bin/env python3
-"""Bao cao radar meme: paper copy-trade + wallet leaderboard (tieng Viet)."""
+"""Bao cao radar meme: paper copy-trade + wallet leaderboard (tieng Viet).
+
+  python report.py                 bao cao thuong (+ muc kha thi)
+  python report.py --sensitivity   them bang do nhay: P&L paper neu thanh
+                                   khoan pool chi la $X (lenh cu chua ghi
+                                   thanh khoan) va theo min_liquidity_mult
+"""
 import json
 import os
+import sys
 from datetime import datetime, timezone
 
+import feasibility as feas
+
 BASE = os.path.dirname(os.path.abspath(__file__))
+SENS_LIQ = (2_000, 5_000, 10_000, 25_000, 50_000, 100_000)
+SENS_MULT = (10, 20, 40)
+
+
+def load_rows(p):
+    """Doc jsonl khong dedupe (paper_entries.jsonl)."""
+    out = []
+    if os.path.exists(p):
+        for line in open(p):
+            line = line.strip()
+            if line:
+                try:
+                    out.append(json.loads(line))
+                except Exception:
+                    pass
+    return out
+
+
+def _pnl(t):
+    return (t.get("final_ret") or 0) * (t.get("size_usd") or 0)
+
+
+def _pnl_adj(t):
+    if t.get("realized_adj_usd") is not None:
+        return float(t["realized_adj_usd"])
+    return (t.get("final_ret_adj") or 0) * (t.get("size_usd") or 0)
+
+
+def feasibility_lines(trades, entries, F):
+    """Muc kha thi (de xuat Musev): ty le lenh bi loc thanh khoan, P&L goc
+    vs sau slippage, exit bi rang buoc. Ham thuan -> test duoc."""
+    L = ["-- Kha thi (thanh khoan/volume that) --"]
+    if entries:
+        dec = {}
+        for e in entries:
+            dec[e.get("decision", "?")] = dec.get(e.get("decision", "?"), 0) + 1
+        n = len(entries)
+        skipped = sum(v for k, v in dec.items() if k.startswith("skipped"))
+        L.append(f"Quyet dinh mo paper: {n} | mo {dec.get('opened', 0)} | "
+                 f"bi loc {skipped} ({skipped / n:.0%})")
+        L.append("  " + "; ".join(f"{k}: {v}" for k, v in
+                                  sorted(dec.items(), key=lambda x: -x[1])))
+    new = [t for t in trades if t.get("feasibility")]
+    if not new:
+        L.append("Chua co lenh dong co tinh kha thi (lenh cu khop tai gia "
+                 "signal; xem --sensitivity).")
+        return L
+    n = len(new)
+    raw = sum(_pnl(t) for t in new)
+    adj = sum(_pnl_adj(t) for t in new)
+    w_raw = sum(1 for t in new if (t.get("final_ret") or 0) > 0)
+    w_adj = sum(1 for t in new if (t.get("final_ret_adj") or 0) > 0)
+    L.append(f"Lenh dong co tinh kha thi: {n} | P&L goc {raw:+.1f}U -> sau "
+             f"slippage {adj:+.1f}U (chenh {adj - raw:+.1f}U) | winrate "
+             f"{w_raw / n:.0%} -> {w_adj / n:.0%}")
+    slips_in = [float(t["entry_slip_pct"]) for t in new
+                if t.get("entry_slip_pct") is not None]
+    slips_out = [float(leg["slip_pct"]) for t in new for leg in t.get("legs", [])
+                 if leg.get("slip_pct") is not None]
+    if slips_in or slips_out:
+        L.append("Slippage TB: vao "
+                 + (f"{sum(slips_in) / len(slips_in):.2f}%" if slips_in
+                    else "?")
+                 + ", ra "
+                 + (f"{sum(slips_out) / len(slips_out):.2f}%" if slips_out
+                    else "?")
+                 + f" (cong thuc min(size/liq*{F['slippage_coef']:g}, "
+                 f"{F['max_slippage_pct']:g}%))")
+    cons = sum(1 for t in new if t.get("exit_constrained"))
+    fail = [t for t in new if t.get("exit_failed_liquidity")]
+    L.append(f"Exit bi rang buoc (vol5m < leg x{F['min_exit_volume_mult']:g})"
+             f": {cons} lenh | exit_failed_liquidity (qua "
+             f"{int(F['max_exit_waits'])} vong): {len(fail)} lenh"
+             + (f" ({sum(_pnl_adj(t) for t in fail):+.1f}U)" if fail else ""))
+    return L
+
+
+def sensitivity_lines(trades, F):
+    """Do nhay: (a) gia dinh moi lenh co thanh khoan $X; (b) dung thanh
+    khoan da ghi voi cac min_liquidity_mult khac nhau."""
+    L = ["-- Do nhay thanh khoan (replay legs, slippage vao + ra) --"]
+    rows = [t for t in trades if t.get("legs") and t.get("size_usd")]
+    if not rows:
+        L.append("Khong co lenh co legs de replay.")
+        return L
+    raw = sum(_pnl(t) for t in rows)
+    L.append(f"{len(rows)} lenh | P&L goc (khop tai gia signal): {raw:+.1f}U")
+    L.append("  Gia dinh liq   | giu lai | P&L goc phan giu | P&L sau slippage")
+    for liq in SENS_LIQ:
+        kept = raw_k = adj = 0.0
+        for t in rows:
+            r = feas.replay_trade(t, liq, F)
+            if r["skipped"]:
+                continue
+            kept += 1
+            raw_k += r["pnl_raw"]
+            adj += r["pnl_adj"]
+        L.append(f"  ${liq:>12,} | {int(kept):>4}/{len(rows):<4}| "
+                 f"{raw_k:>+14.1f}U | {adj:>+14.1f}U")
+    known = [t for t in rows if t.get("liquidity_usd")]
+    if known:
+        L.append(f"  Thanh khoan da ghi ({len(known)} lenh), theo "
+                 "min_liquidity_mult:")
+        for m in SENS_MULT:
+            Fm = dict(F, min_liquidity_mult=m)
+            kept = adj = 0.0
+            for t in known:
+                r = feas.replay_trade(t, t["liquidity_usd"], Fm)
+                if not r["skipped"]:
+                    kept += 1
+                    adj += r["pnl_adj"]
+            L.append(f"    x{m:<3} giu {int(kept)}/{len(known)} | P&L sau "
+                     f"slippage {adj:+.1f}U")
+    L.append("  (replay khong mo phong do tre thoat; xem exit_failed_liquidity"
+             " o lenh moi)")
+    return L
 
 
 def load_jsonl(p):
@@ -28,8 +153,18 @@ def load_jsonl(p):
     return uniq
 
 
-def main():
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
     trades = load_jsonl(os.path.join(BASE, "paper_trades.jsonl"))
+    entries = load_rows(os.path.join(BASE, "paper_entries.jsonl"))
+    cfg = {}
+    cp = os.path.join(BASE, "config.json")
+    if os.path.exists(cp):
+        try:
+            cfg = json.load(open(cp))
+        except Exception:
+            cfg = {}
+    F = feas.params(cfg)
     st = {}
     sp = os.path.join(BASE, "radar_state.json")
     if os.path.exists(sp):
@@ -40,6 +175,8 @@ def main():
     L.append(f"Vi the paper dang mo: {len(st.get('paper', []))}")
     if not trades:
         L.append("Chua co lenh paper nao dong (can ~4h moi dong 1 lenh).")
+        if entries:
+            L += feasibility_lines(trades, entries, F)
         print("\n".join(L))
         return
 
@@ -80,6 +217,9 @@ def main():
     for w, d in sorted(by_w.items(), key=lambda x: x[1]["pnl"],
                        reverse=True)[:5]:
         L.append(f"  - {w[:10]}...: {d['n']} lenh, {d['pnl']:+.1f}U")
+    L += feasibility_lines(trades, entries, F)
+    if "--sensitivity" in argv:
+        L += sensitivity_lines(trades, F)
     L.append("Paper thuan tuy mo phong copy theo vi smart money; "
              "ket qua ao khong dam bao ket qua that.")
     # plan holder (vi holder: SL rong, om dai, scale-in, chot theo vi)
