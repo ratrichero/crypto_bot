@@ -385,6 +385,11 @@ class BinanceEngine:
         entry = float(pos.get("entry", 0) or 0)
         gross = ((exit_px - entry) if side == "long" else (entry - exit_px)) \
             * lot_qty
+        if close_order_id:
+            booked = getattr(self, "_booked_close_orders", None)
+            if booked is None:
+                booked = self._booked_close_orders = set()
+            booked.add(str(close_order_id))
         summary = self._order_fill_summary(pos.get("symbol"), close_order_id)
         if summary is not None:
             share = 1.0
@@ -1322,8 +1327,9 @@ class BinanceEngine:
         estimated=True), day vao DB, xoa khoi state. Tra ve list rec de main
         loop goi _record_close (JSONL + grid bookkeeping).
 
-        Chi xu ly truong hop san ve ~0 hoan toan; dong mot phan thi de
-        reconcile_positions halt nhu cu.
+        San ve ~0: ghi nhan moi lot cua leg. Leg giam MOT PHAN: xem
+        _detect_partial_leg_reduction (chi khi khop dung nhom lot, guard
+        con nguyen); khong khop -> reconcile_positions halt nhu cu.
 
         Fail-closed: mot lan doc positionRisk rong/tre (API glitch, lenh vua
         khop chua hien) KHONG du de xoa lot. Lot phai (1) da mo it nhat
@@ -1466,7 +1472,168 @@ class BinanceEngine:
                         "exchange fill" if fired == "EXCHANGE"
                         else "estimated"))
             recs.append(rec)
+        recs.extend(self._detect_partial_leg_reduction(
+            exchange, now, marks, min_age, confirm_after))
         return recs
+
+    def _detect_partial_leg_reduction(self, exchange, now, marks, min_age,
+                                      confirm_after):
+        """Leg tren san GIAM mot phan (vd dong tay 1 trong nhieu lot grid).
+
+        San la source of truth: neu phan giam khop dung tong qty cua mot
+        nhom lot (chon LIFO) thi ghi nhan cac lot do da dong (gia = fill dong
+        that tu userTrades, khong co -> mark, estimated) thay vi halt vo han.
+        An toan: xac nhan 2 lan quet; lot du tuoi; neu bat ky guard nao cua
+        leg khong con open (co the guard bot vua khop) -> hoan, de
+        sync_exchange_protection ghi dung lot. Khong khop subset -> giu
+        nguyen (reconcile_positions halt nhu cu).
+        """
+        pending = getattr(self, "_partial_pending", None)
+        if pending is None:
+            pending = self._partial_pending = {}
+        legs = {}
+        for p in self.state.get("positions", []):
+            if float(p.get("qty", 0) or 0) > 0:
+                legs.setdefault((p.get("symbol"), p.get("side")), []).append(p)
+        for stale in [k for k in pending if k not in legs]:
+            pending.pop(stale, None)
+        recs = []
+        for key, lots in legs.items():
+            symbol, side = key
+            local = sum(float(p.get("qty", 0) or 0) for p in lots)
+            actual = exchange.get(key, 0.0)
+            tol = self._qty_tolerance(symbol, local)
+            if actual <= tol or actual >= local - tol:
+                pending.pop(key, None)     # khop / ve 0 (o tren) / san nhieu hon
+                continue
+            reduction = local - actual
+            chosen, acc = [], 0.0
+            for p in sorted(lots, key=lambda x: (float(x.get("opened_at", 0)
+                                                       or 0), x.get("id", 0)),
+                            reverse=True):
+                q = float(p.get("qty", 0) or 0)
+                if acc + q <= reduction + tol:
+                    chosen.append(p)
+                    acc += q
+                if abs(acc - reduction) <= tol:
+                    break
+            if not chosen or abs(acc - reduction) > tol:
+                pending.pop(key, None)
+                continue                   # khong quy duoc cho lot nao
+            if any(now - float(p.get("opened_at", 0) or 0) < min_age
+                   for p in chosen if p.get("opened_at")):
+                continue
+            prev = pending.get(key)
+            if prev is None or abs(prev[1] - actual) > tol:
+                pending[key] = (now, actual)
+                self.log("WARNING LEG_REDUCED? %s %s: san %s < local %s, cho "
+                         "xac nhan lan 2" % (symbol, side, actual, local))
+                continue
+            if now - prev[0] < confirm_after:
+                continue
+            if self.cfg.get("exchange_protection", False):
+                try:
+                    open_ids = {str(o.get("algoId")) for o in
+                                self._fetch_open_algo_orders(symbol)
+                                if isinstance(o, dict)}
+                except binance_safety.BinanceSafetyStop:
+                    raise
+                except Exception as exc:
+                    self.log("WARNING leg reduced %s: khong doc duoc algo "
+                             "(%s) -> hoan" %
+                             (symbol, binance_safety.redact_body(exc)))
+                    continue
+                gone = [p.get("id") for p in lots for label in ("sl", "tp")
+                        if p.get("%s_algo_id" % label)
+                        and str(p.get("%s_algo_id" % label)) not in open_ids]
+                if gone:
+                    self.log("INFO leg reduced %s %s: guard cua lot %s khong "
+                             "con open -> de protection sync ghi nhan"
+                             % (symbol, side, sorted(set(gone))))
+                    self._protection_sync_soon()
+                    continue
+            pending.pop(key, None)
+            exit_px, order_id = self._reduction_fill(
+                symbol, side, reduction,
+                min(float(p.get("opened_at", 0) or 0) for p in lots))
+            estimated = exit_px is None
+            if estimated:
+                try:
+                    exit_px = float(marks.get(symbol))
+                except (TypeError, ValueError):
+                    exit_px = None
+            for pos in chosen:
+                px = exit_px or float(pos.get("entry", 0) or 0)
+                booking = self._book_exit(pos, px,
+                                          None if estimated else order_id)
+                self._apply_booking(booking)
+                rec = {
+                    "id": pos["id"], "symbol": symbol, "side": side,
+                    "tag": pos.get("tag"),
+                    "entry": round(float(pos.get("entry", 0) or 0), 6),
+                    "exit": round(px, 6),
+                    "notional": round(float(pos.get("notional", 0) or 0), 2),
+                    "reason": "CLOSED_ON_EXCHANGE",
+                    "closed_at": int(now), "live": True, "dry": self.dry_run,
+                    "estimated": estimated,
+                    "exit_source": "exchange_detect_partial",
+                    "close_ord": None if estimated else order_id,
+                    **self._booking_fields(booking),
+                }
+                self.state["positions"] = [
+                    p for p in self.state["positions"]
+                    if p.get("id") != pos["id"]]
+                self._cancel_leftover_guards(pos)
+                self._db_insert_trade(rec)
+                self.log("EXCHANGE_PARTIAL #%s %s %s: leg san giam %s -> ghi "
+                         "nhan lot dong @%s pnl=%+.2f [%s]"
+                         % (pos["id"], symbol, side, round(reduction, 8),
+                            round(px, 6), booking["net"],
+                            "estimated" if estimated else "exchange fill"))
+                recs.append(rec)
+        return recs
+
+    def _reduction_fill(self, symbol, side, qty, since_s):
+        """Lenh dong (khong phai cua bot) gan nhat tren leg co qty = qty.
+        Tra ve (avg, order_id) hoac (None, None)."""
+        close_side = "sell" if side == "long" else "buy"
+        leg = "LONG" if side == "long" else "SHORT"
+        try:
+            trades = self._private_call(
+                "private:account", self.ex.fetch_my_trades,
+                self._ccxt_symbol(symbol) or symbol, None, 500,
+                _weight=5) or []
+        except binance_safety.BinanceSafetyStop:
+            raise
+        except Exception as exc:
+            self.log("WARNING userTrades %s: %s" %
+                     (symbol, binance_safety.redact_body(exc)))
+            return None, None
+        booked = getattr(self, "_booked_close_orders", set())
+        orders = {}
+        for trade in trades:
+            info = trade.get("info") or {}
+            if (str(trade.get("side", "")).lower() != close_side
+                    or str(info.get("positionSide", "")).upper() != leg):
+                continue
+            try:
+                ts = int(trade.get("timestamp") or info.get("time") or 0)
+                q = float(trade.get("amount") or info.get("qty") or 0)
+                px = float(trade.get("price") or info.get("price") or 0)
+            except (TypeError, ValueError):
+                continue
+            oid = str(trade.get("order") or info.get("orderId") or "")
+            if ts < since_s * 1000 or q <= 0 or px <= 0 or oid in booked:
+                continue
+            g = orders.setdefault(oid, {"qty": 0.0, "cost": 0.0, "ts": 0})
+            g["qty"] += q
+            g["cost"] += q * px
+            g["ts"] = max(g["ts"], ts)
+        for oid, g in sorted(orders.items(), key=lambda i: i[1]["ts"],
+                             reverse=True):
+            if abs(g["qty"] - qty) <= self._qty_tolerance(symbol, qty):
+                return g["cost"] / g["qty"], oid
+        return None, None
 
     @staticmethod
     def _exit_reason_from_price(pos, exit_px, real_fill):

@@ -1136,6 +1136,65 @@ def test_startup_open_order_halt_rechecked():
           eng2.recheck_startup_holds() is False and st2["halted"])
 
 
+# ===================================================================
+# Leg giam mot phan (dong tay 1 trong nhieu lot grid)
+# ===================================================================
+def _three_lots(eng):
+    lots = [open_lot(eng, "long", 60000, level="b%d" % i) for i in (1, 2, 3)]
+    CLOCK.sleep(120)
+    return lots
+
+
+def test_partial_manual_close_books_lot_lifo():
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    l1, l2, l3 = _three_lots(eng)
+    manual_close(fake, "long", 0.01, 60500)          # nguoi dung dong 0.01
+    first = detect_round(eng, {"BTCUSDT": 60450})
+    recs = detect_round(eng, {"BTCUSDT": 60450})
+    check("partial: lan quet 1 chi cho xac nhan", first == [])
+    check("partial: ghi nhan 1 lot (LIFO = b3) voi fill that 60500",
+          len(recs) == 1 and recs[0]["id"] == l3["id"]
+          and recs[0]["exit"] == 60500 and recs[0]["estimated"] is False
+          and recs[0]["exit_source"] == "exchange_detect_partial", recs)
+    check("partial: guard cua lot da dong bi huy, lot con lai giu guard",
+          not guards_of(fake, l3) and len(guards_of(fake, l1)) == 2
+          and len(guards_of(fake, l2)) == 2, fake.open_algos())
+    ok = eng.reconcile_positions(force=True)
+    check("partial: state khop san, khong halt",
+          ok and not st.get("halted") and len(st["positions"]) == 2,
+          (st.get("halt_reason"), st["positions"]))
+
+
+def test_partial_guard_fill_left_to_sync():
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    l1, l2, l3 = _three_lots(eng)
+    fake.fire(l1["tp_algo_id"], price=60300)          # guard cua b1 khop
+    detect_round(eng, {"BTCUSDT": 60300})
+    recs = detect_round(eng, {"BTCUSDT": 60300})
+    check("partial: guard bot vua khop -> detect KHONG doan lot",
+          recs == [] and len(st["positions"]) == 3, recs)
+    booked = sync(eng)
+    check("partial: sync ghi dung lot b1 (khong phai b3)",
+          len(booked) == 1 and booked[0]["id"] == l1["id"]
+          and {p["id"] for p in st["positions"]} == {l2["id"], l3["id"]},
+          (booked, st["positions"]))
+
+
+def test_partial_unmatched_reduction_still_halts():
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    _three_lots(eng)
+    manual_close(fake, "long", 0.005, 60500)          # nua lot
+    detect_round(eng)
+    recs = detect_round(eng)
+    ok = eng.reconcile_positions(force=True)
+    check("partial: giam khong khop lot nao -> khong doan, reconcile halt",
+          recs == [] and not ok and st.get("halted")
+          and len(st["positions"]) == 3, (recs, st.get("halt_reason")))
+
+
 TESTS = [
     test_close_one_of_many_grid_lots,
     test_close_detects_real_partial,
@@ -1181,6 +1240,9 @@ TESTS = [
     test_startup_foreign_algo_not_halt,
     test_startup_protection_halt_rechecked,
     test_startup_open_order_halt_rechecked,
+    test_partial_manual_close_books_lot_lifo,
+    test_partial_guard_fill_left_to_sync,
+    test_partial_unmatched_reduction_still_halts,
 ]
 
 
