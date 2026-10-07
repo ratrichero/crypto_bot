@@ -73,7 +73,54 @@ def test_sol_wallet():
           f'"wallet_address": "{ns["DEFAULT_SOL_WALLET"]}"' in lt_src)
 
 
-TESTS = [test_sol_wallet]
+def test_live_radar_halt_status():
+    print("== Trang thai halt that cua live_trader (khong doc file HALT chet) ==")
+    ns = load("live_radar_halt_status")
+    f = ns["live_radar_halt_status"]
+    day = "2026-10-07"
+    with tempfile.TemporaryDirectory() as d:
+        cfg = os.path.join(d, "config.live.json")
+        st_p = os.path.join(d, "live_state.json")
+
+        def state(**kw):
+            json.dump(kw, open(st_p, "w"))
+
+        check("khong co live_state -> canh bao",
+              [lv for lv, _ in f(d, cfg, day)] == ["warning"])
+        state(daily={"day": day, "realized_usd": -1.0,
+                     "day_start_portfolio_usd": 100.0,
+                     "risk_unavailable": False})
+        check("binh thuong -> rong", f(d, cfg, day) == [], f(d, cfg, day))
+        open(os.path.join(d, "HALT"), "w").write("x")
+        check("file HALT khong lien quan -> van rong", f(d, cfg, day) == [])
+        state(daily={"day": day, "realized_usd": -21.0,
+                     "day_start_portfolio_usd": 100.0,
+                     "risk_unavailable": False})
+        r = f(d, cfg, day)
+        check("lo > 20% -> DAILY STOP", len(r) == 1 and r[0][0] == "error"
+              and "DAILY STOP" in r[0][1], r)
+        json.dump({"daily_stop_pct": 0.30}, open(cfg, "w"))
+        check("dung daily_stop_pct tu config", f(d, cfg, day) == [])
+        check("daily cua ngay cu -> khong bao", f(d, cfg, "2026-10-08") == [])
+        state(daily={"day": day, "realized_usd": 0.0,
+                     "day_start_portfolio_usd": 1000.0,
+                     "risk_unavailable": True},
+              entry_blocked=True, block_reason="unmanaged tokens: 1",
+              block_since="2026-10-07 01:00:00")
+        r = f(d, cfg, day)
+        check("risk_unavailable + entry_blocked deu hien",
+              [lv for lv, _ in r] == ["error", "warning"]
+              and "unmanaged tokens: 1" in r[1][1], r)
+        open(os.path.join(d, "STOP_LIVE"), "w").write("")
+        r = f(d, cfg, day)
+        check("STOP_LIVE -> loi dau tien, nhac vi the van mo",
+              r[0][0] == "error" and "STOP_LIVE" in r[0][1]
+              and "VẪN MỞ" in r[0][1], r)
+    check("UI khong con doc meme-radar/HALT",
+          'meme-radar/HALT"' not in SRC)
+
+
+TESTS = [test_sol_wallet, test_live_radar_halt_status]
 
 if __name__ == "__main__":
     for t in TESTS:

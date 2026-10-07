@@ -701,6 +701,55 @@ def tab_live_radar(days):
     live_radar_trades_frag(days)
 
 
+RADAR_DIR = os.environ.get("RADAR_DIR", "/home/ubuntu/muse_bot/meme-radar")
+
+
+def live_radar_halt_status(base_dir, cfg_path, today=None):
+    """Ly do live_trader dang dung/khong mo lenh moi, doc dung nguon ma
+    live_trader dung. Tra ve list (level, message); rong = binh thuong.
+
+    - STOP_LIVE: process tu shutdown, vi the live VAN MO khong ai quan ly.
+    - daily (live_state.json): risk_unavailable hoac realized < -pct*base
+      cua NGAY UTC hien tai (live_trader reset theo ngay UTC).
+    - entry_blocked: reconcile on-chain thay token la/pending BUY.
+    PAUSE hien thi o cot ben canh nen khong lap lai o day.
+    """
+    out = []
+    if os.path.exists(os.path.join(base_dir, "STOP_LIVE")):
+        out.append(("error", "🛑 STOP_LIVE: live trader đã tắt — vị thế live "
+                             "VẪN MỞ, không được quản lý (xoá file + restart "
+                             "service để chạy lại)"))
+    try:
+        with open(os.path.join(base_dir, "live_state.json")) as f:
+            ls = json.load(f)
+    except Exception:
+        ls = None
+        out.append(("warning", "⚠️ Không đọc được live_state.json"))
+    pct = 0.20
+    try:
+        with open(cfg_path) as f:
+            pct = float(json.load(f).get("daily_stop_pct", pct))
+    except Exception:
+        pass
+    if ls:
+        today = today or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        d = ls.get("daily") or {}
+        if d.get("day") == today:
+            base = d.get("day_start_portfolio_usd") or 1.0
+            realized = float(d.get("realized_usd") or 0.0)
+            if d.get("risk_unavailable"):
+                out.append(("error", "🛑 Chặn mở mới: chưa đo được portfolio "
+                                     "đầu ngày (risk_unavailable)"))
+            elif realized < -pct * base:
+                out.append(("error", f"🛑 DAILY STOP: realized {realized:+.2f}$ "
+                                     f"< -{pct:.0%} × {base:,.2f}$ "
+                                     "(mở lại ngày UTC mới)"))
+        if ls.get("entry_blocked"):
+            out.append(("warning", "⚠️ BLOCKED: "
+                        f"{ls.get('block_reason') or 'unknown'} "
+                        f"(từ {ls.get('block_since') or '?'} UTC)"))
+    return out
+
 def tab_monitor():
     """Tab giam sat he thong real: status service + log realtime."""
     import subprocess
@@ -835,23 +884,13 @@ def tab_monitor():
                 except Exception as e:
                     st.error(f"Lỗi: {e}")
     with rcol2:
-        # Radar halt (neu co file halt)
-        radar_halt = "/home/ubuntu/muse_bot/meme-radar/HALT"
-        if os.path.exists(radar_halt):
-            try:
-                reason = open(radar_halt).read().strip()
-            except:
-                reason = "unknown"
-            st.error(f"🛑 HALT: {reason}")
-            if st.button("✅ Xóa halt", key="clear_halt_radar"):
-                try:
-                    os.remove(radar_halt)
-                    st.success("Đã xóa halt")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Lỗi: {e}")
-        else:
-            st.success("✅ Không halt")
+        # Trang thai chan/dung THAT cua live_trader (truoc day doc file HALT
+        # ma khong module nao ghi -> luon bao "Khong halt").
+        issues = live_radar_halt_status(RADAR_DIR, LIVE_CFG_P)
+        if not issues:
+            st.success("✅ Không halt / không chặn mở mới")
+        for level, msg in issues:
+            (st.error if level == "error" else st.warning)(msg)
 
     st.divider()
 
