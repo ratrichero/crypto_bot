@@ -919,6 +919,12 @@ class BinanceEngine:
             self.log("CRITICAL POSITION RECONCILE mismatch=%s; halt new entries"
                      % mismatches)
             return False
+        # Tu phuc hoi: neu truoc do halt vi mismatch ma gio het -> unhalt
+        if (self.state.get("halted") and
+                self.state.get("halt_reason") == "exchange position reconciliation mismatch"):
+            self.state["halted"] = False
+            self.state["halt_reason"] = None
+            self.log("RECOVERY: position reconciliation da khop, tu dong unhalt")
         return True
 
     def _reconcile_startup_open_orders(self):
@@ -1127,6 +1133,12 @@ class BinanceEngine:
                      "halt until manually reconciled"
                      % (missing, missing_required, unknown, guard_mismatch))
             return False
+        # Tu phuc hoi: neu truoc do halt vi protection mismatch ma gio het -> unhalt
+        if (self.state.get("halted") and
+                self.state.get("halt_reason") == "exchange protection reconciliation mismatch"):
+            self.state["halted"] = False
+            self.state["halt_reason"] = None
+            self.log("RECOVERY: protection reconciliation da khop, tu dong unhalt")
         return True
 
     def _reconcile_startup(self):
