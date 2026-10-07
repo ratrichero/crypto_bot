@@ -586,6 +586,18 @@ def main():
                     ) / st["day_start_equity"]
 
 
+            if MODE == "live":
+                # Phat hien vi the bi TP/SL tren san dong ma bot chua biet
+                # (VD khi dang halt hoac miss WS): ghi trade uoc tinh truoc
+                # khi reconcile, de mismatch tu het thay vi treo halt.
+                try:
+                    for rec in engine.detect_exchange_closed(mark_prices):
+                        _record_close(st, rec)
+                        dirty = True
+                except binance_safety.BinanceSafetyStop:
+                    raise
+                except Exception as e:
+                    log(f"detect_exchange_closed loi: {e}")
             if MODE == "live" and not engine.reconcile_positions():
                 if not st["halted"]:
                     st["halted"] = True
