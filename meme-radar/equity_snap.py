@@ -18,6 +18,8 @@ from datetime import datetime, timezone
 
 import requests
 
+from dexscreener import pick_pair
+
 BASE = os.path.dirname(os.path.abspath(__file__))
 STATE_P = os.path.join(BASE, "radar_state.json")
 LOG_P = os.path.join(BASE, "equity_snap.log")
@@ -77,9 +79,8 @@ def ds_price(addr):
         r = requests.get(
             f"https://api.dexscreener.com/tokens/v1/solana/{addr}", timeout=12)
         r.raise_for_status()
-        rows = r.json()
-        if isinstance(rows, list) and rows:
-            px = float(rows[0]["priceUsd"])
+        p = pick_pair(r.json(), addr)  # khong lay pair dau tien (xem dexscreener.py)
+        px = p["price"] if p else None
     except Exception:
         px = None
     _price_cache[addr] = (now, px)

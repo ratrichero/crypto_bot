@@ -19,6 +19,8 @@ from datetime import datetime, timezone
 
 import requests
 
+from dexscreener import pick_pair
+
 BASE = os.path.dirname(os.path.abspath(__file__))
 CFG = json.load(open(os.path.join(BASE, "config.json")))
 # Helius key: uu tien env HELIUS_API_KEY, roi file .helius_key (chmod 600), roi config
@@ -137,16 +139,12 @@ def ds_token(addr):
                          timeout=12)
         r.raise_for_status()
         d = r.json()
-        rows = d if isinstance(d, list) else []
-        if rows:
-            r0 = rows[0]
-            mcap = r0.get("marketCap") or r0.get("fdv") or 0
-            res = (float(r0["priceUsd"]),
-                   (r0.get("baseToken", {}).get("symbol")
-                    or r0.get("symbol") or "?").upper(),
-                   float(mcap or 0))
-        else:
-            res = (None, "?", 0)
+        # Khong lay pair dau tien: co the la pair ma addr la QUOTE (vd XYZ/SOL khi
+        # hoi gia SOL -> gia SOL sai -> amount_usd moi lenh WS/Helius sai)
+        # hoac pool rac. pick_pair chon pair dung (xem dexscreener.py).
+        p = pick_pair(d, addr)
+        res = ((p["price"], (p["symbol"] or "?").upper(), float(p["mcap"]))
+               if p else (None, "?", 0))
     except Exception:
         res = (None, "?", 0)
     _price_cache[ck] = (now, res)
