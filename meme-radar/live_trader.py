@@ -1088,8 +1088,11 @@ class LiveTrader:
             actual = int(bal.get("amount", 0) or 0)
             if actual <= 0:
                 log(f"RECONCILE: {pos.get('symbol')} khong con token "
-                    "tren vi -> bo local position, khong ban lai")
-                self.positions.remove(pos)
+                    "tren vi -> dong local position (ghi live_trades, P&L "
+                    "phan con lai KHONG XAC DINH), khong ban lai")
+                # Ghi trade record thay vi xoa im lang (truoc day mat lich su
+                # + legs da ban). Khong cong gi vao daily (khong biet gia).
+                self._close_position(pos, "reconcile_wallet_empty", None, now)
                 changed = True
                 continue
             pos["onchain_tokens_base"] = actual

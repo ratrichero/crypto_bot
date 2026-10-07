@@ -906,6 +906,24 @@ def test_empty_wallet_no_fake_loss():
         check("realized 0 (khong -$10)", rec["realized_usd"] == 0.0, str(rec))
 
 
+
+def test_reconcile_gone_writes_trade():
+    print("== reconcile: token bien mat -> ghi live_trades (khong xoa im lang) ==")
+    with isolated() as tmpd:
+        tr = _live_trader_stub(tmpd, {})   # vi khong con MINT
+        pos = mkpos()
+        pos["legs"] = [{"frac": 0.3334, "why": "TP1", "pnl_usd": 1.7}]
+        pos["realized_usd"] = 1.7
+        tr.positions = [pos]
+        tr.reconcile_onchain(now=1000, force=True)
+        check("vi the bi dong", tr.positions == [])
+        lines = open(lt.TRADES_P).read().splitlines() if os.path.exists(lt.TRADES_P) else []
+        rec = json.loads(lines[-1]) if lines else {}
+        check("co trade record", rec.get("reason") == "reconcile_wallet_empty", str(rec))
+        check("giu legs/realized da co", rec.get("realized_usd") == 1.7
+              and len(rec.get("legs", [])) == 1, str(rec))
+
+
 if __name__ == "__main__":
     test_exit_tp_ladder()
     test_exit_sl()
@@ -943,5 +961,6 @@ if __name__ == "__main__":
     test_uncertain_partial_not_landed_waits_then_retries()
     test_uncertain_pending_allows_full_sl()
     test_empty_wallet_no_fake_loss()
+    test_reconcile_gone_writes_trade()
     print(f"\n{PASS} pass, {FAIL} fail")
     sys.exit(1 if FAIL else 0)
