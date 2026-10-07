@@ -1497,11 +1497,31 @@ class BinanceEngine:
             return None, "action_failed: %s" % e
 
     def retry_protection(self):
-        """Retry dat SL/TP cho cac vi the dang 'retrying'. Tra ve True neu co thay doi."""
+        """Retry dat SL/TP cho cac vi the dang 'retrying' hoac chua co protection.
+        Tra ve True neu co thay doi."""
         now = time.time()
         changed = False
         for pos in self.state.get("positions", []):
-            if pos.get("protection_status") != "retrying":
+            status = pos.get("protection_status")
+            # Backfill: vi the cu chua co protection -> dat ngay
+            if status is None and self.cfg.get("exchange_protection", False):
+                if pos.get("sl") or pos.get("tp"):
+                    log_msg = f"Backfill protection cho #{pos['id']} {pos['symbol']}"
+                    self.log(log_msg)
+                    try:
+                        protection = self._create_exchange_protection(pos)
+                        pos["sl_algo_id"] = protection.get("sl")
+                        pos["tp_algo_id"] = protection.get("tp")
+                        pos["protection_status"] = "armed"
+                        changed = True
+                        self.log(f"Backfill thanh cong #{pos['id']}")
+                    except Exception as e:
+                        pos["protection_status"] = "retrying"
+                        pos["protection_retry_at"] = now + 10
+                        pos["protection_deadline"] = now + 120
+                        changed = True
+                continue
+            if status != "retrying":
                 continue
             if now < pos.get("protection_retry_at", 0):
                 continue
