@@ -198,7 +198,7 @@ lệnh và mẫu báo cáo.
 | Giai đoạn | Nội dung | Ảnh hưởng lệnh thật |
 |---|---|---|
 | G0 | Sửa basket + trần tổng 10% | ✅ đã xong (`8b95587`) |
-| G1 | Config runtime DB + cache + trang dashboard (đăng nhập, user lưu DB) | ✅ xong (`869aba8` + dashboard) — xem `docs/upgrade.md` mục 9 |
+| G1 | Config runtime DB + cache + trang dashboard (đăng nhập, user lưu DB) | ✅ xong (`869aba8`, `7641978`) — xem `docs/upgrade.md` mục 9 |
 | G2 | Scanner đi ngang, **chế độ quan sát** + bảng xếp hạng trên dashboard | ✅ xong — ngưỡng CHOP/percentile đã chỉnh, xem `docs/upgrade.md` mục 9.3 |
 | G3 | Backtest: kiểm chứng scanner + grid v2 | Không |
 | G4 | Range grid 2 chiều theo scanner, `max_symbols`, SL biên, giảm vị thế khi trend | Có (dry-run → testnet) |

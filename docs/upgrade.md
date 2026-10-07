@@ -329,7 +329,7 @@ Các dòng `Traceback ...` / `FAIL attempt=1` trong output test là log có ch�
 
 ## 9. G1 + G2 — config runtime, dashboard đăng nhập, scanner đi ngang
 
-Thiết kế ở `docs/grid-v2-design.md`. Commit: bot/DB `869aba8`, dashboard (commit kế tiếp).
+Thiết kế ở `docs/grid-v2-design.md`. Commit: bot/DB `869aba8`, dashboard `7641978`.
 
 ### 9.1 Config runtime (DB → cache → bot, không restart)
 
