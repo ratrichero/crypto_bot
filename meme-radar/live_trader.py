@@ -138,6 +138,11 @@ DEFAULTS = {
     # jupiter_min_interval_seconds = 2.
     "jupiter_api_key_file": ".jupiter_key",
     "jupiter_min_interval_seconds": 0.0,
+    # Jupiter tra 401 voi key (key sai/het han/bi thu hoi) -> CRITICAL 1 lan,
+    # gui lai NGAY request do len jupiter_fallback_base KHONG key (de lenh ban
+    # khong ket), thu lai key sau jupiter_key_retry_seconds. "" = tat.
+    "jupiter_fallback_base": "https://lite-api.jup.ag",
+    "jupiter_key_retry_seconds": 1800,
     # ---- (1) thu hoi rent token account (~0.00204 SOL/token) sau khi ban
     # sach. Chi dong account so du 0 (on-chain cung tu choi neu con token).
     "reclaim_rent": True,
@@ -576,7 +581,8 @@ class SwapUncertain(SwapError):
 class JupiterClient:
     def __init__(self, base="https://lite-api.jup.ag", timeout=20,
                  http_get=None, http_post=None, api_key=None,
-                 min_interval=0.0):
+                 min_interval=0.0, fallback_base=None,
+                 key_retry_seconds=1800, clock=None):
         self.base = base.rstrip("/")
         self.timeout = timeout
         self._get = http_get or requests.get
@@ -585,10 +591,66 @@ class JupiterClient:
         self.api_key = api_key or None
         self.min_interval = float(min_interval or 0.0)
         self._last_req = 0.0
+        # 401 voi key -> chay tam khong key tren fallback_base
+        self.fallback_base = (fallback_base or "").rstrip("/") or None
+        self.key_retry_seconds = float(key_retry_seconds or 0)
+        self._clock = clock or time.time
+        self.key_rejected_at = 0.0       # >0: key dang bi Jupiter tu choi
+        self.key_reject_count = 0
+
+    def _key_active(self):
+        """Co dung key cho request nay khong (het han cho -> thu lai key)."""
+        if not getattr(self, "api_key", None):
+            return False
+        if not getattr(self, "key_rejected_at", 0):
+            return True
+        if self.key_retry_seconds > 0 and \
+                self._clock() - self.key_rejected_at >= self.key_retry_seconds:
+            log("Jupiter: thu lai API key sau %.0f phut chay khong key"
+                % ((self._clock() - self.key_rejected_at) / 60))
+            self.key_rejected_at = 0.0
+            return True
+        return False
 
     def _headers(self):
         key = getattr(self, "api_key", None)
+        if key and getattr(self, "key_rejected_at", 0):
+            return None
         return {"x-api-key": key} if key else None
+
+    def _url(self, path, keyed):
+        if keyed or not getattr(self, "key_rejected_at", 0) or \
+                not getattr(self, "fallback_base", None):
+            return f"{self.base}{path}"
+        return f"{self.fallback_base}{path}"
+
+    def _request(self, method, path, **kw):
+        """GET/POST qua 1 cho: 401 khi dang dung key -> bo key, gui lai ngay
+        len fallback_base khong key. An toan cho /swap: 401 = Jupiter chua
+        dung tx nao (va endpoint chi dung tx, khong gui len chain)."""
+        fn = self._get if method == "GET" else self._post
+        keyed = self._key_active()
+        self._throttle()
+        r = fn(self._url(path, keyed), timeout=self.timeout,
+               headers={"x-api-key": self.api_key} if keyed else None, **kw)
+        if keyed and getattr(r, "status_code", 200) == 401 and \
+                getattr(self, "fallback_base", None):
+            self.key_rejected_at = self._clock()
+            self.key_reject_count += 1
+            retry_min = self.key_retry_seconds / 60
+            if self.key_reject_count == 1:
+                log("CRITICAL Jupiter tu choi API key (401) -> chay KHONG key "
+                    f"tren {self.fallback_base}, thu lai key sau "
+                    f"{retry_min:.0f} phut. Thay key: env JUPITER_API_KEY "
+                    "(.env goc) hoac .jupiter_key, tao tai portal.jup.ag")
+            else:
+                log(f"Jupiter: key van bi tu choi (401, lan "
+                    f"{self.key_reject_count}) -> tiep tuc khong key, thu lai "
+                    f"sau {retry_min:.0f} phut")
+            self._throttle()
+            r = fn(self._url(path, False), timeout=self.timeout, headers=None,
+                   **kw)
+        return r
 
     def _throttle(self):
         """Gian cach toi thieu giua 2 request (keyless api.jup.ag 0.5 rps)."""
@@ -601,12 +663,11 @@ class JupiterClient:
         self._last_req = time.monotonic()
 
     def quote(self, in_mint, out_mint, amount_base, slippage_bps):
-        self._throttle()
-        r = self._get(f"{self.base}/swap/v1/quote", params={
+        r = self._request("GET", "/swap/v1/quote", params={
             "inputMint": in_mint, "outputMint": out_mint,
             "amount": str(int(amount_base)),
             "slippageBps": str(int(slippage_bps)),
-        }, timeout=self.timeout, headers=self._headers())
+        })
         r.raise_for_status()
         q = r.json()
         if not isinstance(q, dict) or "outAmount" not in q:
@@ -621,10 +682,8 @@ class JupiterClient:
         mints = [m for m in dict.fromkeys(mints) if m]
         for i in range(0, len(mints), 50):
             chunk = mints[i:i + 50]
-            self._throttle()
-            r = self._get(f"{self.base}/price/v3",
-                          params={"ids": ",".join(chunk)},
-                          timeout=self.timeout, headers=self._headers())
+            r = self._request("GET", "/price/v3",
+                              params={"ids": ",".join(chunk)})
             r.raise_for_status()
             d = r.json() or {}
             for m in chunk:
@@ -637,13 +696,12 @@ class JupiterClient:
         return out
 
     def swap_tx(self, quote, user_pubkey, priority_fee):
-        self._throttle()
-        r = self._post(f"{self.base}/swap/v1/swap", json={
+        r = self._request("POST", "/swap/v1/swap", json={
             "quoteResponse": quote,
             "userPublicKey": user_pubkey,
             "dynamicComputeUnitLimit": True,
             "prioritizationFeeLamports": priority_fee,
-        }, timeout=self.timeout, headers=self._headers())
+        })
         r.raise_for_status()
         d = r.json()
         tx = d.get("swapTransaction")
@@ -1298,9 +1356,16 @@ class LiveTrader:
             log("CANH BAO Jupiter lite-api dang bi giam rate va se khai tu. "
                 "Nen tao API key (developers.jup.ag) -> env JUPITER_API_KEY "
                 "hoac file .jupiter_key")
+        fb = cfg.get("jupiter_fallback_base", DEFAULTS["jupiter_fallback_base"])
+        if not key or (fb or "").rstrip("/") == base.rstrip("/"):
+            fb = None                    # khong key / trung base -> vo nghia
         return JupiterClient(
             base, api_key=key or None,
-            min_interval=float(cfg.get("jupiter_min_interval_seconds") or 0))
+            min_interval=float(cfg.get("jupiter_min_interval_seconds") or 0),
+            fallback_base=fb,
+            key_retry_seconds=float(cfg.get(
+                "jupiter_key_retry_seconds",
+                DEFAULTS["jupiter_key_retry_seconds"]) or 0))
 
     def _init_source_offsets(self, first_start):
         """Bind persisted offsets to the configured files.

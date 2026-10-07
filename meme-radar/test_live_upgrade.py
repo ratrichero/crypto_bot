@@ -563,11 +563,13 @@ def test_batch_prices():
 
 
 class FakeResp:
-    def __init__(self, data):
+    def __init__(self, data, status_code=200):
         self.data = data
+        self.status_code = status_code
 
     def raise_for_status(self):
-        pass
+        if self.status_code >= 400:
+            raise lt.requests.HTTPError("%d Client Error" % self.status_code)
 
     def json(self):
         return self.data
@@ -611,6 +613,128 @@ def test_jupiter_client():
                   and j.min_interval == 2)
             check("key bi che trong log", "ENVKEY12345"
                   not in lt.redact("x ENVKEY12345 y"))
+        finally:
+            os.environ.pop("JUPITER_API_KEY", None)
+            if old is not None:
+                os.environ["JUPITER_API_KEY"] = old
+
+
+def test_jupiter_key_fallback():
+    print("== (5b) Jupiter 401 voi key -> chay khong key tren lite-api ==")
+    now = [1000.0]
+    calls, logs = [], []
+    key_ok = [False]
+
+    def get(url, params=None, timeout=None, headers=None):
+        calls.append(("GET", url, headers))
+        if headers and not key_ok[0]:
+            return FakeResp({"error": "Unauthorized"}, 401)
+        if "lite-api" in url and headers:
+            return FakeResp({}, 401)             # lite-api khong nhan key
+        if url.endswith("/price/v3"):
+            return FakeResp({m: {"usdPrice": 2.0}
+                             for m in params["ids"].split(",")})
+        return FakeResp({"outAmount": "123"})
+
+    def post(url, json=None, timeout=None, headers=None):
+        calls.append(("POST", url, headers, json))
+        if headers and not key_ok[0]:
+            return FakeResp({}, 401)
+        return FakeResp({"swapTransaction": "TX"})
+
+    old_log = lt.log
+    lt.log = lambda m: logs.append(m)
+    try:
+        j = lt.JupiterClient("https://api.jup.ag", http_get=get,
+                             http_post=post, api_key="K" * 12,
+                             fallback_base="https://lite-api.jup.ag",
+                             key_retry_seconds=1800, clock=lambda: now[0])
+        px = j.prices_usd(["A", "B"])
+        check("401 voi key -> gui lai ngay len lite-api khong key, co gia",
+              px == {"A": 2.0, "B": 2.0} and len(calls) == 2
+              and calls[0][1:] == ("https://api.jup.ag/price/v3",
+                                   {"x-api-key": "K" * 12})
+              and calls[1][1:] == ("https://lite-api.jup.ag/price/v3", None),
+              calls)
+        check("CRITICAL 1 lan, khong lo key",
+              sum("CRITICAL" in m for m in logs) == 1
+              and not any("K" * 12 in m for m in logs), logs)
+        del calls[:]
+        q = j.quote("IN", "OUT", 10, 50)
+        check("trong thoi gian cho -> di thang lite-api, khong goi key",
+              q["outAmount"] == "123" and len(calls) == 1
+              and calls[0][1].startswith("https://lite-api.jup.ag/swap/v1/quote")
+              and calls[0][2] is None, calls)
+        del calls[:]
+        tx = j.swap_tx({"q": 1}, "PUB", 1000)
+        check("swap (lenh ban) khong ket: POST lite-api, giu nguyen body",
+              tx == "TX" and len(calls) == 1
+              and calls[0][1] == "https://lite-api.jup.ag/swap/v1/swap"
+              and calls[0][3]["quoteResponse"] == {"q": 1}, calls)
+
+        # het 30 phut: thu lai key, van 401 -> quay lai khong key, khong CRITICAL
+        now[0] += 1800
+        del calls[:]
+        j.prices_usd(["A"])
+        check("het han cho -> thu lai key; van 401 -> lite-api",
+              len(calls) == 2 and calls[0][2] == {"x-api-key": "K" * 12}
+              and calls[1][2] is None and j.key_reject_count == 2, calls)
+        check("lan 401 sau khong CRITICAL lai",
+              sum("CRITICAL" in m for m in logs) == 1, logs)
+
+        # nguoi dung thay key moi hop le -> lan thu sau dung key
+        now[0] += 1800
+        key_ok[0] = True
+        del calls[:]
+        j.prices_usd(["A"])
+        check("key hoat dong lai -> dung api.jup.ag + key",
+              len(calls) == 1 and calls[0][1] == "https://api.jup.ag/price/v3"
+              and calls[0][2] == {"x-api-key": "K" * 12}
+              and j.key_rejected_at == 0, calls)
+
+        # loi khac 401 (429/500) -> KHONG fallback, van raise nhu cu
+        def get500(url, params=None, timeout=None, headers=None):
+            calls.append(("GET", url, headers))
+            return FakeResp({}, 500)
+        j5 = lt.JupiterClient("https://api.jup.ag", http_get=get500,
+                              api_key="K" * 12,
+                              fallback_base="https://lite-api.jup.ag")
+        del calls[:]
+        try:
+            j5.prices_usd(["A"])
+            raised = False
+        except lt.requests.HTTPError:
+            raised = True
+        check("500 -> khong fallback, raise", raised and len(calls) == 1)
+
+        # tat fallback -> 401 raise nhu truoc
+        key_ok[0] = False
+        j0 = lt.JupiterClient("https://api.jup.ag", http_get=get,
+                              api_key="K" * 12)
+        try:
+            j0.prices_usd(["A"])
+            raised = False
+        except lt.requests.HTTPError:
+            raised = True
+        check("khong co fallback_base -> 401 raise nhu cu", raised)
+    finally:
+        lt.log = old_log
+
+    with isolated():
+        old = os.environ.pop("JUPITER_API_KEY", None)
+        try:
+            j = lt.LiveTrader._make_jupiter(dict(lt.DEFAULTS))
+            check("_make_jupiter khong key -> khong fallback",
+                  j.fallback_base is None)
+            os.environ["JUPITER_API_KEY"] = "ENVKEY12345"
+            j = lt.LiveTrader._make_jupiter(dict(lt.DEFAULTS))
+            check("_make_jupiter co key -> fallback lite-api, retry 30 phut",
+                  j.base == "https://api.jup.ag"
+                  and j.fallback_base == "https://lite-api.jup.ag"
+                  and j.key_retry_seconds == 1800)
+            j = lt.LiveTrader._make_jupiter(dict(lt.DEFAULTS,
+                                                 jupiter_fallback_base=""))
+            check("jupiter_fallback_base='' -> tat", j.fallback_base is None)
         finally:
             os.environ.pop("JUPITER_API_KEY", None)
             if old is not None:
@@ -778,6 +902,7 @@ if __name__ == "__main__":
     test_exit_escalation()
     test_batch_prices()
     test_jupiter_client()
+    test_jupiter_key_fallback()
     test_copy_exit()
     test_close_empty_script()
     test_graceful_signal_shutdown()
