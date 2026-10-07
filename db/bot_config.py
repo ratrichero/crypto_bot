@@ -357,6 +357,16 @@ CREATE TABLE IF NOT EXISTS scanner_snapshots (
 );
 CREATE INDEX IF NOT EXISTS scanner_snapshots_sym_idx
     ON scanner_snapshots (bot, symbol, ts DESC);
+CREATE TABLE IF NOT EXISTS dashboard_sessions (
+    token_hash   TEXT PRIMARY KEY,
+    username     TEXT NOT NULL REFERENCES dashboard_users (username)
+                 ON DELETE CASCADE,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at   TIMESTAMPTZ NOT NULL,
+    last_seen_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS dashboard_sessions_user_idx
+    ON dashboard_sessions (username);
 """
 
 
@@ -593,6 +603,9 @@ def set_active(conn, actor: str, username: str, active: bool) -> None:
         conn.execute("UPDATE dashboard_users SET is_active = %s, "
                      "failed_attempts = 0, locked_until = NULL "
                      "WHERE id = %s", (active, user["id"]))
+        if not active:
+            conn.execute("DELETE FROM dashboard_sessions WHERE username = %s",
+                         (user["username"],))
 
 
 def set_role(conn, actor: str, username: str, role: str) -> None:
@@ -623,6 +636,58 @@ def reset_password(conn, actor: str, username: str, password: str) -> None:
         conn.execute("UPDATE dashboard_users SET password_hash = %s, "
                      "failed_attempts = 0, locked_until = NULL "
                      "WHERE id = %s", (hash_password(password), user["id"]))
+        # Doi mat khau -> thu hoi moi phien (dashboard tao lai phien hien tai
+        # khi user tu doi).
+        conn.execute("DELETE FROM dashboard_sessions WHERE username = %s",
+                     (user["username"],))
+
+
+# --------------------------------------------------------- sessions
+# Phien dang nhap dashboard (giu qua F5). Cookie trinh duyet chi chua token
+# ngau nhien; DB chi luu SHA-256 cua token -> lo DB khong lo phien. Phien het
+# han co dinh SESSION_DAYS sau dang nhap; doi mat khau / khoa tai khoan /
+# dang xuat moi thiet bi -> thu hoi.
+SESSION_DAYS = 7
+
+
+def _token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def create_session(conn, username: str, days: float = SESSION_DAYS) -> str:
+    token = secrets.token_urlsafe(32)
+    with conn.transaction():
+        conn.execute("DELETE FROM dashboard_sessions WHERE expires_at < now()")
+        conn.execute("INSERT INTO dashboard_sessions (token_hash, username, "
+                     "expires_at) VALUES (%s, %s, now() + %s)",
+                     (_token_hash(token), username, timedelta(days=days)))
+    return token
+
+
+def session_user(conn, token: Optional[str]) -> Optional[dict]:
+    """User {username, role} cua phien con han va tai khoan con hoat dong."""
+    if not token or len(token) > 200:
+        return None
+    rows = _rows(conn, "UPDATE dashboard_sessions s SET last_seen_at = now() "
+                       "FROM dashboard_users u WHERE s.token_hash = %s "
+                       "AND s.expires_at > now() AND u.username = s.username "
+                       "AND u.is_active RETURNING u.username, u.role",
+                 (_token_hash(token),))
+    return dict(rows[0]) if rows else None
+
+
+def delete_session(conn, token: Optional[str]) -> None:
+    if token:
+        with conn.transaction():
+            conn.execute("DELETE FROM dashboard_sessions WHERE token_hash = %s",
+                         (_token_hash(token),))
+
+
+def delete_user_sessions(conn, username: str) -> int:
+    with conn.transaction():
+        cur = conn.execute("DELETE FROM dashboard_sessions WHERE username = %s",
+                           (username,))
+        return cur.rowcount or 0
 
 
 # --------------------------------------------------------- scanner

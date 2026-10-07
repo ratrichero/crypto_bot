@@ -246,7 +246,30 @@ def test_scanner_tab_levels():
                                              for c in fst.captions))
 
 
-TESTS = [test_sol_wallet, test_live_radar_halt_status, test_config_helpers,
+def test_session_cookie():
+    print("== Phien dang nhap: cookie ==")
+    import re as _re
+    ns = load("SESSION_COOKIE", "_TOKEN_RE", "cookie_js",
+              extra={"re": _re, "SESSION_DAYS": 7})
+    tok = "A" * 43
+    js = ns["cookie_js"](tok, 7)
+    check("cookie: ghi tren trang cha, 7 ngay, SameSite=Strict, Path=/",
+          "window.parent" in js and "mb_session=%s; Max-Age=604800" % tok in js
+          and "SameSite=Strict" in js and "Path=/" in js, js)
+    check("cookie: HTTPS thi them Secure", "'; Secure'" in js)
+    check("cookie: xoa -> Max-Age=0",
+          "mb_session=; Max-Age=0" in ns["cookie_js"](None))
+    try:
+        ns["cookie_js"]("x'; alert(1);//" + "a" * 20)
+        bad = False
+    except ValueError:
+        bad = True
+    check("cookie: token la (chen JS) bi tu choi", bad)
+    check("auth: F5 doc cookie qua st.context.cookies",
+          "st.context.cookies" in SRC and "bc.session_user" in SRC)
+
+
+TESTS = [test_session_cookie, test_sol_wallet, test_live_radar_halt_status, test_config_helpers,
          test_scanner_tab_levels]
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ Tu refresh 60s. Vi the dang mo doc truc tiep tu state file cua bot.
 """
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -16,6 +17,7 @@ import psycopg
 import psycopg.rows
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))), "db"))
@@ -1422,6 +1424,86 @@ def is_admin():
     return bool(u and u.get("role") == "admin")
 
 
+# ---- phien dang nhap giu qua F5 (cookie token + bang dashboard_sessions)
+SESSION_COOKIE = "mb_session"
+SESSION_DAYS = float(os.environ.get("DASHBOARD_SESSION_DAYS", bc.SESSION_DAYS))
+_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{20,200}$")
+
+
+def cookie_js(token=None, days=SESSION_DAYS):
+    """Script ghi (token) / xoa (None) cookie phien tren trang CHA.
+
+    Streamlit khong cho dat header Set-Cookie nen phai ghi bang JS qua iframe
+    components (sandbox allow-same-origin) -> cookie khong the HttpOnly.
+    Trang chay HTTPS thi tu them Secure."""
+    if token:
+        if not _TOKEN_RE.match(token):
+            raise ValueError("token phiên không hợp lệ")
+        value, age = token, int(days * 86400)
+    else:
+        value, age = "", 0
+    return ("<script>(function(){var w=window.parent;"
+            "var c='%s=%s; Max-Age=%d; Path=/; SameSite=Strict';"
+            "if(w.location.protocol==='https:'){c+='; Secure';}"
+            "w.document.cookie=c;})();</script>"
+            % (SESSION_COOKIE, value, age))
+
+
+def _cookie_token():
+    try:
+        token = st.context.cookies.get(SESSION_COOKIE)
+    except Exception:                    # Streamlit < 1.42: khong doc duoc
+        return None
+    return (token if isinstance(token, str) and _TOKEN_RE.match(token)
+            else None)
+
+
+def _run_js(html):
+    """Chay script trong iframe cung origin (st.iframe o Streamlit moi,
+    components.html o ban cu - sap bi bo)."""
+    frame = getattr(st, "iframe", None)
+    if frame is not None:
+        frame(html, height=1)
+    else:
+        components.html(html, height=0)
+
+
+def _flush_cookie_cmd():
+    """Ghi/xoa cookie da hen o lan chay truoc (st.rerun() cat ngang trang nen
+    script phai render o lan chay sau)."""
+    cmd = st.session_state.pop("_cookie_cmd", None)
+    if cmd is not None:
+        _run_js(cookie_js(cmd or None))
+
+
+def _start_session(user, remember=True):
+    st.session_state["auth_user"] = {"username": user["username"],
+                                     "role": user["role"]}
+    if not remember:
+        return
+    try:
+        token = db_call(bc.create_session, user["username"], SESSION_DAYS)
+    except Exception as e:               # phien van chay theo tab
+        st.session_state["_session_err"] = str(e)
+        return
+    st.session_state["_session_token"] = token
+    st.session_state["_cookie_cmd"] = token
+
+
+def _end_session(all_devices=False):
+    user = current_user()
+    token = st.session_state.pop("_session_token", None) or _cookie_token()
+    try:
+        if all_devices and user:
+            db_call(bc.delete_user_sessions, user["username"])
+        else:
+            db_call(bc.delete_session, token)
+    except Exception:
+        pass
+    st.session_state.pop("auth_user", None)
+    st.session_state["_cookie_cmd"] = ""
+
+
 def auth_gate():
     """Chan toan bo dashboard toi khi dang nhap. Tra ve user dict."""
     try:
@@ -1429,14 +1511,24 @@ def auth_gate():
     except Exception as e:
         st.error("Không tạo được bảng tài khoản/config trong DB: %s" % e)
         st.stop()
+    _flush_cookie_cmd()
     user = current_user()
+    if not user:
+        token = _cookie_token()
+        restored = db_call(bc.session_user, token) if token else None
+        if restored:
+            st.session_state["auth_user"] = user = restored
+            st.session_state["_session_token"] = token
+        elif token:
+            _run_js(cookie_js(None))   # phien het han
     if user:
         fresh = db_call(bc.get_user, user["username"])
         if fresh and fresh["is_active"]:
             user = {"username": fresh["username"], "role": fresh["role"]}
             st.session_state["auth_user"] = user
             return user
-        st.session_state.pop("auth_user", None)
+        _end_session()
+        _flush_cookie_cmd()
         st.warning("Phiên đăng nhập đã hết hiệu lực (tài khoản bị khoá/xoá).")
     if db_call(bc.user_count) == 0:
         st.subheader("🔐 Khởi tạo tài khoản quản trị")
@@ -1453,8 +1545,7 @@ def auth_gate():
                 for e in errs:
                     st.error(e)
             elif db_call(bc.create_first_admin, u.strip(), p1):
-                st.session_state["auth_user"] = {"username": u.strip(),
-                                                 "role": "admin"}
+                _start_session({"username": u.strip(), "role": "admin"})
                 st.rerun()
             else:
                 st.error("Đã có tài khoản khác được tạo trước — hãy đăng nhập.")
@@ -1463,12 +1554,13 @@ def auth_gate():
     with st.form("login"):
         u = st.text_input("Tên đăng nhập")
         p = st.text_input("Mật khẩu", type="password")
+        remember = st.checkbox("Ghi nhớ đăng nhập %g ngày (F5 không phải "
+                               "đăng nhập lại)" % SESSION_DAYS, value=True)
         ok = st.form_submit_button("Đăng nhập")
     if ok:
         user, msg = db_call(bc.authenticate, u.strip(), p)
         if user:
-            st.session_state["auth_user"] = {"username": user["username"],
-                                             "role": user["role"]}
+            _start_session(user, remember)
             st.rerun()
         st.error(msg)
     st.stop()
@@ -1478,8 +1570,15 @@ def sidebar_account(user):
     with st.sidebar:
         st.markdown("👤 **%s** · %s" % (user["username"], user["role"]))
         if st.button("Đăng xuất", key="logout"):
-            st.session_state.pop("auth_user", None)
+            _end_session()
             st.rerun()
+        if st.button("Đăng xuất mọi thiết bị", key="logout_all",
+                     help="Thu hồi mọi phiên ghi nhớ của tài khoản này"):
+            _end_session(all_devices=True)
+            st.rerun()
+        if st.session_state.get("_session_err"):
+            st.caption("⚠️ Không lưu được phiên (F5 sẽ phải đăng nhập lại): "
+                       + st.session_state["_session_err"])
         with st.expander("Đổi mật khẩu"):
             with st.form("self_pw"):
                 p1 = st.text_input("Mật khẩu mới", type="password")
@@ -1492,7 +1591,13 @@ def sidebar_account(user):
                     try:
                         db_call(bc.reset_password, user["username"],
                                 user["username"], p1)
-                        st.success("Đã đổi mật khẩu")
+                        # doi mat khau thu hoi moi phien -> cap phien moi
+                        # cho thiet bi hien tai neu dang ghi nho
+                        if st.session_state.pop("_session_token", None):
+                            _start_session(user)
+                            _flush_cookie_cmd()
+                        st.success("Đã đổi mật khẩu (các thiết bị khác đã "
+                                   "bị đăng xuất)")
                     except (ValueError, PermissionError) as e:
                         st.error(str(e))
 

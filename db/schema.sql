@@ -127,3 +127,17 @@ CREATE TABLE IF NOT EXISTS scanner_snapshots (
 );
 CREATE INDEX IF NOT EXISTS scanner_snapshots_sym_idx
     ON scanner_snapshots (bot, symbol, ts DESC);
+
+-- Phien dang nhap dashboard giu qua F5: cookie chi chua token ngau nhien,
+-- DB chi luu SHA-256 cua token. Het han 7 ngay; doi mat khau / khoa tai
+-- khoan / dang xuat moi thiet bi -> xoa.
+CREATE TABLE IF NOT EXISTS dashboard_sessions (
+    token_hash   TEXT PRIMARY KEY,
+    username     TEXT NOT NULL REFERENCES dashboard_users (username)
+                 ON DELETE CASCADE,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at   TIMESTAMPTZ NOT NULL,
+    last_seen_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS dashboard_sessions_user_idx
+    ON dashboard_sessions (username);

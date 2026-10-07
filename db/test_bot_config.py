@@ -165,6 +165,51 @@ if pgserver is not None:
     check("list_users khong tra password_hash",
           all("password_hash" not in r for r in bc.list_users(conn)))
 
+    # ---- phien dang nhap (giu qua F5)
+    tok = bc.create_session(conn, "minh")
+    row = bc._rows(conn, "SELECT token_hash, expires_at - created_at AS ttl "
+                         "FROM dashboard_sessions")
+    check("session: DB chi luu hash token, han 7 ngay",
+          len(row) == 1 and row[0]["token_hash"] != tok
+          and row[0]["ttl"] == timedelta(days=7), row)
+    check("session: token dung -> user + role tu DB",
+          bc.session_user(conn, tok) == {"username": "minh", "role": "viewer"})
+    check("session: token sai/rong -> None",
+          bc.session_user(conn, tok + "x") is None
+          and bc.session_user(conn, None) is None)
+    bc.set_role(conn, "cuong", "minh", "admin")
+    check("session: doi quyen ap dung ngay (doc role tu DB)",
+          bc.session_user(conn, tok)["role"] == "admin")
+    bc.set_role(conn, "cuong", "minh", "viewer")
+    with conn.transaction():
+        conn.execute("UPDATE dashboard_sessions SET expires_at = now() - "
+                     "interval '1 second'")
+    check("session: het han -> None", bc.session_user(conn, tok) is None)
+    tok2 = bc.create_session(conn, "minh")
+    check("session: tao phien moi don phien het han",
+          bc._rows(conn, "SELECT count(*) AS n FROM dashboard_sessions")[0]["n"]
+          == 1)
+    bc.set_active(conn, "cuong", "minh", False)
+    check("session: khoa tai khoan -> thu hoi phien",
+          bc.session_user(conn, tok2) is None)
+    bc.set_active(conn, "cuong", "minh", True)
+    tok3 = bc.create_session(conn, "minh")
+    tok4 = bc.create_session(conn, "minh")
+    bc.reset_password(conn, "minh", "minh", "matkhau789")
+    check("session: doi mat khau -> thu hoi moi phien",
+          bc.session_user(conn, tok3) is None
+          and bc.session_user(conn, tok4) is None)
+    tok5 = bc.create_session(conn, "minh")
+    tok6 = bc.create_session(conn, "cuong")
+    bc.delete_session(conn, tok5)
+    check("session: dang xuat chi xoa phien do",
+          bc.session_user(conn, tok5) is None
+          and bc.session_user(conn, tok6) is not None)
+    bc.create_session(conn, "cuong")
+    check("session: dang xuat moi thiet bi",
+          bc.delete_user_sessions(conn, "cuong") == 2
+          and bc.session_user(conn, tok6) is None)
+
     # ---- RuntimeConfig phia bot
     import runtime_config as rc
 
