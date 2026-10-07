@@ -25,6 +25,8 @@ from datetime import datetime, timezone
 
 import binance_client
 import binance_safety
+import runtime_config
+import scanner as range_scanner
 import strategy
 from indicators import atr
 from binance_ws import BinanceWS
@@ -46,6 +48,9 @@ MODE = CFG.get("mode", "dry_run")
 DATA_ONLY = MODE == "data_only"
 LOCK_P = os.path.join(BASE, "bot.lock")
 CIRCUIT_P = os.path.join(BASE, "binance_circuit.json")
+SCANNER_P = os.path.join(BASE, "scanner_latest.json")
+RUNTIME = None           # runtime_config.RuntimeConfig (tao trong main)
+SCANNER = None           # scanner.ScannerRunner (tao trong main)
 
 
 def make_engine(st):
@@ -471,6 +476,23 @@ def enforce_grid_total_stop(engine, st, mark_prices, base_equity):
     return True
 
 
+def grid_entry_allowed(st, symbol, has_lots):
+    """Gioi han mo lot grid moi (khong anh huong quan ly lot dang mo):
+    - grid.max_symbols: symbol CHUA co lot khong duoc vao khi so symbol
+      dang co lot grid da dat gioi han (0 = khong gioi han).
+    - scanner che do filter: chi symbol dat chuan + top K, du lieu het han
+      -> chan (fail-closed)."""
+    limit = int(CFG["grid"].get("max_symbols") or 0)
+    if limit > 0 and not has_lots:
+        busy = {p.get("symbol") for p in st["positions"]
+                if p.get("tag") == "grid"}
+        if len(busy) >= limit:
+            return False
+    if SCANNER is not None and not SCANNER.allows(symbol, SYMBOLS):
+        return False
+    return True
+
+
 def manage_grid(engine, st, symbol, price):
     g = CFG["grid"]
     grid = st["grids"].setdefault(symbol, {"anchor": None, "taken": {}})
@@ -513,9 +535,15 @@ def manage_grid(engine, st, symbol, price):
         changed = True
     if grid.get("rebuild_pending"):
         return changed
+    if not grid_entry_allowed(st, symbol, bool(active)):
+        return changed
     anchor = grid["anchor"]
     n_grid = sum(1 for p in st["positions"] if p["tag"] == "grid")
     notional = CFG["order_margin_usdt"] * CFG["leverage"]
+    # TP/SL moi lot tu config runtime (dashboard). tp_pct = 0 -> TP = 1 step
+    # (hanh vi cu). SL tren san truoc day hard-code 3%.
+    tp_pct = float(g.get("tp_pct") or 0) or step
+    sl_pct = float(g.get("sl_pct") or 0.03)
     entries = 0
     max_entries = int(g.get("max_entries_per_cycle", 1))
     for k in range(1, g["levels_each_side"] + 1):
@@ -527,7 +555,7 @@ def manage_grid(engine, st, symbol, price):
         if price <= anchor * (1 - k * step) and bk not in grid["taken"]:
             pos, _ = engine.open(symbol, "long", notional,
                                  anchor * (1 - k * step),
-                                 0.03, step, "grid", level=bk)
+                                 sl_pct, tp_pct, "grid", level=bk)
             if pos:
                 grid["taken"][bk] = pos["id"]
                 n_grid += 1
@@ -540,7 +568,7 @@ def manage_grid(engine, st, symbol, price):
         if price >= anchor * (1 + k * step) and sk not in grid["taken"]:
             pos, _ = engine.open(symbol, "short", notional,
                                  anchor * (1 + k * step),
-                                 0.03, step, "grid", level=sk)
+                                 sl_pct, tp_pct, "grid", level=sk)
             if pos:
                 grid["taken"][sk] = pos["id"]
                 n_grid += 1
@@ -620,6 +648,19 @@ def main():
     except binance_safety.BinanceSafetyStop as e:
         log("START BLOCKED by Binance safety circuit: %s" % e)
         return
+
+    global RUNTIME, SCANNER
+    try:
+        RUNTIME = runtime_config.RuntimeConfig(CFG, log=log)
+        RUNTIME.start()
+    except Exception:
+        # Khong de loi config DB chan bot: chay theo config.json.
+        log("RUNTIME CONFIG START ERROR (dung config.json):\n"
+            + traceback.format_exc())
+    SCANNER = range_scanner.ScannerRunner(
+        CFG, binance_client.get_klines, log=log,
+        db=RUNTIME.db if RUNTIME else None, path=SCANNER_P,
+        fatal=(binance_safety.BinanceSafetyStop,))
 
     st = load_state()
     include_position_symbols(st)
@@ -701,11 +742,17 @@ def main():
             if now - last_cfg_reload > 60:
                 try:
                     new = json.load(open(os.path.join(BASE, "config.json")))
-                    CFG.clear()
-                    CFG.update(new)
+                    if RUNTIME is not None:
+                        # giu override tu DB (dashboard) khi file doi
+                        RUNTIME.reload_file(new)
+                    else:
+                        CFG.clear()
+                        CFG.update(new)
                 except Exception as e:
                     log(f"cfg reload failed: {e}")
                 last_cfg_reload = now
+            if RUNTIME is not None:
+                RUNTIME.poll()           # version moi tu dashboard (~10s)
             if ws.healthy():
                 prices = ws.snapshot()
                 marks = ws.mark_snapshot()
@@ -911,6 +958,14 @@ def main():
                         raise
                     except Exception as e:
                         log(f"candle refresh {symbol} failed: {e}")
+                # Scanner di ngang: chay o moi mode (ke ca data_only).
+                if SCANNER is not None:
+                    try:
+                        SCANNER.tick(SYMBOLS, candles)
+                    except binance_safety.BinanceSafetyStop:
+                        raise
+                    except Exception:
+                        log("SCANNER loi:\n" + traceback.format_exc())
                 if not st["halted"]:
                     for symbol in SYMBOLS:
                         px = prices.get(symbol)

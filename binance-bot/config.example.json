@@ -11,6 +11,7 @@
  "_comment_misc": "fee_rate = phi taker Binance USDT-M (0.05%). disabled_symbols: {\"BTCUSDT\": <unix_ts>} de tam nghi 1 coin.",
  "_comment_order": "Live dung clientOrderId + ORDER_TRADE_UPDATE; recvWindow nho, khong blind retry order timeout.",
  "_comment_protection": "exchange_protection chi bat sau khi testnet kiem tra algo order Hedge Mode; MARK_PRICE, khong reduceOnly.",
+ "_comment_runtime": "Tham so chien luoc/rui ro (lot, leverage, grid, risk, scanner) luu o DB (bang bot_config_versions), sua tren dashboard tab Cau hinh, bot ap dung trong ~10s khong restart. Gia tri trong file nay chi dung de seed lan dau / khi DB loi (cache runtime_config.cache.json).",
  "mode": "dry_run",
  "use_testnet": false,
  "exchange_protection": false,
@@ -65,17 +66,37 @@
   "levels_each_side": 5,
   "max_entries_per_cycle": 1,
   "max_positions": 7,
+  "max_symbols": 0,
   "order_notional": 1000.0,
   "range_steps": 6,
+  "sl_pct": 0.03,
   "step_max": 0.008,
   "step_min": 0.004,
   "step_mult": 0.8,
-  "step_pct": 0.005
+  "step_pct": 0.005,
+  "tp_pct": 0.01
  },
  "risk": {
   "daily_max_loss_pct": 0.1,
   "grid_basket_max_loss_pct": 0.02,
-  "grid_total_max_loss_pct": 0.10,
+  "grid_total_max_loss_pct": 0.1,
   "max_notional_mult": 10.0
+ },
+ "scanner": {
+  "enabled": true,
+  "mode": "observe",
+  "top_k": 5,
+  "rescan_minutes": 15,
+  "adx_1h_max": 20.0,
+  "adx_15m_max": 22.0,
+  "bbw_min_pct": 0.025,
+  "bbw_max_pct": 0.1,
+  "bbw_pctile_max": 80.0,
+  "range_hours": 48,
+  "range_min_pct": 0.025,
+  "range_max_pct": 0.12,
+  "min_mid_crosses": 4,
+  "chop_min": 45.0,
+  "er_max": 0.35
  }
 }

@@ -166,7 +166,9 @@ class BinanceEngine:
         self._price_ticks = {}
         self._markets = None
         self._symbol_map = {}  # raw Binance symbol -> CCXT unified symbol
-        self._lev_done = set()
+        # symbol -> leverage da dat tren san. Doi leverage tren dashboard ->
+        # gia tri khac -> dat lai o lenh mo ke tiep cua symbol do.
+        self._lev_done = {}
         self._dry_n = 0
         # Failure state is keyed by symbol/order action.  A transient API or
         # validation error must not be retried by the 0.5s market loop.
@@ -1097,11 +1099,11 @@ class BinanceEngine:
             pos.pop("%s_client_algo_id" % label, None)
 
     def _set_leverage(self, symbol):
-        if symbol in self._lev_done:
+        lev = int(self.cfg["leverage"])
+        if self._lev_done.get(symbol) == lev:
             return
         if self.dry_run:
-            self.log("DRY_RUN set-leverage %s lev=%s cross" %
-                     (symbol, self.cfg["leverage"]))
+            self.log("DRY_RUN set-leverage %s lev=%s cross" % (symbol, lev))
         else:
             ccxt_symbol = self._ccxt_symbol(symbol)
             if not ccxt_symbol:
@@ -1123,10 +1125,10 @@ class BinanceEngine:
             self._private_call(
                 "private:trade",
                 self.ex.set_leverage,
-                self.cfg["leverage"],
+                lev,
                 ccxt_symbol,
             )
-        self._lev_done.add(symbol)
+        self._lev_done[symbol] = lev
 
     def get_positions(self):
         """Vi the dang mo tren san (read-only)."""

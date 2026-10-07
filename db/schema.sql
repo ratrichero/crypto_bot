@@ -82,3 +82,48 @@ ALTER TABLE binance_trades ADD COLUMN IF NOT EXISTS estimated BOOLEAN;
 ALTER TABLE binance_trades ADD COLUMN IF NOT EXISTS exit_source TEXT;
 CREATE INDEX IF NOT EXISTS idx_binance_trades_closed ON binance_trades (closed_at);
 CREATE INDEX IF NOT EXISTS idx_binance_trades_tag    ON binance_trades (tag);
+
+-- ==== Config runtime bot + tai khoan dashboard + scanner (G1/G2) ====
+-- Dong bo voi db/bot_config.py:DDL (test_bot_config kiem tra).
+CREATE TABLE IF NOT EXISTS bot_config_versions (
+    version     BIGSERIAL PRIMARY KEY,
+    bot         TEXT NOT NULL,
+    config      JSONB NOT NULL,
+    author      TEXT NOT NULL,
+    note        TEXT,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS bot_config_versions_bot_idx
+    ON bot_config_versions (bot, version DESC);
+CREATE TABLE IF NOT EXISTS bot_config_applied (
+    bot         TEXT PRIMARY KEY,
+    version     BIGINT,
+    status      TEXT NOT NULL,
+    error       TEXT,
+    applied_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS dashboard_users (
+    id              BIGSERIAL PRIMARY KEY,
+    username        TEXT NOT NULL UNIQUE,
+    password_hash   TEXT NOT NULL,
+    role            TEXT NOT NULL DEFAULT 'viewer'
+                    CHECK (role IN ('admin', 'viewer')),
+    is_active       BOOLEAN NOT NULL DEFAULT true,
+    failed_attempts INTEGER NOT NULL DEFAULT 0,
+    locked_until    TIMESTAMPTZ,
+    created_by      TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_login_at   TIMESTAMPTZ
+);
+CREATE TABLE IF NOT EXISTS scanner_snapshots (
+    id          BIGSERIAL PRIMARY KEY,
+    bot         TEXT NOT NULL,
+    symbol      TEXT NOT NULL,
+    ts          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    passed      BOOLEAN NOT NULL,
+    score       DOUBLE PRECISION,
+    metrics     JSONB,
+    reasons     JSONB
+);
+CREATE INDEX IF NOT EXISTS scanner_snapshots_sym_idx
+    ON scanner_snapshots (bot, symbol, ts DESC);
