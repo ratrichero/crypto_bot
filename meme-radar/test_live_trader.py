@@ -947,6 +947,78 @@ def test_pick_dexscreener_price():
         [{"baseToken": {"address": "X"}, "priceUsd": "1"}], "MINT") is None)
 
 
+
+# ---- lenh mua cham khong chan exit ----
+
+class SlowBuySwapper:
+    def __init__(self, clock, events, buy_seconds=60):
+        self.clock = clock
+        self.events = events
+        self.buy_seconds = buy_seconds
+
+    def execute_buy(self, mint, size_usd, symbol="?"):
+        self.events.append(("buy", mint))
+        self.clock[0] += self.buy_seconds
+        return {"tokens_base": 10_000_000, "decimals": 6, "cost_usd": size_usd,
+                "entry_usd": 0.001, "tx": None, "dry": True}
+
+    def execute_sell(self, mint, frac, symbol="?"):
+        self.events.append(("sell", mint))
+        return {"sold_base": 0, "proceeds_usd": 0.0, "tx": None,
+                "dry": True, "simulated": True}
+
+
+def test_slow_buy_does_not_block_exits():
+    print("== mua cham 60s: SL vi the khac chay xen giua 2 lenh mua ==")
+    with isolated() as tmpd:
+        tr, jup = _dry_trader(tmpd, {"MINT": 0.7, "A": 0.001, "B": 0.001})
+        tr.cfg["price_poll_seconds"] = 20
+        clock, events = [0.0], []
+        tr._clock = lambda: clock[0]
+        tr.swapper = SlowBuySwapper(clock, events)
+        pos = mkpos(entry=1.0, opened_at=900)
+        pos["price_poll_at"] = 995       # vua poll -> chua den han o dau vong
+        tr.positions = [pos]
+        with open(lt.SIG_P, "a") as f:
+            f.write(json.dumps(_sig("tid_a", "A", ts=1000)) + "\n")
+            f.write(json.dumps(_sig("tid_b", "B", ts=1000)) + "\n")
+        tr.run_once(now=1000)
+        check("thu tu: buy A -> sell MINT (SL) -> buy B",
+              events == [("buy", "A"), ("sell", "MINT"), ("buy", "B")], str(events))
+
+
+def test_exits_before_buys():
+    print("== run_once: exit chay truoc mua moi ==")
+    with isolated() as tmpd:
+        tr, jup = _dry_trader(tmpd, {"MINT": 0.7, "A": 0.001})
+        clock, events = [0.0], []
+        tr._clock = lambda: clock[0]
+        tr.swapper = SlowBuySwapper(clock, events, buy_seconds=0)
+        pos = mkpos(entry=1.0, opened_at=900)
+        pos["price_poll_at"] = 0
+        tr.positions = [pos]
+        with open(lt.SIG_P, "a") as f:
+            f.write(json.dumps(_sig("tid_a", "A", ts=1000)) + "\n")
+        tr.run_once(now=1000)
+        check("sell truoc buy", events == [("sell", "MINT"), ("buy", "A")], str(events))
+
+
+
+def test_age_uses_real_time_after_slow_buy():
+    print("== signal thu 2 tinh tuoi theo thoi gian thuc sau lenh mua cham ==")
+    with isolated() as tmpd:
+        tr, jup = _dry_trader(tmpd, {"A": 0.001, "B": 0.001})
+        clock, events = [0.0], []
+        tr._clock = lambda: clock[0]
+        tr.swapper = SlowBuySwapper(clock, events, buy_seconds=90)
+        with open(lt.SIG_P, "a") as f:
+            f.write(json.dumps(_sig("tid_a", "A", ts=1000)) + "\n")
+            f.write(json.dumps(_sig("tid_b", "B", ts=1000)) + "\n")
+        tr.run_once(now=1060)   # A 60s -> mua (90s); B luc do 150s -> bo
+        check("chi mua A", events == [("buy", "A")], str(events))
+        check("B skipped", "tid_b" in tr.state["processed"])
+
+
 if __name__ == "__main__":
     test_exit_tp_ladder()
     test_exit_sl()
@@ -986,5 +1058,8 @@ if __name__ == "__main__":
     test_empty_wallet_no_fake_loss()
     test_reconcile_gone_writes_trade()
     test_pick_dexscreener_price()
+    test_slow_buy_does_not_block_exits()
+    test_exits_before_buys()
+    test_age_uses_real_time_after_slow_buy()
     print(f"\n{PASS} pass, {FAIL} fail")
     sys.exit(1 if FAIL else 0)

@@ -934,6 +934,7 @@ class LiveTrader:
         self.onchain_tokens = set()
         self.unmanaged_tokens = set()
         self._last_reconcile = 0
+        self._clock = time.monotonic  # injectable cho test
         self._init_source_offsets(not bool(st))
         self._price_last = {}
         self._log_source_health()
@@ -1352,21 +1353,25 @@ class LiveTrader:
         return True
 
     def ingest_signals(self, now):
+        """Mo vi the tu signal. Moi lenh mua co the block toi ~100s (confirm
+        + verify) -> sau moi lan thu, chay lai exit cho cac vi the khac (gate
+        price_poll_seconds tranh poll thua) de SL/trailing khong bi tre."""
         sigs, _ = self._tail_source("signals")
         opened = 0
-        # Retry previously failed signals first
-        for s in self._retry_failed_signals(now):
+        t0 = self._clock()
+        queue = [(s, "ERROR retry signal") for s in self._retry_failed_signals(now)]
+        queue += [(s, "ERROR mo vi the") for s in sigs]
+        for s, err in queue:
+            # thoi diem thuc (tuoi signal/opened_at dung ca khi lenh truoc block)
+            cur = now + max(0.0, self._clock() - t0)
             try:
-                if self._attempt_signal(s, now):
+                if self._attempt_signal(s, cur):
                     opened += 1
             except Exception:
-                log("ERROR retry signal:\n" + traceback.format_exc())
-        for s in sigs:
-            try:
-                if self._attempt_signal(s, now):
-                    opened += 1
-            except Exception:
-                log("ERROR mo vi the:\n" + traceback.format_exc())
+                log(err + ":\n" + traceback.format_exc())
+            elapsed = self._clock() - t0
+            if elapsed >= 1.0 and self.positions:
+                self.manage_positions(now + elapsed)
         return opened
 
     def _open_from_signal(self, s, now):
@@ -1692,6 +1697,13 @@ class LiveTrader:
             self.reconcile_onchain(now)
         except Exception:
             log("ERROR reconcile:\n" + traceback.format_exc())
+        # sell_cluster (smart exit) va exit ladder chay TRUOC mua moi (lenh
+        # mua co the block lau) va chay CA KHI PAUSE
+        try:
+            self.ingest_alerts()
+        except Exception:
+            log("ERROR ingest alerts:\n" + traceback.format_exc())
+        self.manage_positions(now)
         try:
             if paused:
                 # PAUSE: KHONG mo lenh moi. Van tieu thu signal (danh dau
@@ -1701,12 +1713,6 @@ class LiveTrader:
                 self.ingest_signals(now)
         except Exception:
             log("ERROR ingest signals:\n" + traceback.format_exc())
-        # sell_cluster (smart exit) va exit ladder chay CA KHI PAUSE
-        try:
-            self.ingest_alerts()
-        except Exception:
-            log("ERROR ingest alerts:\n" + traceback.format_exc())
-        self.manage_positions(now)
         self.save()
         return "paused" if paused else "ok"
 
