@@ -700,8 +700,11 @@ Chi tiết xem [`deploy/README.md`](../deploy/README.md).
   trước mốc vẫn được đánh dấu cần restart ở các lần `git up` sau, kể cả khi lần trước
   restart bị bỏ qua.
 - `git up --force`: làm lại pip/migrate/build và restart mọi app đang chạy. Dòng cuối tóm tắt `code / thu-vien / migrate / build / restart`.
-- `git up --branch X`: đổi nhánh deploy và ghi nhớ `DEPLOY_BRANCH` vào
-  `deploy.local.env`. Chỉ đổi sang nhánh đã có `deploy/` (`main` hiện chưa có).
+- `git up --branch X`: checkout sang nhánh X rồi deploy. Từ đó `git up` theo nhánh
+  đang checkout, không ghi file nào. Chỉ đổi sang nhánh đã có `deploy/` (`main`
+  hiện chưa có).
+- Bỏ `deploy/deploy.local.env` và `DEPLOY_BRANCH`. Cấu hình duy nhất là
+  `deploy/deploy.env` (commit trong repo). File cũ còn trên VPS bị bỏ qua, xoá được.
 - **Bỏ mọi câu hỏi y/N** (deploy, đổi nhánh, setup): mặc định là đồng ý. Khoá
   `confirm` trong `apps.json` đổi tên thành `live` (chỉ dùng để gắn nhãn). `--yes`
   còn được chấp nhận nhưng không có tác dụng.

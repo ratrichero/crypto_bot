@@ -39,7 +39,7 @@ fi
 
 cd "$cwd" || { echo "run-app: khong vao duoc $cwd" >&2; exit 78; }
 if [ ! -x "$py" ]; then
-    echo "run-app: khong thay python $py (dat PYTHON trong deploy.local.env)" >&2
+    echo "run-app: khong thay python $py (sua PYTHON trong deploy/deploy.env)" >&2
     exit 78
 fi
 export PYTHONUNBUFFERED=1

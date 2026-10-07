@@ -1,4 +1,4 @@
-// pm2 ecosystem - sinh tu deploy/apps.json + deploy/deploy.env (+ deploy.local.env).
+// pm2 ecosystem - sinh tu deploy/apps.json + deploy/deploy.env.
 // Dung qua deploy.py (git up / git up setup); chay tay:
 //   pm2 start deploy/ecosystem.config.js --only muse-dashboard
 'use strict';
@@ -26,9 +26,7 @@ function parseEnvFile(file) {
   return out;
 }
 
-const cfg = Object.assign({},
-  parseEnvFile(path.join(DEPLOY, 'deploy.env')),
-  parseEnvFile(path.join(DEPLOY, 'deploy.local.env')));
+const cfg = parseEnvFile(path.join(DEPLOY, 'deploy.env'));
 const spec = JSON.parse(fs.readFileSync(path.join(DEPLOY, 'apps.json'), 'utf8')).apps;
 
 const appKey = (name) => name.toUpperCase().replace(/[^A-Z0-9]/g, '_');

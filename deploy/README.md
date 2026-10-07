@@ -22,7 +22,7 @@ Tuỳ chọn khác: `--only muse-dashboard,muse-radar`, `--no-restart`,
 
 | Bước | Kiểm tra | Bỏ qua khi |
 |---|---|---|
-| 1. Kéo code | `git fetch` rồi chỉ **fast-forward** nhánh đang checkout (`DEPLOY_BRANCH`) | không có commit mới |
+| 1. Kéo code | `git fetch` rồi chỉ **fast-forward** nhánh đang checkout | không có commit mới |
 | 2. Thư viện | băm file requirements của từng python/venv, so với lần cài trước; `pip install -r` rồi so `pip freeze` trước/sau | requirements không đổi |
 | 3. Migrate DB | `db/schema.sql` (idempotent) đổi, hoặc DB đổi → chạy trong **1 transaction** (lock_timeout 15s, statement_timeout 300s) | file và DB không đổi |
 | 4. Build web | thư mục có `package.json` đổi → `npm ci` + `npm run build` | không có (dashboard Streamlit chạy thẳng `app.py`) |
@@ -57,7 +57,7 @@ có chứa URL thì URL được thay bằng `***`.
 
 - Lỗi → rollback toàn bộ, **không restart app nào** (code mới có thể cần bảng
   mới), mã thoát 1. Sửa SQL rồi chạy lại `git up`; migrate chạy lại vì dấu chưa ghi.
-- Không dùng DB: đặt `MIGRATE_SQL=` (rỗng) trong `deploy.local.env`.
+- Không dùng DB: đặt `MIGRATE_SQL=` (rỗng) trong `deploy/deploy.env`.
 - Thêm bảng mới: viết vào `db/schema.sql` theo kiểu idempotent (`CREATE TABLE IF
   NOT EXISTS`, `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`).
 
@@ -75,12 +75,10 @@ git up --branch main --dry-run  # chỉ xem chênh bao nhiêu commit
   với remote (diverged) thì dừng. Commit chưa push của nhánh cũ vẫn nằm trên nhánh cũ.
 - Cho xem `A (sha) -> B (sha): +N commit chỉ có ở nhánh mới, -M commit chỉ có ở
   nhánh cũ`. -M > 0 nghĩa là code sẽ **mất** các commit đó (có thể là lùi bản).
-- Sau khi đổi, ghi `DEPLOY_BRANCH=X` vào `deploy/deploy.local.env` (giữ các dòng
-  khác). Các lần `git up` sau tự theo X, rồi chạy bình thường: cài thư viện,
-  migrate, chỉ restart app có file khác nhau giữa hai nhánh. Script deploy khác
-  nhau thì tự chạy lại bằng bản của nhánh mới.
-- Đang đứng sai nhánh so với `DEPLOY_BRANCH` (do checkout tay) → `git up` dừng và
-  gợi ý `git up --branch <nhánh>`.
+- Sau khi checkout, chạy bình thường: cài thư viện, migrate, chỉ restart app có
+  file khác nhau giữa hai nhánh. Script deploy khác nhau thì tự chạy lại bằng bản
+  của nhánh mới. Không ghi file cấu hình nào: `git up` luôn deploy **nhánh đang
+  checkout**, nên các lần sau tự theo X.
 - Lần đầu: VPS đang chạy `deploy.py` cũ chưa có `--branch` → chạy `git up` một lần
   để lấy bản mới.
 
@@ -129,11 +127,11 @@ và health check).
 
 ## Cấu hình
 
-`deploy/deploy.env` chứa giá trị mặc định và được commit. Trên VPS, ghi đè bằng
-`deploy/deploy.local.env` (không commit), cùng cú pháp:
+Chỉ có **một** file cấu hình là `deploy/deploy.env`, được commit trong repo.
+Muốn đổi thì sửa file này rồi push. Không còn `deploy.local.env`: nếu VPS còn
+file đó thì `git up` bỏ qua và in nhắc xoá. Các giá trị chính:
 
 ```bash
-DEPLOY_BRANCH=arena/1b7a22f9-crypto-bot
 PYTHON=.venv/bin/python                  # riêng 1 app: PYTHON_MUSE_BINANCE=...
 ENV_FILE=.env                            # riêng 1 app: ENV_FILE_MUSE_LIVE_TRADER=meme-radar/.env
 DASHBOARD_PORT=8501
@@ -155,7 +153,7 @@ python3 deploy/deploy.py doctor
 
 Đọc kết quả `doctor`:
 - **ExecStart** của từng unit: python, tham số và port dashboard phải khớp với
-  cấu hình. Nếu khác, ghi vào `deploy.local.env`.
+  cấu hình trong `deploy/deploy.env`. Nếu khác, sửa `deploy.env` trong repo rồi push.
 - **Env (tên)**: các biến unit systemd đang cấp. Biến nào chưa có trong
   `ENV_FILE` thì `doctor`/`setup` báo `XX` và **không chuyển** app đó. Thêm biến
   vào `.env` (chmod 600) trước khi chuyển.

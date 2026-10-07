@@ -9,7 +9,7 @@ Lenh:
   setup              cai alias git up, pm2-logrotate, chuyen app tu systemd
                      sang pm2, pm2 save + pm2 startup
 
-Tuy chon: --branch X (doi nhanh deploy, ghi nho), --dry-run, --only a,b,
+Tuy chon: --branch X (checkout nhanh X roi deploy), --dry-run, --only a,b,
           --no-restart, --restart (ep restart app chon), --force-deps,
           --force (lam lai moi buoc + restart moi app)
 
@@ -136,35 +136,16 @@ def parse_env_file(path):
     return out
 
 
-def local_env_path():
-    return os.path.join(ROOT, "deploy", "deploy.local.env")
-
-
 def load_config():
-    cfg = parse_env_file(os.path.join(ROOT, "deploy", "deploy.env"))
-    cfg.update(parse_env_file(local_env_path()))
-    return cfg
+    """Cau hinh duy nhat: deploy/deploy.env (commit trong repo)."""
+    return parse_env_file(os.path.join(ROOT, "deploy", "deploy.env"))
 
 
-def persist_local(key, value):
-    """Ghi/sua KEY=value trong deploy.local.env, giu nguyen cac dong khac."""
-    path = local_env_path()
-    try:
-        with open(path) as f:
-            lines = f.read().splitlines()
-    except (IOError, OSError):
-        lines = ["# Cau hinh rieng VPS (khong commit) - xem deploy/deploy.env"]
-    pat = re.compile(r"^\s*(export\s+)?%s\s*=" % re.escape(key))
-    done = False
-    for i, line in enumerate(lines):
-        if pat.match(line):
-            lines[i] = "%s=%s" % (key, value)
-            done = True
-    if not done:
-        lines.append("%s=%s" % (key, value))
-    with open(path + ".tmp", "w") as f:
-        f.write("\n".join(lines) + "\n")
-    os.replace(path + ".tmp", path)
+def warn_obsolete_files():
+    old = os.path.join(ROOT, "deploy", "deploy.local.env")
+    if os.path.exists(old):
+        warn("deploy/deploy.local.env khong con duoc dung (bi bo qua) - xoa "
+             "duoc: rm deploy/deploy.local.env")
 
 
 def app_key(name):
@@ -497,13 +478,6 @@ def check_branch(cfg):
     branch = git("symbolic-ref", "--short", "-q", "HEAD", check=False)
     if not branch:
         raise DeployError("HEAD dang detached - checkout nhanh deploy truoc")
-    want = cfg.get("DEPLOY_BRANCH") or branch
-    if want != branch:
-        raise DeployError(
-            "dang o nhanh '%s' nhung DEPLOY_BRANCH='%s' (deploy.local.env).\n"
-            "  Deploy nhanh cau hinh:      git up --branch %s\n"
-            "  Hoac giu nhanh hien tai:    git up --branch %s"
-            % (branch, want, want, branch))
     return branch
 
 
@@ -517,7 +491,8 @@ def ensure_clean():
 
 def step_switch_branch(cfg, target, dry_run):
     """git up --branch X: chuyen sang nhanh X cua remote (chi checkout +
-    fast-forward), ghi DEPLOY_BRANCH. -> (old_head, new_head, switched)."""
+    fast-forward). Cac lan git up sau theo nhanh dang checkout nen khong can
+    ghi nho o dau ca. -> (old_head, new_head, switched)."""
     remote = cfg.get("DEPLOY_REMOTE") or "origin"
     current = git("symbolic-ref", "--short", "-q", "HEAD", check=False)
     step("Chon nhanh deploy: %s/%s" % (remote, target))
@@ -581,11 +556,6 @@ def step_switch_branch(cfg, target, dry_run):
         return old, tip, False
     if git("rev-parse", "HEAD") != tip:
         git("merge", "--ff-only", "--quiet", tip)
-    if cfg.get("DEPLOY_BRANCH") != target:
-        persist_local("DEPLOY_BRANCH", target)
-        cfg["DEPLOY_BRANCH"] = target
-        ok("da ghi DEPLOY_BRANCH=%s vao deploy/deploy.local.env (lan git up "
-           "sau tu theo nhanh nay)" % target)
     new = git("rev-parse", "HEAD")
     if new != old:
         ok("HEAD %s -> %s (%s)" % (short(old), short(new), target))
@@ -638,8 +608,8 @@ def step_deps(cfg, apps, dry_run, force):
                        if os.path.exists(abspath(r))})
         names = ", ".join(a["name"] for a in group)
         if not os.path.exists(py):
-            bad("khong thay python %s (%s) - dat PYTHON trong "
-                "deploy/deploy.local.env" % (py, names))
+            bad("khong thay python %s (%s) - sua PYTHON trong "
+                "deploy/deploy.env" % (py, names))
             continue
         h = hashlib.sha256(py.encode())
         for r in reqs:
@@ -724,7 +694,7 @@ def step_migrate(cfg, dry_run, force=False):
         if not url:
             raise DeployError(
                 "%s doi nhung khong co %s (moi truong hoac %s) -> khong "
-                "migrate duoc. Dat MIGRATE_SQL= trong deploy.local.env neu "
+                "migrate duoc. Dat MIGRATE_SQL= trong deploy/deploy.env neu "
                 "khong dung DB" % (rel, var, env_file or "ENV_FILE"))
         if dry_run:
             info("  %s can ap dung vao DB (--dry-run: bo qua)" % rel)
@@ -1065,12 +1035,8 @@ def cmd_status(args, cfg):
     apps = load_apps(cfg, only)
     head = git("rev-parse", "HEAD")
     branch = git("symbolic-ref", "--short", "-q", "HEAD", check=False)
-    step("Repo: nhanh %s, HEAD %s, DEPLOY_BRANCH=%s" % (
-        branch or "(detached)", short(head),
-        cfg.get("DEPLOY_BRANCH") or "(nhanh hien tai)"))
-    if cfg.get("DEPLOY_BRANCH") and branch != cfg.get("DEPLOY_BRANCH"):
-        warn("dang o nhanh khac DEPLOY_BRANCH -> git up se dung; dung "
-             "git up --branch <nhanh>")
+    step("Repo: nhanh %s (git up deploy nhanh nay), HEAD %s" % (
+        branch or "(detached)", short(head)))
     procs = pm2_list(cfg)
     plan = plan_restarts(cfg, apps, head)
     step("App")
@@ -1236,9 +1202,9 @@ def cmd_doctor(args, cfg):
     apps = load_apps(cfg, only)
     step("Moi truong")
     info("  repo     %s" % ROOT)
-    info("  nhanh    %s (DEPLOY_BRANCH=%s)" % (
-        git("symbolic-ref", "--short", "-q", "HEAD", check=False),
-        cfg.get("DEPLOY_BRANCH") or "nhanh hien tai"))
+    info("  nhanh    %s (git up deploy nhanh dang checkout)" % (
+        git("symbolic-ref", "--short", "-q", "HEAD", check=False)
+        or "(detached)"))
     alias = git("config", "--get", "alias.up", check=False)
     (ok if "deploy.py" in alias else warn)("alias git up: %s" % (
         alias or "chua cai (git up setup)"))
@@ -1407,7 +1373,7 @@ def main(argv=None):
                     help="chi xem se lam gi (fetch nhung khong pull/cai/restart)")
     ap.add_argument("-b", "--branch",
                     help="deploy nhanh nay cua remote (checkout + fast-forward), "
-                         "ghi nho vao DEPLOY_BRANCH cho lan sau")
+                         "lan sau git up tu theo nhanh dang checkout")
     ap.add_argument("--only", help="chi xu ly cac app nay (phay ngan cach)")
     ap.add_argument("--no-restart", action="store_true",
                     help="pull + cai thu vien, khong restart")
@@ -1425,6 +1391,7 @@ def main(argv=None):
     if args.branch and args.command != "deploy":
         ap.error("--branch chi dung voi deploy (git up --branch X)")
     cfg = load_config()
+    warn_obsolete_files()
     try:
         return {"deploy": cmd_deploy, "status": cmd_status,
                 "doctor": cmd_doctor, "setup": cmd_setup}[args.command](

@@ -133,10 +133,12 @@ def test_ecosystem():
         os.makedirs(dep)
         for f in ("ecosystem.config.js", "apps.json", "deploy.env"):
             shutil.copy(os.path.join(HERE, f), dep)
-        with open(os.path.join(dep, "deploy.local.env"), "w") as f:
-            f.write("APPS=muse-dashboard muse-binance\nDASHBOARD_PORT=9999\n"
+        with open(os.path.join(dep, "deploy.env"), "a") as f:
+            f.write("\nAPPS=muse-dashboard muse-binance\nDASHBOARD_PORT=9999\n"
                     "PYTHON_MUSE_BINANCE=/opt/py/bin/python\n"
                     "ENV_FILE_MUSE_DASHBOARD=\nDASHBOARD_ARGS=--a 1 \"--b x\"\n")
+        with open(os.path.join(dep, "deploy.local.env"), "w") as f:
+            f.write("APPS=muse-radar\nDASHBOARD_PORT=1111\n")  # bi bo qua
         out = subprocess.run(
             ["node", "-e", "process.stdout.write(JSON.stringify("
              "require(process.argv[1]).apps))",
@@ -812,11 +814,17 @@ def test_switch_branch():
         sh(["git", "clone", "-q", "-b", "main", remote, vps], tmp)
         sh(["git", "config", "user.email", "t@t"], vps)
         sh(["git", "config", "user.name", "t"], vps)
-        write(vps, "deploy/deploy.local.env", "# rieng VPS\nAPPS=x y\n")
+        # file cu Muse tao tren VPS: phai bi bo qua hoan toan
+        bad_local = "DEPLOY_BRANCH=sai-nhanh\nPYTHON=/khong/co\n"
+        write(vps, "deploy/deploy.local.env", bad_local)
+        local_path = os.path.join(vps, "deploy", "deploy.local.env")
         m1 = sh(["git", "rev-parse", "HEAD"], vps)
         cur = lambda: sh(["git", "symbolic-ref", "--short", "HEAD"], vps)
         with use_root(vps):
             cfg = d.load_config()
+            check("deploy.local.env bi bo qua (khong doc PYTHON/DEPLOY_BRANCH)",
+                  "PYTHON" not in cfg and "DEPLOY_BRANCH" not in cfg
+                  and d.check_branch(cfg) == "main", cfg)
             try:
                 d.step_switch_branch(cfg, "khong-co", False)
                 check("nhanh khong ton tai -> loi", False)
@@ -835,8 +843,7 @@ def test_switch_branch():
                 check("ten nhanh dang tuy chon -> tu choi", True)
             old, new, sw = d.step_switch_branch(cfg, "feature", True)
             check("--dry-run: bao commit moi, khong doi nhanh",
-                  new == f1 and not sw and cur() == "main"
-                  and "DEPLOY_BRANCH" not in open(d.local_env_path()).read())
+                  new == f1 and not sw and cur() == "main")
             write(vps, "app.txt", "sua tay\n")
             try:
                 d.step_switch_branch(cfg, "feature", False)
@@ -846,14 +853,12 @@ def test_switch_branch():
             sh(["git", "checkout", "-q", "app.txt"], vps)
 
             old, new, sw = d.step_switch_branch(cfg, "feature", False)
-            text = open(d.local_env_path()).read()
             check("doi sang feature: checkout tracking + HEAD moi",
                   sw and old == m1 and new == f1 and cur() == "feature")
-            check("ghi nho DEPLOY_BRANCH, giu dong cu",
-                  "DEPLOY_BRANCH=feature" in text and "APPS=x y" in text
-                  and "# rieng VPS" in text, text)
+            check("khong ghi file cau hinh nao (deploy.local.env giu nguyen)",
+                  open(local_path).read() == bad_local)
             cfg = d.load_config()
-            check("lan sau check_branch theo nhanh moi",
+            check("lan sau git up theo nhanh dang checkout",
                   d.check_branch(cfg) == "feature")
 
             sh(["git", "checkout", "-q", "main"], dev)
@@ -863,19 +868,7 @@ def test_switch_branch():
             old, new, sw = d.step_switch_branch(cfg, "main", False)
             check("quay ve main (nhanh local cu) -> fast-forward toi c2",
                   sw and new == m2 and cur() == "main"
-                  and d.load_config()["DEPLOY_BRANCH"] == "main")
-            text = open(d.local_env_path()).read()
-            check("DEPLOY_BRANCH khong bi lap dong",
-                  text.count("DEPLOY_BRANCH=") == 1, text)
-
-            sh(["git", "checkout", "-q", "feature"], vps)
-            try:
-                d.check_branch(d.load_config())
-                check("lech DEPLOY_BRANCH -> loi goi y --branch", False)
-            except d.DeployError as e:
-                check("lech DEPLOY_BRANCH -> loi goi y --branch",
-                      "git up --branch main" in str(e)
-                      and "git up --branch feature" in str(e))
+                  and d.check_branch(d.load_config()) == "main")
     finally:
         shutil.rmtree(tmp)
 
