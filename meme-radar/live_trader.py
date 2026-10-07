@@ -1130,6 +1130,14 @@ class LiveTrader:
         if not isinstance(s.get("token"), str) or not s.get("token"):
             self._mark_processed(tid, "skipped_invalid_token")
             return False
+        # Dedup: khong mo vi the moi neu da co cung token dang mo
+        mint = s.get("token")
+        for p in self.positions:
+            if p.get("token") == mint:
+                self._mark_processed(tid, "skipped_duplicate_token")
+                log(f"signal {tid[:12]}... -> skipped_duplicate_token "
+                    f"({s.get('symbol', '?')} da co vi the mo)")
+                return False
         try:
             amount_usd = float(s.get("amount_usd") or 0)
         except (TypeError, ValueError):
