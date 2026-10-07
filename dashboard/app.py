@@ -322,7 +322,7 @@ def binance_exchange_positions():
             if not isinstance(o, dict):
                 continue
             sym = str(o.get("symbol") or "")
-            otype = str(o.get("type") or o.get("algoType") or "")
+            otype = str(o.get("orderType") or o.get("type") or o.get("algoType") or "")
             try:
                 trig = float(o.get("triggerPrice") or 0)
             except (TypeError, ValueError):
