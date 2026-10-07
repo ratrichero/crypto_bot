@@ -21,6 +21,8 @@
  "protection_sl_deadline_seconds": 120,
  "orphan_cleanup_seconds": 60,
  "startup_hold_recheck_seconds": 60,
+ "ambiguous_order_check_seconds": 30,
+ "ambiguous_order_expire_seconds": 300,
  "exchange_close_check_seconds": 10,
  "exchange_close_min_age_seconds": 60,
  "exchange_close_confirm_seconds": 10,

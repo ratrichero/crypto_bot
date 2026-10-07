@@ -128,6 +128,43 @@ Nếu sửa logic chiến thuật, sửa cả hai nơi.
     ghi nhận khi lot đã mở ≥ `exchange_close_min_age_seconds` và hai lần quét
     liên tiếp đều thấy leg về 0. Giá lấy từ fill đúng positionSide, sau lúc
     mở, đúng khối lượng; không tìm thấy thì đánh dấu `estimated`.
+  - **Đóng tay một phần leg grid:** `_detect_partial_leg_reduction` ghi
+    nhận lot bị đóng theo LIFO, chỉ khi phần giảm khớp đúng qty của các lot
+    đó và được xác nhận qua 2 lần quét. Giá lấy từ fill đóng thật, bỏ qua lệnh
+    bot đã ghi. Không khớp được thì vẫn halt mismatch như trước.
+  - **Bot tự đóng (`close()`):** đóng đúng qty của lot (lot cuối của leg quét
+    thêm bụi ≤2 step). Guard nào huỷ chắc chắn thì xoá id ngay. Nếu lệnh market
+    lỗi, lot hiện "thiếu guard" và `retry_protection` đặt lại SL/TP. Halt
+    `close action requires reconciliation` tự gỡ khi sàn khớp state và mọi lot
+    đủ guard; lệnh đóng vẫn thử lại theo cooldown.
+  - **Lệnh mở mơ hồ:** timeout không tra được `clientOrderId`, hoặc sàn đã nhận
+    lệnh nhưng không đọc được giá khớp (response/WS/`fetch_order`/userTrades
+    đều lỗi) → lưu vào `state["ambiguous_orders"]`. `resolve_ambiguous_orders`
+    tra lại mỗi `ambiguous_order_check_seconds` (30s), chạy cả khi đang hold:
+    đã khớp → nhận lot với qty/giá thật và đặt SL/TP ngay; huỷ/hết hạn không
+    khớp, hoặc không tồn tại sau `ambiguous_order_expire_seconds` (300s) → bỏ.
+    Hết danh sách thì gỡ halt `ambiguous ...` / `order fill reconciliation ...`.
+  - **Đang hold (state lệch sàn):** `protect_during_hold` vẫn đặt lại SL/TP
+    còn thiếu (lệnh chỉ đóng, luôn giảm rủi ro) nhưng không ép đóng.
+  - **Algo đặt tay:** không làm halt; bot chỉ quản lý algo có client id của bot.
+    Halt phát hiện lúc khởi động được kiểm lại mỗi
+    `startup_hold_recheck_seconds` (60s) và tự gỡ khi sàn đã khớp.
+- **Risk stop:**
+  - Daily stop (MTM) kích hoạt 1 lần/ngày (`state["daily_stop_day"]`), kể cả
+    khi bot đang halt vì lý do khác (giữ nguyên halt_reason cũ). Các vòng sau
+    thử đóng lại lot còn sót.
+  - Grid basket stop: lot không đóng được ở lần đầu (cooldown, guard đang
+    khớp) được thử lại ở các vòng sau (`grid["basket_stopping"]`) cho tới khi
+    hết lot.
+- **PnL và phí (từ commit B2):** `pnl` = PnL gộp − phí đóng thật − phí mở thật.
+  Phí lấy từ `userTrades` (`commission`) của chính order; một lệnh đóng nhiều
+  lot thì phí chia theo qty. Phí trả bằng BNB hoặc không đọc được → dùng
+  `fee_rate` ước tính và đặt `fee_estimated=true`. Record có thêm `pnl_gross`,
+  `fee_entry`, `fee_exit`, `fee_estimated`, `exit_source`
+  (`bot` | `exchange_algo` | `exchange_detect` | `exchange_detect_partial`); các cột
+  tương ứng trong `binance_trades` được thêm bằng `ALTER TABLE ... IF NOT EXISTS`
+  trong `db/schema.sql` (test: `db/test_binance_trades_pg.py`). **Record cũ**
+  (trước B2) có `pnl` chưa trừ phí mở, nên cao hơn thực tế khoảng 0.05% notional.
 - Startup luôn đối chiếu open normal orders và open Algo Orders theo các
   symbol bot quản lý; nếu protection bật còn kiểm tra
   symbol/positionSide/side/type/quantity của từng guard. Mismatch hoặc không

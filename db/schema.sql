@@ -71,7 +71,7 @@ CREATE TABLE IF NOT EXISTS binance_trades (
     fee_exit    DOUBLE PRECISION,            -- phi dong (commission userTrades)
     fee_estimated BOOLEAN,                   -- true = phi uoc tinh fee_rate
     estimated   BOOLEAN,                     -- true = gia thoat uoc tinh
-    exit_source TEXT                         -- bot | exchange_algo | exchange_detect
+    exit_source TEXT                         -- bot | exchange_algo | exchange_detect[_partial]
 );
 -- DB cu: bo sung cot (idempotent; bot/sync cung tu chay khi khoi dong)
 ALTER TABLE binance_trades ADD COLUMN IF NOT EXISTS pnl_gross DOUBLE PRECISION;
