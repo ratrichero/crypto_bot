@@ -647,7 +647,8 @@ def radar_positions_block():
 
 def radar_live_equity():
     """Tinh equity radar paper TRUC TIEP luc render (khong qua snapshot):
-    tong pnl lenh dong + realized vi the mo + unrealized theo gia Jupiter live."""
+    tong pnl lenh dong + realized vi the mo.
+    KHONG tinh unrealized theo gia live (so ao, khong phan anh thuc te paper)."""
     st_ = load_state(RADAR_STATE)
     if not st_:
         return None, "khong doc duoc radar_state"
@@ -655,33 +656,13 @@ def radar_live_equity():
     # pnl lenh dong tu DB (da sync)
     r = q("SELECT COALESCE(SUM(pnl_usd),0) AS s FROM radar_trades")
     closed = float(r[0]["s"]) if r else 0.0
-    # gia batch Jupiter
-    mints = [p.get("token") for p in pos if p.get("token")]
-    marks = {}
-    try:
-        rr = requests.get("https://lite-api.jup.ag/price/v3",
-                           params={"ids": ",".join(dict.fromkeys(mints))},
-                           timeout=10)
-        d = rr.json()
-        for m in mints:
-            px = (d.get(m) or {}).get("usdPrice")
-            if px:
-                marks[m] = float(px)
-    except Exception:
-        pass
-    real_o, unreal = 0.0, 0.0
+    real_o = 0.0
     for p in pos:
         try:
             real_o += float(p.get("realized", 0) or 0)
-            e = float(p.get("entry", 0) or 0)
-            s = float(p.get("size_usd", 0) or 0)
-            rem = float(p.get("remaining", 1) or 0)
-            mk = marks.get(p.get("token", ""))
-            if e > 0 and s > 0 and rem > 0 and mk:
-                unreal += (mk - e) / e * s * rem
         except Exception:
             pass
-    return closed + real_o + unreal, f"{len(pos)} vi the mo"
+    return closed + real_o, f"{len(pos)} vi the mo (chi P&L thuc)"
 
 
 @frag15
@@ -717,7 +698,7 @@ def radar_equity_realtime():
             st.plotly_chart(fig, width="stretch")
         else:
             st.info("Chua co snapshot — doi service muse-equity-snap.")
-    st.caption("Tu refresh 15s · P&L tich luy tu dau (paper, chua tru phi giao dich that).")
+    st.caption("Tự refresh 15s · P&L thực từ lệnh đã đóng + realized (không tính unrealized ảo theo giá live).")
 
 
 @frag
