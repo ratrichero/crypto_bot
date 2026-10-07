@@ -613,3 +613,29 @@ vòng khoảng 0.12%:
 Step và số tầng có hiệu lực ở lần dựng lưới kế tiếp, tức khi symbol đã flat.
 `max_positions` và basket có hiệu lực ngay. Lot đang mở giữ nguyên SL/TP cũ.
 
+
+### 10.7 Range grid: bỏ symbol biên hẹp khi chọn top K (`grid.range_min_levels`)
+
+**Vấn đề:** top K (mặc định 5) chọn theo điểm scanner, không xét symbol đó có
+dựng được lưới hay không. Range grid cần biên rộng hơn 2·k·step mới có k tầng
+mỗi phía. Vì vậy symbol biên 2.5–3% với step 1.25–1.5% có **0 tầng** nhưng
+vẫn chiếm 1 chỗ trong top K, còn symbol biên 5% xếp hạng 6 bị loại.
+
+**Sửa:** trước khi cắt top K, bỏ symbol mà `build_range` (đúng biên và step bot
+sẽ dùng) cho ra ít hơn `grid.range_min_levels` tầng mỗi phía.
+
+- Mặc định 1: chỉ bỏ symbol 0 tầng. Đặt 2 để đòi đủ 2 tầng (biên > 4 × step).
+- Chỉnh ở dashboard → Cấu hình → Grid v2. Không vượt "Số tầng mỗi phía"
+  (dashboard chặn; trong code cũng tự chặn).
+- Áp dụng ngay ở lần chọn top K kế tiếp. Lot đang mở không bị ảnh hưởng.
+- VPS không cần sửa gì: DB chưa có key thì dùng mặc định 1.
+- `backtest_v2.py` dùng cùng bộ lọc. So sánh bằng
+  `--set grid.range_min_levels=1` với `=2`.
+- Bot log một lần khi có symbol bị bỏ:
+  `RANGE: bo khoi top K (bien hep, < N tang/phia): ...`.
+- Tab 🧭 Scanner có thêm cột **Tầng/phía**. Symbol đạt chuẩn nhưng thiếu tầng
+  hiện **⚠️ hẹp**.
+- `scanner.range_min_pct` giữ nguyên 2.5%. Ngưỡng tầng tự khớp với step nên
+  không cần đoán độ rộng biên.
+- Chỉ áp dụng cho `grid.engine = range`. Grid classic không đổi; việc chỉnh
+  `step_mult` và `range_steps` của classic chờ kết quả backtest.
