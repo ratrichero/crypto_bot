@@ -1380,19 +1380,16 @@ class BinanceEngine:
                 except binance_safety.BinanceSafetyStop:
                     raise
                 except Exception as protection_error:
-                    # Keep the already-created position in state, stop new
-                    # entries, and let local SL/TP remain the fallback.
-                    pos["protection_status"] = "failed"
+                    # Retry dat protection: moi 10s, toi da 2 phut (12 lan).
+                    # Neu van that bai -> dong vi the de tranh mat kiem soat.
+                    pos["protection_status"] = "retrying"
                     pos["protection_error"] = binance_safety.redact_body(
                         protection_error
                     )
-                    self.state["halted"] = True
-                    self.state["halt_reason"] = (
-                        "exchange protection failed for %s" % symbol
-                    )
-                    self.log("CRITICAL UNPROTECTED position #%s %s: %s" %
-                             (pos["id"], symbol,
-                              binance_safety.redact_body(protection_error)))
+                    pos["protection_retry_at"] = time.time() + 10
+                    pos["protection_deadline"] = time.time() + 120
+                    self.log("WARNING protection that bai, se retry sau 10s: %s" %
+                             binance_safety.redact_body(protection_error))
             self._mark_action_success(key)
             self.log("%s OPEN #%d %s %s entry=%s sl=%s tp=%s ord=%s "
                      "protection=%s"
@@ -1405,6 +1402,45 @@ class BinanceEngine:
         except Exception as e:
             self._mark_action_failure(key, e)
             return None, "action_failed: %s" % e
+
+    def retry_protection(self):
+        """Retry dat SL/TP cho cac vi the dang 'retrying'. Tra ve True neu co thay doi."""
+        now = time.time()
+        changed = False
+        for pos in self.state.get("positions", []):
+            if pos.get("protection_status") != "retrying":
+                continue
+            if now < pos.get("protection_retry_at", 0):
+                continue
+            if now >= pos.get("protection_deadline", 0):
+                # Het 2 phut van that bai -> dong vi the
+                self.log("CRITICAL protection retry het 2 phut, dong vi the #%s %s" %
+                         (pos["id"], pos["symbol"]))
+                try:
+                    self.close(pos, pos["entry"], "PROTECTION_FAILED")
+                    changed = True
+                except Exception as e:
+                    self.log("CRITICAL khong dong duoc vi the khong protection: %s" % e)
+                    self.state["halted"] = True
+                    self.state["halt_reason"] = "unprotected position cannot close"
+                continue
+            # Thu dat lai protection
+            try:
+                protection = self._create_exchange_protection(pos)
+                pos["sl_algo_id"] = protection.get("sl")
+                pos["tp_algo_id"] = protection.get("tp")
+                pos["protection_status"] = "armed"
+                pos.pop("protection_retry_at", None)
+                pos.pop("protection_deadline", None)
+                self.log("Protection retry thanh cong cho #%s %s" %
+                         (pos["id"], pos["symbol"]))
+                changed = True
+            except Exception as e:
+                pos["protection_retry_at"] = now + 10
+                self.log("Protection retry that bai, thu lai sau 10s: %s" %
+                         binance_safety.redact_body(e))
+                changed = True
+        return changed
 
     # ---------------------------------------------------------------- close
     def close(self, pos, price, reason):

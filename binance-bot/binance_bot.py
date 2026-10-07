@@ -628,6 +628,12 @@ def main():
                             continue
                         if update_positions(engine, st, symbol, mark):
                             dirty = True
+                    # Retry dat protection cho vi the chua co SL/TP tren san
+                    try:
+                        if engine.retry_protection():
+                            dirty = True
+                    except Exception as e:
+                        log(f"retry_protection loi: {e}")
                 if not st["halted"]:
                     for symbol in SYMBOLS:
                         px = prices.get(symbol)
