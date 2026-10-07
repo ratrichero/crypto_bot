@@ -1,0 +1,60 @@
+{
+  "_comment": [
+    "Dinh nghia app chay duoi pm2 - dung chung cho deploy.py va ecosystem.config.js.",
+    "Ten app = ten service systemd cu (muse-*) de tab Monitor/thoi quen khong doi.",
+    "cwd/entry/search_path tinh tu goc repo. search_path = thu muc ma app import",
+    "module (sys.path) -> deploy.py tinh tap file Python app phu thuoc de biet",
+    "commit moi co dong toi app hay khong. {VAR} lay tu deploy.env.",
+    "confirm=true: app giao dich tien that, restart phai duoc xac nhan (luat repo:",
+    "len live Binance can Cuong duyet) - git up hoi y/N, hoac git up --yes.",
+    "kill_timeout (ms): thoi gian cho bot dung sach (lam xong vong/swap dang chay)."
+  ],
+  "apps": {
+    "muse-dashboard": {
+      "label": "Dashboard",
+      "cwd": "dashboard",
+      "entry": "app.py",
+      "python_args": ["-m", "streamlit", "run", "app.py",
+                      "--server.port", "{DASHBOARD_PORT}",
+                      "--server.address", "{DASHBOARD_ADDRESS}",
+                      "--server.headless", "true"],
+      "extra_args_var": "DASHBOARD_ARGS",
+      "search_path": ["dashboard", "db", "binance-bot"],
+      "requirements": ["dashboard/requirements.txt"],
+      "confirm": false,
+      "kill_timeout": 10000,
+      "health_seconds": 15
+    },
+    "muse-radar": {
+      "label": "Radar paper (Solana)",
+      "cwd": "meme-radar",
+      "entry": "radar.py",
+      "search_path": ["meme-radar"],
+      "requirements": ["meme-radar/requirements.txt"],
+      "confirm": false,
+      "kill_timeout": 30000,
+      "health_seconds": 20
+    },
+    "muse-live-trader": {
+      "label": "Live Trader (Solana tien that)",
+      "cwd": "meme-radar",
+      "entry": "live_trader.py",
+      "search_path": ["meme-radar"],
+      "requirements": ["meme-radar/requirements.txt"],
+      "confirm": true,
+      "kill_timeout": 180000,
+      "health_seconds": 30
+    },
+    "muse-binance": {
+      "label": "Binance Futures LIVE",
+      "cwd": "binance-bot",
+      "entry": "binance_bot.py",
+      "search_path": ["binance-bot", "db"],
+      "requirements": ["binance-bot/requirements.txt"],
+      "confirm": true,
+      "kill_timeout": 60000,
+      "health_seconds": 45,
+      "state_file": "binance-bot/state.json"
+    }
+  }
+}

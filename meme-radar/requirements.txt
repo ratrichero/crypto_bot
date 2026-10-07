@@ -1,0 +1,5 @@
+# radar.py (paper) + live_trader.py (tien that)
+requests
+websockets
+solders
+psycopg[binary]>=3.1

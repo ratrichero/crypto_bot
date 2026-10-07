@@ -1,3 +1,5 @@
 ccxt>=4.0
 requests
 websocket-client
+# runtime config + ghi trade vao PostgreSQL (db/bot_config.py)
+psycopg[binary]>=3.1

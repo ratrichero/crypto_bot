@@ -34,3 +34,6 @@ binance-bot/runtime_config.cache.json
 binance-bot/runtime_config.cache.json.tmp
 binance-bot/scanner_latest.json
 binance-bot/scanner_latest.json.tmp
+# Deploy (pm2): trang thai cuc bo + cau hinh rieng VPS
+.deploy/
+deploy/deploy.local.env
