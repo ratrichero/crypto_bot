@@ -222,7 +222,10 @@ def build_params(main=True):
 
 
 def manage_positions(st, P, now):
-    """Exit engine tham so hoa cho ca plan scalp va holder."""
+    """Exit engine tham so hoa cho ca plan scalp va holder.
+    LUU Y: logic exit cho plan scalp PHAI DONG BO voi strategy.py::decide_exits
+    (live_trader dung strategy.py). Moi thay doi exit rules cho scalp thi sua
+    strategy.py truoc, roi dong bo vao day."""
     positions = st.setdefault(P["key"], [])
     for p in list(positions):
         px = ds_price(p["token"])
