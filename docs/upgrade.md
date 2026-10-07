@@ -716,3 +716,18 @@ Chi tiết xem [`deploy/README.md`](../deploy/README.md).
 - **Bỏ mọi câu hỏi y/N** (deploy, đổi nhánh, setup): mặc định là đồng ý. Khoá
   `confirm` trong `apps.json` đổi tên thành `live` (chỉ dùng để gắn nhãn). `--yes`
   còn được chấp nhận nhưng không có tác dụng.
+
+### 10.10 Live Trader: Jupiter từ chối API key (401) → tự chạy không key
+
+Khi chuyển sang pm2, live trader lần đầu thực sự nhận `JUPITER_API_KEY` từ `.env` gốc,
+nên chuyển sang `api.jup.ag`. Key bị Jupiter từ chối (401), làm mọi lệnh lấy giá,
+quote và **bán** thất bại (ví dụ `COPY_EXIT THAT BAI`).
+
+- Khi gặp 401 trong lúc dùng key: ghi `CRITICAL` một lần, rồi gửi lại **ngay** đúng
+  request đó lên `jupiter_fallback_base` (mặc định `https://lite-api.jup.ag`) không
+  kèm key. Gửi lại `/swap` là an toàn: 401 nghĩa là Jupiter chưa dựng tx nào, và
+  endpoint này chỉ dựng tx, không gửi lên chain.
+- Sau `jupiter_key_retry_seconds` (mặc định 1800 giây) bot thử lại key. Thay key mới
+  vào `.env` gốc thì bot tự dùng lại ở lần thử tiếp theo, không cần restart.
+- Chỉ áp dụng cho 401. Lỗi 429/5xx vẫn xử lý như cũ. Tắt bằng `jupiter_fallback_base: ""`.
+- `lite-api` đang bị Jupiter khai tử. Vẫn cần tạo key hợp lệ tại portal.jup.ag.
