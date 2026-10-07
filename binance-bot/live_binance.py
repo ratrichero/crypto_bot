@@ -1888,7 +1888,60 @@ class BinanceEngine:
             self.log("CRITICAL working exchange orders at startup=%s; "
                      "cancel/reconcile manually before resume" % working)
             return False
+        if self.state.get("halted") and self.state.get("halt_reason") in (
+                "unmanaged open exchange order",
+                "open order reconciliation unavailable"):
+            self.log("RECOVERY: khong con lenh thuong dang treo tren symbol "
+                     "cua bot -> tu dong unhalt (%s)"
+                     % self.state.get("halt_reason"))
+            self.state["halted"] = False
+            self.state["halt_reason"] = None
         return True
+
+    _STARTUP_HOLDS = {
+        "unmanaged open exchange order": "orders",
+        "open order reconciliation unavailable": "orders",
+        "exchange protection reconciliation mismatch": "protection",
+        "exchange protection reconciliation unavailable": "protection",
+    }
+
+    def recheck_startup_holds(self, force=False):
+        """Kiem tra lai dinh ky cac halt do doi chieu luc khoi dong.
+
+        Truoc day cac check nay chi chay 1 lan khi start: sau khi nguoi van
+        hanh don san, halt (persistent, khong het khi sang ngay) van treo den
+        khi restart. Tra ve True neu da unhalt."""
+        if self.dry_run or not self.state.get("halted"):
+            return False
+        kind = self._STARTUP_HOLDS.get(self.state.get("halt_reason"))
+        if kind is None:
+            return False
+        now = time.time()
+        interval = float(self.cfg.get("startup_hold_recheck_seconds", 60))
+        if not force and now - getattr(self, "_last_hold_recheck", 0.0) < interval:
+            return False
+        self._last_hold_recheck = now
+        if kind == "orders":
+            self._reconcile_startup_open_orders()
+        else:
+            try:
+                rows = self.get_positions()
+            except binance_safety.BinanceSafetyStop:
+                raise
+            except Exception as exc:
+                self.log("WARNING recheck protection: khong doc duoc vi the: "
+                         "%s" % binance_safety.redact_body(exc))
+                return False
+            if self.cfg.get("exchange_protection", False):
+                try:
+                    self.cleanup_orphan_orders()
+                except binance_safety.BinanceSafetyStop:
+                    raise
+                except Exception as exc:
+                    self.log("WARNING recheck orphan cleanup: %s" %
+                             binance_safety.redact_body(exc))
+            self._reconcile_exchange_protection(rows)
+        return not self.state.get("halted")
 
     def _fetch_open_algo_orders(self, symbol=None):
         """Return normalized open USD-M Algo Orders from the exchange."""
@@ -1998,6 +2051,22 @@ class BinanceEngine:
             symbol = str(order.get("symbol") or order.get("s")
                          or info.get("symbol") or "").upper()
             if symbol in bot_symbols and algo_id not in expected:
+                client_algo_id = (order.get("clientAlgoId")
+                                  or info.get("clientAlgoId"))
+                if not self._is_bot_algo(symbol, client_algo_id):
+                    # Lenh nguoi dung tu dat: bot khong so huu, khong huy,
+                    # khong halt (giong cleanup luc dang chay). Neu no dong/
+                    # mo vi the, reconcile_positions/detect se bat duoc.
+                    seen_foreign = getattr(self, "_foreign_algo_logged", None)
+                    if seen_foreign is None:
+                        seen_foreign = self._foreign_algo_logged = set()
+                    if (symbol, algo_id) not in seen_foreign:
+                        seen_foreign.add((symbol, algo_id))
+                        self.log("WARNING algo %s %s (clientAlgoId=%s) khong "
+                                 "do bot tao tren symbol cua bot -> giu "
+                                 "nguyen, khong halt" %
+                                 (symbol, algo_id, client_algo_id))
+                    continue
                 unknown.append((symbol, algo_id))
                 continue
             if algo_id not in expected:
@@ -2066,8 +2135,9 @@ class BinanceEngine:
                      % (missing, missing_required, unknown, guard_mismatch))
             return False
         # Tu phuc hoi: neu truoc do halt vi protection mismatch ma gio het -> unhalt
-        if (self.state.get("halted") and
-                self.state.get("halt_reason") == "exchange protection reconciliation mismatch"):
+        if (self.state.get("halted") and self.state.get("halt_reason") in (
+                "exchange protection reconciliation mismatch",
+                "exchange protection reconciliation unavailable")):
             self.state["halted"] = False
             self.state["halt_reason"] = None
             self.log("RECOVERY: protection reconciliation OK - "
@@ -2217,6 +2287,8 @@ class BinanceEngine:
                 self.log("WARNING startup orphan cleanup: %s" %
                          binance_safety.redact_body(exc))
         self._reconcile_exchange_protection(rows)
+        # vua doi chieu xong: lan kiem tra lai dau tien sau 1 chu ky
+        self._last_hold_recheck = time.time()
 
     def _place_market(self, symbol, side, qty, position_side,
                       reduce_only=False, ref_price=None):

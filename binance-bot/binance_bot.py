@@ -631,6 +631,16 @@ def main():
                     raise
                 except Exception as e:
                     log(f"detect_exchange_closed loi: {e}")
+            if MODE == "live":
+                # Halt do doi chieu luc khoi dong (lenh treo / algo lech) duoc
+                # kiem tra lai moi 60s -> tu unhalt khi san da sach.
+                try:
+                    if engine.recheck_startup_holds():
+                        dirty = True
+                except binance_safety.BinanceSafetyStop:
+                    raise
+                except Exception as e:
+                    log(f"recheck_startup_holds loi: {e}")
             if MODE == "live" and not engine.reconcile_positions():
                 if not st["halted"]:
                     st["halted"] = True

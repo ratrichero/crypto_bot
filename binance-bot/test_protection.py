@@ -1061,6 +1061,81 @@ def test_hold_never_force_closes_without_sl():
           st["positions"] == [] and len(recs) == 1, recs)
 
 
+# ===================================================================
+# Startup: algo tay khong halt; halt doi chieu duoc kiem tra lai
+# ===================================================================
+def _restart(fake, st):
+    eng2, st2 = make_engine(fake)
+    st2["positions"] = copy.deepcopy(st["positions"])
+    return eng2, st2
+
+
+def test_startup_foreign_algo_not_halt():
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    open_lot(eng, "long", 60000, level="b1")
+    manual = add_algo(fake, "web_aF3kManualStop")         # nguoi dung tu dat
+    eng2, st2 = _restart(fake, st)
+    eng2._reconcile_startup()
+    check("startup: algo tay tren symbol bot -> khong halt",
+          not st2.get("halted"), (st2.get("halt_reason"), eng2.logs[-4:]))
+    check("startup: algo tay duoc giu nguyen + co WARNING",
+          fake.algos[manual]["algoStatus"] == "NEW"
+          and any("khong do bot tao" in m for m in eng2.logs))
+
+
+def test_startup_protection_halt_rechecked():
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    lot = open_lot(eng, "long", 60000, level="b1")
+    fake.algos[lot["sl_algo_id"]]["quantity"] = "0.02"    # guard lech qty
+    eng2, st2 = _restart(fake, st)
+    eng2._reconcile_startup()
+    check("recheck: guard lech -> halt luc start",
+          st2.get("halt_reason") == "exchange protection reconciliation "
+          "mismatch", st2.get("halt_reason"))
+    fake.fapiPrivateDeleteAlgoOrder({"algoId": lot["sl_algo_id"]})  # don tay
+    check("recheck: chua toi 60s -> chua kiem tra lai",
+          eng2.recheck_startup_holds() is False and st2.get("halted"))
+    CLOCK.sleep(61)
+    ok = eng2.recheck_startup_holds()
+    check("recheck: san da sach -> tu unhalt khong can restart",
+          ok and not st2.get("halted"), (st2.get("halt_reason"),
+                                         eng2.logs[-4:]))
+    sync(eng2)
+    retry(eng2, 1)
+    check("recheck: SL bi huy tay duoc dat lai",
+          len(guards_of(fake, st2["positions"][0])) == 2,
+          fake.open_algos())
+
+
+def test_startup_open_order_halt_rechecked():
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    open_lot(eng, "long", 60000, level="b1")
+    working = [{"id": "77", "symbol": "BTCUSDT", "status": "open",
+                "clientOrderId": "web_limit",
+                "info": {"symbol": "BTCUSDT", "orderId": "77"}}]
+    fake.fetch_open_orders = lambda *a, **k: list(working)
+    eng2, st2 = _restart(fake, st)
+    eng2._reconcile_startup()
+    check("recheck: lenh LIMIT treo -> halt luc start",
+          st2.get("halt_reason") == "unmanaged open exchange order",
+          st2.get("halt_reason"))
+    CLOCK.sleep(61)
+    eng2.recheck_startup_holds()
+    check("recheck: lenh van con -> van halt", st2.get("halted") is True)
+    working.clear()
+    CLOCK.sleep(61)
+    check("recheck: lenh da huy -> tu unhalt",
+          eng2.recheck_startup_holds() and not st2.get("halted"),
+          st2.get("halt_reason"))
+    st2["halted"], st2["halt_reason"] = True, "daily stop -10.00%"
+    CLOCK.sleep(61)
+    check("recheck: khong dung vao halt khac (daily stop)",
+          eng2.recheck_startup_holds() is False and st2["halted"])
+
+
 TESTS = [
     test_close_one_of_many_grid_lots,
     test_close_detects_real_partial,
@@ -1103,6 +1178,9 @@ TESTS = [
     test_detect_real_exit_old_lot_and_busy_symbol,
     test_hold_still_rearms_missing_sl,
     test_hold_never_force_closes_without_sl,
+    test_startup_foreign_algo_not_halt,
+    test_startup_protection_halt_rechecked,
+    test_startup_open_order_halt_rechecked,
 ]
 
 

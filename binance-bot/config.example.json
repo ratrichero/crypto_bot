@@ -20,6 +20,7 @@
  "protection_grace_seconds": 15,
  "protection_sl_deadline_seconds": 120,
  "orphan_cleanup_seconds": 60,
+ "startup_hold_recheck_seconds": 60,
  "exchange_close_check_seconds": 10,
  "exchange_close_min_age_seconds": 60,
  "exchange_close_confirm_seconds": 10,
