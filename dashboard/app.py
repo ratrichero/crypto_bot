@@ -790,7 +790,7 @@ def tab_monitor():
     st.subheader("🖥️ Giám sát hệ thống REAL")
 
     services = {
-        "muse-binance": "🔴 Binance Futures LIVE",
+        "muse-binance": "🟡 Binance Futures LIVE",
         "muse-radar": "🦅 Radar paper (Solana)",
         "muse-live-trader": "☀️ Live Trader (Solana tiền thật)",
         "muse-dashboard": "📊 Dashboard",
@@ -846,7 +846,7 @@ def tab_monitor():
     st.markdown("### ⏯️ Điều khiển bot")
 
     # --- Binance Live ---
-    st.markdown("#### 🔴 Binance Futures LIVE")
+    st.markdown("#### 🟡 Binance Futures LIVE")
     pause_file = "/home/ubuntu/muse_bot/binance-bot/PAUSE"
     is_paused = os.path.exists(pause_file)
     col1, col2 = st.columns(2)
@@ -1868,7 +1868,7 @@ def main():
         where = "WHERE closed_at >= now() - make_interval(days => %s)"
         params = (days,)
 
-    names = ["🔴 Live Binance", "☀️ Live Radar", "📄 Paper OKX",
+    names = ["🟡 Live Binance", "☀️ Live Radar", "📄 Paper OKX",
              "🦅 Paper Radar", "🖥️ Monitor", "⚙️ Cấu hình", "🧭 Scanner"]
     if user["role"] == "admin":
         names.append("👤 Quản trị")
