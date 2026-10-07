@@ -1017,6 +1017,12 @@ class BinanceEngine:
                     self.ex.fapiPrivateDeleteAlgoOrder,
                     identifier,
                 )
+                # Huy chac chan -> guard KHONG con tren san: xoa id ngay de
+                # neu lenh dong sau do loi, _missing_guards thay thieu va
+                # retry_protection dat lai (truoc day id cu con -> lot bao
+                # 'armed' trong khi san khong co SL/TP).
+                pos.pop(key, None)
+                pos.pop("%s_client_algo_id" % label, None)
             except binance_safety.BinanceSafetyStop:
                 raise
             except Exception as exc:
@@ -1085,6 +1091,10 @@ class BinanceEngine:
                 raise RuntimeError(
                     "cannot verify Hedge position after absent protection"
                 ) from exc
+        for label in absent_labels:
+            # Da xac nhan khong khop va leg con nguyen -> guard da mat that.
+            pos.pop("%s_algo_id" % label, None)
+            pos.pop("%s_client_algo_id" % label, None)
 
     def _set_leverage(self, symbol):
         if symbol in self._lev_done:
@@ -1311,6 +1321,19 @@ class BinanceEngine:
             self.log("CRITICAL POSITION RECONCILE mismatch=%s; halt new entries"
                      % mismatches)
             return False
+        # Lenh dong loi -> halt 'close action requires reconciliation'. Da
+        # doi chieu xong khi san khop state VA moi lot da du SL/TP tren san
+        # (retry_protection dat lai chan da huy); lenh dong van duoc
+        # update_positions thu lai theo cooldown.
+        if (self.state.get("halted") and self.state.get("halt_reason")
+                == "close action requires reconciliation"
+                and not any(self._missing_guards(p)
+                            for p in self.state.get("positions", [])
+                            if p.get("live"))):
+            self.state["halted"] = False
+            self.state["halt_reason"] = None
+            self.log("RECOVERY: lenh dong loi da doi chieu - san khop state, "
+                     "moi lot du SL/TP -> unhalt")
         # Tu phuc hoi: neu truoc do halt vi mismatch ma gio het -> unhalt
         if (self.state.get("halted") and
                 self.state.get("halt_reason") == "exchange position reconciliation mismatch"):

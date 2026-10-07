@@ -621,14 +621,14 @@ def test_local_exit_fallback_after_grace():
     eng, st = make_engine(fake)
     bot_state(st)
     lot = open_lot(eng, "long", 60000, level="b1")
+    ids = [lot["sl_algo_id"], lot["tp_algo_id"]]
     binance_bot.update_positions(eng, st, "BTCUSDT", 60310)
     CLOCK.sleep(16)                                  # guard never fired
     changed = binance_bot.update_positions(eng, st, "BTCUSDT", 60310)
     check("grace het: bot tu dong lenh", changed and st["positions"] == [],
           eng.logs[-4:])
     check("grace het: guard cua lot da duoc huy truoc khi dong",
-          all(fake.algos[lot[k]]["algoStatus"] == "CANCELED"
-              for k in ("sl_algo_id", "tp_algo_id")))
+          all(fake.algos[i]["algoStatus"] == "CANCELED" for i in ids))
 
 
 def test_close_after_guard_filled_books_exchange_fill():
@@ -1393,6 +1393,35 @@ def test_ambiguous_open_never_accepted_expires():
                                       st.get("ambiguous_orders")))
 
 
+def test_failed_close_rearms_guards_and_recovers():
+    """Guard bi huy truoc lenh dong; lenh dong loi -> lot phai duoc dat lai
+    SL/TP (khong duoc bao 'armed' khi san trong) va halt duoc go khi da doi
+    chieu xong."""
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    lot = open_lot(eng, "long", 60000)
+    real = fake._market
+    fake._market = lambda *a, **k: (_ for _ in ()).throw(
+        BinanceError('binance {"code":-1001,"msg":"Internal error"}'))
+    rec = eng.close(lot, 60000, "TP")
+    fake._market = real
+    check("close loi: halt + lot khong con bao co guard (san da huy)",
+          rec is None and st.get("halt_reason")
+          == "close action requires reconciliation"
+          and eng._missing_guards(lot) == ["sl", "tp"],
+          (st.get("halt_reason"), lot.get("sl_algo_id")))
+    eng.reconcile_positions(force=True)
+    check("close loi: chua du guard -> chua unhalt", st.get("halted"))
+    CLOCK.sleep(120)
+    eng.retry_protection()
+    check("close loi: retry_protection dat lai du SL/TP tren san",
+          len(guards_of(fake, lot)) == 2
+          and lot.get("protection_status") == "armed")
+    ok = eng.reconcile_positions(force=True)
+    check("close loi: san khop + du guard -> unhalt",
+          ok and not st.get("halted"), st.get("halt_reason"))
+
+
 TESTS = [
     test_close_one_of_many_grid_lots,
     test_close_detects_real_partial,
@@ -1448,6 +1477,7 @@ TESTS = [
     test_fill_price_falls_back_to_user_trades,
     test_ambiguous_open_filled_is_adopted_with_guards,
     test_ambiguous_open_never_accepted_expires,
+    test_failed_close_rearms_guards_and_recovers,
 ]
 
 
