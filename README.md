@@ -11,6 +11,7 @@ Code Python, dữ liệu vận hành trên PostgreSQL, dashboard Streamlit.
 | `meme-radar/` | Radar copy-trade meme Solana: theo dõi ví smart money qua Helius, tín hiệu real-time qua websocket |
 | `dashboard/` | Dashboard Streamlit: KPIs, equity curve, P&L theo ngày, vị thế mở, xếp hạng ví |
 | `db/` | Schema PostgreSQL, script migrate JSONL → Postgres, daemon đồng bộ |
+| `deploy/` | Deploy tự động (`git up`) + quản lý app bằng pm2 — xem `deploy/README.md` |
 
 ## Kiến trúc dữ liệu
 

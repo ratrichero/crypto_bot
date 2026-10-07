@@ -672,3 +672,23 @@ sẽ dùng) cho ra ít hơn `grid.range_min_levels` tầng mỗi phía.
   biết"; `fetch_order` lỗi thì lấy fill từ userTrades; quá
   `exchange_close_defer_seconds` (90s) thì ghi đúng các lot mất guard nếu
   tổng qty của chúng bằng phần leg giảm.
+
+### 10.9 Deploy tự động bằng pm2 (`git up`)
+
+Chi tiết xem [`deploy/README.md`](../deploy/README.md).
+
+- `git up`: fast-forward nhánh, cài requirements khi đổi (so `pip freeze`),
+  build web khi có `package.json` đổi (hiện không có), rồi **chỉ restart app có
+  file Python import bị đổi**. Commit app đang chạy được xác định bằng giờ start
+  của pm2 đối chiếu `git reflog`, nên trường hợp pull tay mà quên restart (như
+  dashboard chạy code cũ) cũng được phát hiện. App tiền thật cần y/N hoặc `--yes`.
+- Bot dừng sạch khi nhận SIGINT/SIGTERM: Binance thoát như khi có file `STOP`
+  (lưu state, đóng WS), live_trader/radar thoát giữa 2 vòng lặp, swap đang chạy
+  được làm xong.
+- pm2 không restart khi bot tự thoát mã 0 (STOP, safety circuit, khởi động lỗi),
+  tránh spam API Binance.
+- Tab Monitor tự nhận biết pm2 hay systemd.
+- `deploy.sh` ở gốc repo giờ gọi `deploy/deploy.py` và không còn gọi
+  `systemctl restart`. Nếu vẫn gọi, sau khi chuyển sang pm2 lệnh đó sẽ bật lại
+  service systemd và tạo bot chạy trùng.
+- Chuyển từ systemd: `python3 deploy/deploy.py doctor`, rồi `python3 deploy/deploy.py setup`.
