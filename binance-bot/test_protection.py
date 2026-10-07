@@ -174,8 +174,15 @@ class FakeBinance:
         oid = (params or {}).get("orderId")
         if oid is not None:
             rows = [t for t in rows if t["order"] == str(oid)]
+        week = 7 * 24 * 3600 * 1000
+        now_ms = int(CLOCK.now * 1000)
         if since is not None:
-            rows = [t for t in rows if t["timestamp"] >= since]
+            # ccxt: since cu hon 7 ngay -> endTime = since + 7d; Binance co
+            # startTime -> tra trade CU NHAT tu moc do (limit dau tien).
+            end = since + week if now_ms - since >= week else now_ms
+            rows = [t for t in rows if since <= t["timestamp"] <= end]
+            return copy.deepcopy(rows[:(limit or 500)])
+        rows = [t for t in rows if t["timestamp"] >= now_ms - week]
         return copy.deepcopy(rows[-(limit or 500):])
 
     def fapiPrivatePostAlgoOrder(self, params):
@@ -976,6 +983,33 @@ def test_real_fees_detect_group_close_prorated():
                                  for r in recs), recs)
 
 
+def test_detect_real_exit_old_lot_and_busy_symbol():
+    """Lot mo > 7 ngay va symbol co > 100 trade sau khi mo: van tim duoc
+    fill dong that (khong roi ve gia uoc tinh)."""
+    fake = FakeBinance()
+    eng, st = make_engine(fake, protection=False)
+    old = open_lot(eng, "long", 60000, level="b1")
+    CLOCK.sleep(8 * 24 * 3600)
+    manual_close(fake, "long", 0.01, 60300)
+    detect_round(eng, {"BTCUSDT": 60200})
+    recs = detect_round(eng, {"BTCUSDT": 60200})
+    check("old lot (>7d): gia thoat = fill that 60300",
+          len(recs) == 1 and recs[0]["exit"] == 60300
+          and recs[0]["estimated"] is False, recs)
+    eng2, st2 = make_engine(fake, protection=False)
+    lot = open_lot(eng2, "long", 60000, level="b2")
+    for i in range(150):                       # short leg ban ron
+        fake._fill("BTCUSDT", "sell", "SHORT", 0.001, 60000)
+        fake._fill("BTCUSDT", "buy", "SHORT", 0.001, 60000)
+    CLOCK.sleep(120)
+    manual_close(fake, "long", 0.01, 60450)
+    detect_round(eng2, {"BTCUSDT": 60400})
+    recs = detect_round(eng2, {"BTCUSDT": 60400})
+    check("busy symbol (>100 trade): gia thoat = fill that 60450",
+          len(recs) == 1 and recs[0]["exit"] == 60450
+          and recs[0]["estimated"] is False, recs)
+
+
 TESTS = [
     test_close_one_of_many_grid_lots,
     test_close_detects_real_partial,
@@ -1015,6 +1049,7 @@ TESTS = [
     test_real_fees_exchange_tp,
     test_fee_fallback_estimated,
     test_real_fees_detect_group_close_prorated,
+    test_detect_real_exit_old_lot_and_busy_symbol,
 ]
 
 

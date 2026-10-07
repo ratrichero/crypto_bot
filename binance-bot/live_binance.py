@@ -1458,9 +1458,14 @@ class BinanceEngine:
         opened_ms = int(float(pos.get("opened_at", 0) or 0) * 1000)
         try:
             ccxt_symbol = self._ccxt_symbol(symbol) or symbol
+            # KHONG truyen since=opened: (1) lot mo > 7 ngay -> ccxt cat
+            # endTime = since+7d -> mat fill dong gan day; (2) co startTime
+            # Binance tra trade CU NHAT tu moc do (limit) -> symbol grid ban
+            # day fill dong moi nhat. Khong since = trade MOI NHAT 7 ngay;
+            # loc ts >= opened o duoi.
             trades = self._private_call(
                 "private:account", self.ex.fetch_my_trades, ccxt_symbol,
-                opened_ms or None, 100, _weight=5) or []
+                None, 500, _weight=5) or []
         except binance_safety.BinanceSafetyStop:
             raise
         except Exception as exc:
