@@ -657,6 +657,34 @@ def test_retry_stops_when_stale():
         check("processed", "tid_r" in tr.state["processed"])
 
 
+
+# ---- khong lo Helius key ----
+
+def test_redact_secrets():
+    print("== redact api-key trong log/loi ==")
+    msg = ("429 Client Error: Too Many Requests for url: "
+           "https://mainnet.helius-rpc.com/?api-key=abcd1234-SECRET-xyz")
+    out = lt.redact(msg)
+    check("che api-key trong URL", "SECRET" not in out and "api-key=***" in out, out)
+    lt.register_secret("RAWKEY-99887766")
+    check("che gia tri da dang ky", "RAWKEY" not in lt.redact("loi RAWKEY-99887766 x"))
+
+
+def test_rpc_error_redacted():
+    print("== RpcClient: loi ket noi khong chua key, log khong chua key ==")
+    with isolated():
+        rpc = lt.RpcClient("https://127.0.0.1:1/?api-key=TOPSECRET-123456", timeout=1)
+        try:
+            rpc.call("getBalance", ["x"])
+            check("phai loi", False)
+        except lt.RpcError as e:
+            check("RpcError khong chua key", "TOPSECRET" not in str(e), str(e))
+            check("khong chain exception goc", e.__cause__ is None and e.__suppress_context__)
+        lt.log("thu: https://x/?api-key=TOPSECRET-123456 het")
+        content = open(lt.LOG_P).read()
+        check("log file khong chua key", "TOPSECRET" not in content)
+
+
 if __name__ == "__main__":
     test_exit_tp_ladder()
     test_exit_sl()
@@ -685,5 +713,7 @@ if __name__ == "__main__":
     test_signal_age_helpers()
     test_stale_signal_skipped()
     test_retry_stops_when_stale()
+    test_redact_secrets()
+    test_rpc_error_redacted()
     print(f"\n{PASS} pass, {FAIL} fail")
     sys.exit(1 if FAIL else 0)

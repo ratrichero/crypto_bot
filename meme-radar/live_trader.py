@@ -25,6 +25,7 @@ import base64
 import json
 import math
 import os
+import re
 import sys
 import time
 import traceback
@@ -135,9 +136,32 @@ def load_config(path=CFG_P):
 
 # ---------------------------------------------------------------- log
 
+_SECRET_PATTERNS = [
+    # api-key trong URL/query (Helius, ...): ?api-key=XXX / &api_key=XXX
+    re.compile(r"(?i)(api[-_]?key=)[^&\s'\"<>]+"),
+]
+_SECRET_VALUES = set()
+
+
+def register_secret(value):
+    """Dang ky 1 gia tri bi mat (vd. Helius key) de redact o moi noi."""
+    if value and len(value) >= 8:
+        _SECRET_VALUES.add(value)
+
+
+def redact(text):
+    """Che secret trong chuoi bat ky truoc khi log/luu state."""
+    text = str(text)
+    for v in _SECRET_VALUES:
+        text = text.replace(v, "***")
+    for pat in _SECRET_PATTERNS:
+        text = pat.sub(r"\1***", text)
+    return text
+
+
 def log(msg):
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{ts}Z] {msg}"
+    line = f"[{ts}Z] {redact(msg)}"
     try:
         if os.path.exists(LOG_P) and os.path.getsize(LOG_P) > 5 * 1024 * 1024:
             with open(LOG_P, "rb") as f:
@@ -248,14 +272,22 @@ class RpcClient:
 
     def call(self, method, params):
         self._id += 1
-        r = requests.post(self.url, json={
-            "jsonrpc": "2.0", "id": self._id,
-            "method": method, "params": params,
-        }, timeout=self.timeout)
-        r.raise_for_status()
-        d = r.json()
+        try:
+            r = requests.post(self.url, json={
+                "jsonrpc": "2.0", "id": self._id,
+                "method": method, "params": params,
+            }, timeout=self.timeout)
+            r.raise_for_status()
+            d = r.json()
+        except requests.RequestException as e:
+            # Message cua requests chua full URL (?api-key=...) -> redact,
+            # `from None` de traceback khong in lai exception goc.
+            raise RpcError(f"{method}: {type(e).__name__}: "
+                           f"{redact(e)[:200]}") from None
+        except ValueError as e:
+            raise RpcError(f"{method}: JSON khong hop le: {redact(e)[:200]}") from None
         if d.get("error"):
-            raise RpcError(str(d["error"])[:200])
+            raise RpcError(redact(d["error"])[:200])
         return d["result"]
 
     def get_balance_lamports(self, pubkey):
@@ -809,6 +841,7 @@ class LiveTrader:
         kp_path = os.path.join(BASE, cfg["helius_key_file"])
         if os.path.exists(kp_path):
             helius_key = open(kp_path).read().strip()
+        register_secret(helius_key)
         rpc_url = (f"https://mainnet.helius-rpc.com/?api-key={helius_key}"
                    if helius_key else "https://api.mainnet-beta.solana.com")
         self.rpc = rpc or RpcClient(rpc_url)
@@ -1143,7 +1176,7 @@ class LiveTrader:
         retry_after = now + min(ceiling, base * (2 ** min(attempts - 1, 5)))
         failures[tid] = {
             "signal": signal, "attempts": attempts,
-            "last_error": str(error)[:300], "retry_at": retry_after,
+            "last_error": redact(error)[:300], "retry_at": retry_after,
         }
         self.save()
         log(f"signal {tid[:12]}... FAIL attempt={attempts}, "
@@ -1225,7 +1258,7 @@ class LiveTrader:
             self._open_from_signal(s, now)
         except SwapUncertain as e:
             pending[tid]["status"] = "buy_uncertain"
-            pending[tid]["error"] = str(e)[:300]
+            pending[tid]["error"] = redact(e)[:300]
             self.entry_blocked = True
             self.save()
             log(f"BUY {tid[:12]}... khong chac ket qua -> block entry: {e}")
@@ -1236,7 +1269,7 @@ class LiveTrader:
             return False
         except Exception as e:
             pending[tid]["status"] = "buy_uncertain"
-            pending[tid]["error"] = str(e)[:300]
+            pending[tid]["error"] = redact(e)[:300]
             self.entry_blocked = True
             self.save()
             log(f"BUY {tid[:12]}... khong chac ket qua -> block entry: {e}")
