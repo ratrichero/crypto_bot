@@ -682,11 +682,12 @@ def main():
                                        lambda: [])():
                         _record_close(st, rec)
                         dirty = True
-                    # Quet don lenh mo coi moi 30 giay
+                    # Quet don lenh mo coi (weight 40/lan, mac dinh 60s)
                     try:
                         now_ts = time.time()
                         last_cleanup = st.get("_last_orphan_cleanup", 0)
-                        if now_ts - last_cleanup >= 30:
+                        if now_ts - last_cleanup >= float(
+                                CFG.get("orphan_cleanup_seconds", 60)):
                             cleaned = engine.cleanup_orphan_orders()
                             st["_last_orphan_cleanup"] = now_ts
                             if cleaned:

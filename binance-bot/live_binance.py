@@ -29,6 +29,7 @@ SAFETY:
 """
 import json
 import os
+import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -1893,44 +1894,97 @@ class BinanceEngine:
                      self.state.get("halted_at", "unknown"))
         return True
 
+    def _is_bot_algo(self, symbol, client_algo_id):
+        """clientAlgoId format of _new_client_order_id: b<SYMBOL><L|S><n>."""
+        raw = "".join(ch for ch in str(symbol).upper()
+                      if ch.isalnum() or ch in "_-")[:18]
+        return bool(re.fullmatch(r"b%s[LS]\d+" % re.escape(raw),
+                                 str(client_algo_id or "")))
+
     def cleanup_orphan_orders(self):
-        """Quet va xoa lenh condition mo coi (khong con vi the tuong ung).
-        Chay dinh ky moi 5 phut. Tra ve so lenh da xoa."""
+        """Cancel bot-created Algo orders that no local lot references.
+
+        Orphans come from guards whose lot is gone (Binance TP/SL are not
+        OCO, external closes, old retry duplicates). The old rule only
+        cleaned symbols with no position at all, so a grid symbol - which
+        almost always has a position - accumulated orphans forever, and each
+        one counts toward Binance's conditional-order limit.
+
+        Safety rules: only ids/clientAlgoIds not referenced by any lot;
+        only orders created by this bot (clientAlgoId pattern); and only on
+        a Hedge leg whose exchange quantity is fully explained by local lots
+        (an unmanaged position might rely on that order).  Returns count.
+        """
         if self.dry_run:
             return 0
         try:
-            # Lay vi the thuc te tren san
-            positions = self._private_call(
-                "private:account", self.ex.fetch_positions, _weight=5)
-            live_symbols = set()
-            for p in positions or []:
-                amt = float(p.get("contracts", 0) or 0)
-                if amt != 0:
-                    sym = str(p.get("symbol", "")).split("/")[0] + "USDT"
-                    live_symbols.add(sym.upper())
-            # Lay algo orders
-            algos = self._private_call(
-                "private:trade", self.ex.fapiPrivateGetOpenAlgoOrders)
-            if not isinstance(algos, list):
-                return 0
-            cleaned = 0
-            for o in algos:
-                sym = str(o.get("symbol", "")).upper()
-                if sym not in live_symbols:
-                    aid = o.get("algoId")
-                    try:
-                        self._private_call(
-                            "private:trade",
-                            self.ex.fapiPrivateDeleteAlgoOrder,
-                            {"symbol": sym, "algoId": int(aid)})
-                        self.log(f"CLEANUP: da xoa lenh mo coi {sym} algo={aid}")
-                        cleaned += 1
-                    except Exception as e:
-                        self.log(f"CLEANUP loi khi xoa {aid}: {e}")
-            return cleaned
+            rows = self._fetch_open_algo_orders()
+        except binance_safety.BinanceSafetyStop:
+            raise
         except Exception as e:
-            self.log(f"CLEANUP loi: {e}")
+            self.log("CLEANUP loi doc algo orders: %s" %
+                     binance_safety.redact_body(e))
             return 0
+        ref_ids, ref_cids = set(), set()
+        for pos in self.state.get("positions", []):
+            symbol = str(pos.get("symbol") or "").upper()
+            for label in ("sl", "tp"):
+                if pos.get("%s_algo_id" % label):
+                    ref_ids.add((symbol, str(pos["%s_algo_id" % label])))
+                if pos.get("%s_client_algo_id" % label):
+                    ref_cids.add(str(pos["%s_client_algo_id" % label]))
+        candidates = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            symbol = str(row.get("symbol") or "").upper()
+            algo_id = row.get("algoId")
+            client_algo_id = str(row.get("clientAlgoId") or "")
+            if (symbol, str(algo_id)) in ref_ids or client_algo_id in ref_cids:
+                continue
+            if not self._is_bot_algo(symbol, client_algo_id):
+                seen = getattr(self, "_foreign_algo_logged", None)
+                if seen is None:
+                    seen = self._foreign_algo_logged = set()
+                if (symbol, str(algo_id)) not in seen:
+                    seen.add((symbol, str(algo_id)))
+                    self.log("CLEANUP giu nguyen algo %s %s (clientAlgoId=%s "
+                             "khong do bot tao)" % (symbol, algo_id,
+                                                    client_algo_id))
+                continue
+            candidates.append((symbol, algo_id, client_algo_id, row))
+        if not candidates:
+            return 0
+        try:
+            exchange = self._aggregate_positions(self._private_call(
+                "private:account", self.ex.fetch_positions, _weight=5))
+        except binance_safety.BinanceSafetyStop:
+            raise
+        except Exception as e:
+            self.log("CLEANUP loi doc vi the: %s" %
+                     binance_safety.redact_body(e))
+            return 0
+        cleaned = 0
+        for symbol, algo_id, client_algo_id, row in candidates:
+            leg = str(row.get("positionSide") or "").lower()
+            if leg in ("long", "short"):
+                key = (symbol, leg)
+                local = self._local_qty(symbol, leg)
+                actual = exchange.get(key, 0.0)
+                if abs(actual - local) > self._qty_tolerance(symbol, local):
+                    self.log("CLEANUP hoan huy algo %s %s: leg %s san=%s "
+                             "local=%s chua khop" % (symbol, algo_id, leg,
+                                                     actual, local))
+                    continue
+            result = self._cancel_algo_quietly(symbol, algo_id,
+                                               None if algo_id else
+                                               client_algo_id)
+            if result == "cancelled":
+                cleaned += 1
+                self.log("CLEANUP: da huy lenh mo coi %s algo=%s %s %s"
+                         % (symbol, algo_id, row.get("orderType"),
+                            row.get("positionSide")))
+        return cleaned
 
     def _reconcile_startup(self):
         """Remove paper ghosts, then validate aggregate exchange quantities."""
@@ -1968,6 +2022,18 @@ class BinanceEngine:
             self.state["halt_reason"] = "unmanaged exchange position"
         self.reconcile_positions(force=True, rows=rows)
         self._reconcile_startup_open_orders()
+        # Orphans left by a previous run are cancelled (bot-owned, leg
+        # explained by local lots) instead of halting as "unknown".
+        if self.cfg.get("exchange_protection", False):
+            try:
+                cleaned = self.cleanup_orphan_orders()
+                if cleaned:
+                    self.log("STARTUP: da huy %d lenh mo coi" % cleaned)
+            except binance_safety.BinanceSafetyStop:
+                raise
+            except Exception as exc:
+                self.log("WARNING startup orphan cleanup: %s" %
+                         binance_safety.redact_body(exc))
         self._reconcile_exchange_protection(rows)
 
     def _place_market(self, symbol, side, qty, position_side,

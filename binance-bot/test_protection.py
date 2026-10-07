@@ -727,6 +727,80 @@ def test_ambiguous_post_is_adopted_not_duplicated():
           and len(fake.open_algos()) == 2, (lot, fake.open_algos()))
 
 
+# ===================================================================
+# 9. Orphan conditional orders
+# ===================================================================
+def add_algo(fake, cid, side="SELL", position_side="LONG",
+             order_type="STOP_MARKET", qty="0.01", symbol="BTCUSDT"):
+    return fake.fapiPrivatePostAlgoOrder({
+        "clientAlgoId": cid, "type": order_type, "symbol": symbol,
+        "side": side, "positionSide": position_side, "quantity": qty,
+        "triggerPrice": "50000"})["algoId"]
+
+
+def test_orphans_cancelled_on_grid_symbol_with_live_lots():
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    lot = open_lot(eng, "long", 60000, level="b1")
+    orphan_sl = add_algo(fake, "bBTCUSDTL900")                 # old lot
+    orphan_tp = add_algo(fake, "bBTCUSDTS901", side="BUY",
+                         position_side="SHORT",
+                         order_type="TAKE_PROFIT_MARKET")      # flat leg
+    cleaned = eng.cleanup_orphan_orders()
+    check("mo coi: huy ca khi symbol con lot grid",
+          cleaned == 2 and fake.algos[orphan_sl]["algoStatus"] == "CANCELED"
+          and fake.algos[orphan_tp]["algoStatus"] == "CANCELED",
+          (cleaned, eng.logs[-4:]))
+    check("mo coi: guard cua lot dang song khong bi dung",
+          fake.algos[lot["sl_algo_id"]]["algoStatus"] == "NEW"
+          and fake.algos[lot["tp_algo_id"]]["algoStatus"] == "NEW")
+
+
+def test_orphans_keep_foreign_and_unmanaged_leg():
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    manual = add_algo(fake, "web_manual_123")                  # user's own
+    fake.positions[("BTCUSDT", "short")] = 0.02                # unmanaged
+    bot_on_unmanaged = add_algo(fake, "bBTCUSDTS902", side="BUY",
+                                position_side="SHORT")
+    cleaned = eng.cleanup_orphan_orders()
+    check("mo coi: khong huy lenh khong do bot tao",
+          fake.algos[manual]["algoStatus"] == "NEW")
+    check("mo coi: khong huy khi leg co vi the bot khong quan ly",
+          cleaned == 0
+          and fake.algos[bot_on_unmanaged]["algoStatus"] == "NEW")
+
+
+def test_orphan_after_exchange_tp_never_hits_new_lot():
+    """End-to-end: TP fires, a new lot opens on the same leg; the old SL
+    must already be gone so it can never close the new lot."""
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    old = open_lot(eng, "long", 60000, level="b1")
+    fake.fire(old["tp_algo_id"], price=60300)
+    sync(eng)
+    new = open_lot(eng, "long", 60100, level="b1")
+    old_sl = fake.algos[old["sl_algo_id"]]
+    check("e2e: SL cu da bi huy truoc khi mo lot moi",
+          old_sl["algoStatus"] == "CANCELED", old_sl)
+    check("e2e: tren san chi con guard cua lot moi",
+          {a["algoId"] for a in fake.open_algos()}
+          == {new["sl_algo_id"], new["tp_algo_id"]})
+
+
+def test_startup_orphans_cancelled_instead_of_halt():
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    lot = open_lot(eng, "long", 60000, level="b1")
+    add_algo(fake, "bBTCUSDTL903")                             # stale orphan
+    eng2, st2 = make_engine(fake)
+    st2["positions"] = copy.deepcopy(st["positions"])
+    eng2._reconcile_startup()
+    check("startup: mo coi bi huy, bot khong halt",
+          not st2.get("halted") and len(fake.open_algos()) == 2,
+          (st2.get("halt_reason"), fake.open_algos(), eng2.logs[-5:]))
+
+
 TESTS = [
     test_close_one_of_many_grid_lots,
     test_close_detects_real_partial,
@@ -754,6 +828,10 @@ TESTS = [
     test_only_tp_missing_never_force_closes,
     test_lost_guard_rearmed_without_duplicates,
     test_ambiguous_post_is_adopted_not_duplicated,
+    test_orphans_cancelled_on_grid_symbol_with_live_lots,
+    test_orphans_keep_foreign_and_unmanaged_leg,
+    test_orphan_after_exchange_tp_never_hits_new_lot,
+    test_startup_orphans_cancelled_instead_of_halt,
 ]
 
 
