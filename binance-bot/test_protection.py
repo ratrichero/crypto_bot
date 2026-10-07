@@ -150,11 +150,39 @@ class FakeBinance:
                  "info": {"symbol": s, "positionSide": side.upper()}}
                 for (s, side), q in self.positions.items() if q]
 
+    def _market(self, symbol, side, qty, params):
+        params = params or {}
+        mode = getattr(self, "timeout_mode", None)   # None|accepted|lost
+        self.timeout_mode = None
+        if mode == "lost":
+            raise BinanceError("binance RequestTimeout: timed out")
+        order = self._fill(symbol, side, params["positionSide"], qty)
+        order["clientOrderId"] = params.get("newClientOrderId")
+        if mode == "accepted":
+            # San da nhan + khop, nhung chua tra cuu duoc ngay (do tre).
+            order["_hidden_until"] = CLOCK.now + 20
+            raise BinanceError("binance RequestTimeout: timed out")
+        return order
+
     def create_market_buy_order(self, symbol, qty, params=None):
-        return self._fill(symbol, "buy", (params or {})["positionSide"], qty)
+        return self._market(symbol, "buy", qty, params)
 
     def create_market_sell_order(self, symbol, qty, params=None):
-        return self._fill(symbol, "sell", (params or {})["positionSide"], qty)
+        return self._market(symbol, "sell", qty, params)
+
+    def fapiPrivateGetOrder(self, params):
+        self.calls.append("get_order")
+        for o in self.orders.values():
+            if (o.get("clientOrderId") == params.get("origClientOrderId")
+                    and CLOCK.now >= o.get("_hidden_until", 0)):
+                return {"orderId": o["orderId"], "status": "FILLED",
+                        "executedQty": str(o["filled"]),
+                        "avgPrice": str(o["average"]),
+                        "clientOrderId": o["clientOrderId"],
+                        "symbol": o["symbol"], "side": o["side"].upper(),
+                        "positionSide": o["info"]["positionSide"]}
+        raise BinanceError('binance {"code":-2013,'
+                           '"msg":"Order does not exist."}')
 
     def fetch_open_orders(self, symbol=None, since=None, limit=None,
                           params=None):
@@ -1317,6 +1345,54 @@ def test_fill_price_falls_back_to_user_trades():
           pos is not None and len(guards_of(fake, pos)) == 2)
 
 
+# ===================================================================
+# Lenh mo timeout mo ho: tra lai theo clientOrderId, nhan lot neu da khop
+# ===================================================================
+def test_ambiguous_open_filled_is_adopted_with_guards():
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    fake.timeout_mode = "accepted"
+    pos, why = eng.open("BTCUSDT", "long", 600.0, 60000, 0.03, 0.005, "grid",
+                        level="b1")
+    check("ambiguous: open tra None, halt, luu lenh can doi chieu",
+          pos is None and st.get("halt_reason", "").startswith("ambiguous")
+          and len(st.get("ambiguous_orders", [])) == 1
+          and fake.positions.get(("BTCUSDT", "long")) == 0.01,
+          (why, st.get("halt_reason"), st.get("ambiguous_orders")))
+    eng.resolve_ambiguous_orders(force=True)
+    check("ambiguous: chua tra cuu duoc -> van giu, van halt",
+          st["halted"] and len(st["ambiguous_orders"]) == 1)
+    CLOCK.sleep(31)
+    changed = eng.resolve_ambiguous_orders()
+    lot = st["positions"][0] if st["positions"] else {}
+    check("ambiguous: lenh da khop -> nhan lot qty/gia that, level giu nguyen",
+          changed and lot.get("qty") == 0.01 and lot.get("entry") == 60000.0
+          and lot.get("level") == "b1" and lot.get("tag") == "grid", lot)
+    check("ambiguous: lot nhan ve co du SL/TP tren san",
+          lot and len(guards_of(fake, lot)) == 2)
+    ok = eng.reconcile_positions(force=True)
+    check("ambiguous: unhalt + san khop state",
+          ok and not st.get("halted") and st["ambiguous_orders"] == [],
+          st.get("halt_reason"))
+
+
+def test_ambiguous_open_never_accepted_expires():
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    fake.timeout_mode = "lost"
+    pos, _ = eng.open("BTCUSDT", "long", 600.0, 60000, 0.03, 0.005, "grid")
+    CLOCK.sleep(31)
+    eng.resolve_ambiguous_orders()
+    check("ambiguous lost: truoc han van giu + halt",
+          st["halted"] and len(st["ambiguous_orders"]) == 1)
+    CLOCK.sleep(300)
+    eng.resolve_ambiguous_orders()
+    check("ambiguous lost: qua han khong ton tai -> bo, unhalt, khong lot",
+          not st.get("halted") and st["ambiguous_orders"] == []
+          and st["positions"] == [], (st.get("halt_reason"),
+                                      st.get("ambiguous_orders")))
+
+
 TESTS = [
     test_close_one_of_many_grid_lots,
     test_close_detects_real_partial,
@@ -1370,6 +1446,8 @@ TESTS = [
     test_daily_stop_no_stale_or_manual_resume_closes,
     test_basket_stop_retries_unclosed_lots,
     test_fill_price_falls_back_to_user_trades,
+    test_ambiguous_open_filled_is_adopted_with_guards,
+    test_ambiguous_open_never_accepted_expires,
 ]
 
 

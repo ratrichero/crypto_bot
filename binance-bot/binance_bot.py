@@ -706,6 +706,13 @@ def main():
                 # Halt do doi chieu luc khoi dong (lenh treo / algo lech) duoc
                 # kiem tra lai moi 60s -> tu unhalt khi san da sach.
                 try:
+                    if engine.resolve_ambiguous_orders():
+                        dirty = True
+                except binance_safety.BinanceSafetyStop:
+                    raise
+                except Exception as e:
+                    log(f"resolve_ambiguous_orders loi: {e}")
+                try:
                     if engine.recheck_startup_holds():
                         dirty = True
                 except binance_safety.BinanceSafetyStop:

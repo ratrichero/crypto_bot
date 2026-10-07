@@ -2518,7 +2518,13 @@ class BinanceEngine:
                 # We cannot prove whether Binance accepted the MARKET order.
                 # A cooldown alone would permit another entry while the first
                 # request may still fill; halt until positions/open orders are
-                # reconciled by the next startup/operator check.
+                # reconciled (resolve_ambiguous_orders tra lai theo
+                # clientOrderId va nhan lot neu lenh mo thuc ra da khop).
+                self._ambiguous_order = {
+                    "symbol": symbol, "client_order_id": client_order_id,
+                    "qty": qty, "reduce_only": bool(reduce_only),
+                    "ts": time.time(),
+                }
                 self.state["halted"] = True
                 self.state["halt_reason"] = (
                     "ambiguous market order requires reconciliation"
@@ -2658,48 +2664,139 @@ class BinanceEngine:
                 symbol, bside, qty, ps, ref_price=price
             )
             entry = self._fill_price(symbol, oid, price)
-            if side == "long":
-                sl = entry * (1 - sl_pct) if sl_pct else None
-                tp = entry * (1 + tp_pct) if tp_pct else None
-            else:
-                sl = entry * (1 + sl_pct) if sl_pct else None
-                tp = entry * (1 - tp_pct) if tp_pct else None
-            fee = self._fees(qty * entry)   # thay bang phi that ben duoi
-            pos = {
-                "id": self._next_id(),
-                "symbol": symbol, "side": side, "qty": qty, "entry": entry,
-                "notional": notional, "sl": sl, "tp": tp, "tag": tag,
-                "level": level, "opened_at": int(time.time()), "fee_entry": fee,
-                "live": True, "dry": self.dry_run, "ord_id": oid,
-                "client_order_id": client_order_id,
-            }
-            self.state["equity"] -= fee
-            self.state["stats"]["fees"] += fee
-            self.state["positions"].append(pos)
-            if not self.dry_run and self.cfg.get("exchange_protection", False):
-                try:
-                    self._create_exchange_protection(pos)
-                    pos["protection_status"] = "armed"
-                except binance_safety.BinanceSafetyStop:
-                    raise
-                except Exception as protection_error:
-                    # Chan da dat thanh cong duoc GIU; chi chan thieu duoc
-                    # retry (retry_protection). Thieu SL qua deadline -> dong.
-                    self._schedule_protection_retry(pos, protection_error)
-            if not self.dry_run:
-                self._record_entry_fee(pos)
+            pos = self._register_lot(symbol, side, qty, entry, notional,
+                                     sl_pct, tp_pct, tag, level, oid,
+                                     client_order_id)
             self._mark_action_success(key)
             self.log("%s OPEN #%d %s %s entry=%s sl=%s tp=%s ord=%s "
                      "protection=%s"
                      % ("DRY_RUN" if self.dry_run else "LIVE",
-                        pos["id"], symbol, side, entry, sl, tp, oid,
+                        pos["id"], symbol, side, entry, pos["sl"], pos["tp"], oid,
                         pos.get("protection_status", "disabled")))
             return pos, "ok"
         except binance_safety.BinanceSafetyStop:
             raise
         except Exception as e:
+            amb = getattr(self, "_ambiguous_order", None)
+            self._ambiguous_order = None
+            if amb and not amb.get("reduce_only"):
+                amb.update({"side": side, "notional": notional,
+                            "sl_pct": sl_pct, "tp_pct": tp_pct, "tag": tag,
+                            "level": level})
+                self.state.setdefault("ambiguous_orders", []).append(amb)
+                self.log("CRITICAL lenh mo %s %s khong ro da khop chua "
+                         "(clientOrderId=%s) -> halt, tra lai dinh ky de nhan "
+                         "lot neu da khop" % (symbol, side,
+                                              amb["client_order_id"]))
             self._mark_action_failure(key, e)
             return None, "action_failed: %s" % e
+
+    def _register_lot(self, symbol, side, qty, entry, notional, sl_pct,
+                      tp_pct, tag, level, oid, client_order_id):
+        """Ghi 1 lot da khop THAT vao state + dat SL/TP tren san ngay."""
+        if side == "long":
+            sl = entry * (1 - sl_pct) if sl_pct else None
+            tp = entry * (1 + tp_pct) if tp_pct else None
+        else:
+            sl = entry * (1 + sl_pct) if sl_pct else None
+            tp = entry * (1 - tp_pct) if tp_pct else None
+        fee = self._fees(qty * entry)   # thay bang phi that ben duoi
+        pos = {
+            "id": self._next_id(),
+            "symbol": symbol, "side": side, "qty": qty, "entry": entry,
+            "notional": notional, "sl": sl, "tp": tp, "tag": tag,
+            "level": level, "opened_at": int(time.time()), "fee_entry": fee,
+            "live": True, "dry": self.dry_run, "ord_id": oid,
+            "client_order_id": client_order_id,
+        }
+        self.state["equity"] -= fee
+        self.state["stats"]["fees"] += fee
+        self.state["positions"].append(pos)
+        if not self.dry_run and self.cfg.get("exchange_protection", False):
+            try:
+                self._create_exchange_protection(pos)
+                pos["protection_status"] = "armed"
+            except binance_safety.BinanceSafetyStop:
+                raise
+            except Exception as protection_error:
+                # Chan da dat thanh cong duoc GIU; chi chan thieu duoc
+                # retry (retry_protection). Thieu SL qua deadline -> dong.
+                self._schedule_protection_retry(pos, protection_error)
+        if not self.dry_run:
+            self._record_entry_fee(pos)
+        return pos
+
+    def resolve_ambiguous_orders(self, force=False):
+        """Tra lai lenh MO bi timeout mo ho theo clientOrderId.
+
+        Da khop -> nhan lot (qty/gia that tu san) + dat SL/TP ngay; huy/het
+        han khong khop hoac khong ton tai sau ambiguous_order_expire_seconds
+        -> bo. Het danh sach -> go halt 'ambiguous ...' (reconcile_positions
+        se halt lai neu san van lech). Tra ve True neu state thay doi."""
+        items = self.state.get("ambiguous_orders") or []
+        if self.dry_run or not items:
+            return False
+        now = time.time()
+        interval = float(self.cfg.get("ambiguous_order_check_seconds", 30))
+        if not force and now - getattr(self, "_last_ambiguous_check",
+                                       0.0) < interval:
+            return False
+        self._last_ambiguous_check = now
+        expire = float(self.cfg.get("ambiguous_order_expire_seconds", 300))
+        keep, changed = [], False
+        for it in items:
+            symbol, cid = it.get("symbol"), it.get("client_order_id")
+            od = self._find_order_by_client_id(symbol, cid)
+            if not od:
+                if now - float(it.get("ts", now) or now) >= expire:
+                    self.log("RESOLVE lenh mo %s cid=%s khong ton tai tren san "
+                             "sau %.0fs -> bo" % (symbol, cid, expire))
+                    changed = True
+                else:
+                    keep.append(it)
+                continue
+            status = self._order_status(od)
+            try:
+                filled = float(od.get("executedQty") or od.get("filled") or 0)
+            except (TypeError, ValueError):
+                filled = 0.0
+            if filled > 0 and status in ("FILLED", "CLOSED", "CANCELED",
+                                         "CANCELLED", "EXPIRED"):
+                oid = od.get("orderId") or od.get("id")
+                entry = self._order_average(od)
+                if not entry:
+                    summary = self._order_fill_summary(symbol, oid)
+                    entry = summary["avg"] if summary else None
+                if not entry:
+                    keep.append(it)          # chua co gia -> thu lai sau
+                    continue
+                step = (self._filters_for(symbol) or (0,))[0]
+                qty = normalize_qty(filled, step)
+                pos = self._register_lot(
+                    symbol, it["side"], qty, entry,
+                    float(it.get("notional") or qty * entry),
+                    it.get("sl_pct"), it.get("tp_pct"), it.get("tag"),
+                    it.get("level"), oid, cid)
+                self.log("RESOLVE lenh mo mo ho %s cid=%s DA KHOP qty=%s @%s "
+                         "-> nhan lot #%s, protection=%s"
+                         % (symbol, cid, qty, entry, pos["id"],
+                            pos.get("protection_status", "disabled")))
+                changed = True
+            elif status in ("CANCELED", "CANCELLED", "EXPIRED", "REJECTED"):
+                self.log("RESOLVE lenh mo %s cid=%s %s khong khop -> bo"
+                         % (symbol, cid, status))
+                changed = True
+            else:
+                keep.append(it)              # NEW/PARTIALLY_FILLED: cho
+        self.state["ambiguous_orders"] = keep
+        if (not keep and self.state.get("halted") and str(
+                self.state.get("halt_reason") or "").startswith("ambiguous ")):
+            self.state["halted"] = False
+            self.state["halt_reason"] = None
+            self.log("RECOVERY: da doi chieu xong lenh mo mo ho -> unhalt "
+                     "(reconcile_positions van kiem tra san)")
+            changed = True
+        return changed
 
     def _schedule_protection_retry(self, pos, error=None, delay=10.0):
         now = time.time()
