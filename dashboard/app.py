@@ -1817,6 +1817,12 @@ def _tab_config():
     clean, errors = bc.validate(new)
     for e in errors:
         st.error(e)
+    if not errors:
+        n_side, side_notional = bc.same_side_exposure(clean)
+        st.caption("Tối đa cùng một chiều (mọi coin): %d lot grid ≈ $%s "
+                   "notional." % (n_side, format(round(side_notional), ",")))
+        for w in bc.risk_warnings(clean):
+            st.warning("⚠️ " + w)
     changes = bc.diff(base, clean) if not errors else []
     if changes:
         st.markdown("**Thay đổi so với version đang lưu:**")
@@ -1872,9 +1878,58 @@ def _tab_config():
                 st.error("Không khôi phục được: %s" % e)
 
 
+TREND_LABEL = {"down": "🔻 giảm", "up": "🔺 tăng", "neutral": "➖ ngang"}
+
+
+def trend_table(snap):
+    """state['trend'] (bot ghi moi slow tick) -> (bias thi truong, rows)."""
+    snap = snap or {}
+    mkt = snap.get("market") or "BTCUSDT"
+    syms = snap.get("symbols") or {}
+    rows = []
+    for sym in sorted(syms, key=lambda s: (s != mkt, s)):
+        r = syms[sym] or {}
+        b = r.get("bias")
+        ts = r.get("ts")
+        rows.append({
+            "Symbol": sym + (" (thị trường)" if sym == mkt else ""),
+            "Xu hướng": TREND_LABEL.get(b, b),
+            "Chặn mở": {"down": "LONG", "up": "SHORT"}.get(b, "—"),
+            "EMA dốc (×ATR)": r.get("slope_atr"),
+            "BTC biến động %": r.get("move_pct") if sym == mkt else None,
+            "Lý do": r.get("reason") or "",
+            "Lấy nến lúc": _ts_local(datetime.fromtimestamp(
+                float(ts), timezone.utc)) if ts else "—"})
+    return (syms.get(mkt) or {}).get("bias"), rows
+
+
+def _trend_section(cfg):
+    on = [name for key, name in (("trend.market_filter", "xu hướng BTC"),
+                                 ("trend.symbol_filter", "xu hướng từng coin"))
+          if cfg.get(key)]
+    st.markdown("**Lọc xu hướng grid** · %s · trần cùng chiều: %s" % (
+        ("bật " + " + ".join(on)) if on else "TẮT",
+        cfg.get("grid.max_same_side") or "không giới hạn"))
+    snap = (load_state(BINANCE_STATE) or {}).get("trend")
+    if not snap or not snap.get("symbols"):
+        st.info("Chưa có dữ liệu xu hướng (bot cần chạy bản mới).")
+        return
+    mbias, rows = trend_table(snap)
+    if mbias == "down" and cfg.get("trend.market_filter"):
+        st.warning("BTC đang giảm → không mở lot grid LONG mới trên mọi coin.")
+    elif mbias == "up" and cfg.get("trend.market_filter"):
+        st.warning("BTC đang tăng → không mở lot grid SHORT mới trên mọi "
+                   "coin.")
+    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+    st.caption("Chỉ chặn MỞ MỚI phía ngược xu hướng; lot đang mở vẫn chạy tới "
+               "TP/SL. Thiếu dữ liệu một symbol → symbol đó không mở mới.")
+    st.divider()
+
+
 def _tab_scanner():
     row = db_call(bc.load_version, bc.BOT_BINANCE)
     cfg = dict(bc.defaults(), **(row["config"] if row else {}))
+    _trend_section(cfg)
     mode = cfg["scanner.mode"]
     st.caption("Chế độ: **%s** · top K = %s · quét lại mỗi %s phút. %s" % (
         mode, cfg["scanner.top_k"], cfg["scanner.rescan_minutes"],

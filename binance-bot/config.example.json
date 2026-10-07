@@ -112,7 +112,7 @@
  },
  "scanner": {
   "enabled": true,
-  "mode": "observe",
+  "mode": "filter",
   "top_k": 5,
   "rescan_minutes": 15,
   "adx_1h_max": 20.0,

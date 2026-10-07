@@ -187,7 +187,7 @@ PARAMS: Tuple[Param, ...] = (
           0.05, pct=True, apply="new_lots"),
     # ---- Scanner di ngang
     Param("scanner.enabled", "bool", True, "Scanner", "Bật scanner"),
-    Param("scanner.mode", "enum", "observe", "Scanner", "Chế độ",
+    Param("scanner.mode", "enum", "filter", "Scanner", "Chế độ",
           choices=("observe", "filter"),
           help="observe = chỉ quan sát; filter = grid chỉ mở mới trên "
                "symbol đạt chuẩn (top K)."),
@@ -335,6 +335,40 @@ def validate(flat: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
             errors.append("ADX 1h chuyển trend phải ≥ ADX 1h tối đa của "
                           "scanner (nếu không biên vỡ ngay khi dựng)")
     return clean, errors
+
+
+def same_side_exposure(clean: Dict[str, Any]) -> Tuple[int, float]:
+    """(so lot grid toi da cung 1 chieu, notional tuong ung)."""
+    n = int(clean["grid.max_positions"])
+    cap = int(clean["grid.max_same_side"])
+    if cap > 0:
+        n = min(n, cap)
+    return n, n * float(clean["order_margin_usdt"]) * float(clean["leverage"])
+
+
+def risk_warnings(clean: Dict[str, Any]) -> List[str]:
+    """Canh bao (khong chan luu) cho cau hinh de om nhieu lot cung chieu khi
+    thi truong troi 1 chieu (task 34). Dashboard hien thi khi luu."""
+    out: List[str] = []
+    n, notional = same_side_exposure(clean)
+    if int(clean["grid.max_same_side"]) == 0:
+        out.append("Không giới hạn lot grid cùng chiều: có thể ôm tới %d lot "
+                   "× $%s = $%s cùng một chiều. Altcoin giảm đồng loạt là lỗ "
+                   "đồng loạt (vốn $1k: đặt 2)." % (
+                       n, format(round(notional / max(n, 1)), ","),
+                       format(round(notional), ",")))
+    if not clean["trend.market_filter"] and not clean["trend.symbol_filter"]:
+        out.append("Tắt cả hai lớp lọc xu hướng: grid sẽ mua khi thị trường "
+                   "trôi giảm (và bán khi trôi tăng) không giới hạn chiều.")
+    if clean["grid.engine"] == "classic" and (
+            clean["scanner.mode"] != "filter" or not clean["scanner.enabled"]):
+        out.append("Scanner không lọc: grid classic mở trên MỌI coin có ADX "
+                   "15m thấp, kể cả coin đang trôi chậm một chiều. Nên chọn "
+                   "chế độ filter (chỉ top K coin đi ngang).")
+    if int(clean["grid.max_positions"]) > 3:
+        out.append("Số lot grid tối đa = %d (> 3, mức đề xuất cho vốn ~$1k)."
+                   % int(clean["grid.max_positions"]))
+    return out
 
 
 def apply(cfg: dict, flat: Dict[str, Any]) -> List[str]:

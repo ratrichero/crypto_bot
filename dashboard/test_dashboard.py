@@ -217,7 +217,7 @@ def test_scanner_tab_levels():
         def markdown(self, *a, **k):
             pass
 
-        warning = info = markdown
+        warning = info = divider = markdown
 
     def scan(sym, w, passed=True):
         return {"symbol": sym, "passed": passed, "score": 70, "reasons": [],
@@ -230,10 +230,11 @@ def test_scanner_tab_levels():
     def db_call(fn, *a):
         return scans if fn is bc.latest_scans else None
     fst = FakeSt()
-    ns = load("_tab_scanner", extra={
+    ns = load("_tab_scanner", "_trend_section", "trend_table", "TREND_LABEL",
+              "load_state", extra={
         "bc": bc, "range_grid": range_grid, "st": fst, "db_call": db_call,
         "pd": type("PD", (), {"DataFrame": staticmethod(lambda r: r)}),
-        "_ts_local": lambda t: t})
+        "_ts_local": lambda t: t, "BINANCE_STATE": "/nonexistent/state.json"})
     ns["_tab_scanner"]()
     rows = {r["Symbol"]: r for r in fst.frames[0]}
     check("cot Tang/phia (step 1%, 2 tang cau hinh)",
@@ -244,6 +245,85 @@ def test_scanner_tab_levels():
           and rows["FAIL"]["Đạt"] == "—", rows)
     check("chu thich so tang toi thieu", any("< 1 tầng/phía" in c
                                              for c in fst.captions))
+
+
+def test_trend_section():
+    print("== Scanner tab: muc Loc xu huong grid (task 34) ==")
+    import sys
+    import tempfile as _tf
+    root = os.path.dirname(HERE)
+    if os.path.join(root, "db") not in sys.path:
+        sys.path.insert(0, os.path.join(root, "db"))
+    import bot_config as bc
+
+    class FakeSt:
+        def __init__(self):
+            self.frames, self.warnings, self.infos, self.md = [], [], [], []
+
+        def dataframe(self, df, **kw):
+            self.frames.append(df)
+
+        def warning(self, t):
+            self.warnings.append(t)
+
+        def info(self, t):
+            self.infos.append(t)
+
+        def markdown(self, t, **k):
+            self.md.append(t)
+
+        def caption(self, *a, **k):
+            pass
+
+        divider = caption
+
+    with _tf.TemporaryDirectory() as d:
+        sp = os.path.join(d, "state.json")
+        snap = {"market": "BTCUSDT", "ts": 1.7e9, "symbols": {
+            "ETHUSDT": {"bias": "neutral", "slope_atr": 0.1, "reason": "",
+                        "ts": 1.7e9, "move_pct": None},
+            "BTCUSDT": {"bias": "down", "slope_atr": -0.9, "move_pct": -1.8,
+                        "reason": "giảm 1.80% trong ~4h", "ts": 1.7e9},
+            "SOLUSDT": {"bias": "up", "slope_atr": 0.8, "reason": "x",
+                        "ts": 1.7e9}}}
+        json.dump({"trend": snap}, open(sp, "w"))
+        fst = FakeSt()
+        ns = load("_trend_section", "trend_table", "TREND_LABEL", "load_state",
+                  extra={"st": fst, "BINANCE_STATE": sp,
+                         "pd": type("PD", (), {
+                             "DataFrame": staticmethod(lambda r: r)}),
+                         "_ts_local": lambda t: t.strftime("%H:%M")})
+        cfg = bc.defaults()
+        ns["_trend_section"](cfg)
+        rows = fst.frames[0]
+        check("BTC (thi truong) dung dau, cot chan mo dung",
+              rows[0]["Symbol"] == "BTCUSDT (thị trường)"
+              and rows[0]["Chặn mở"] == "LONG"
+              and rows[0]["BTC biến động %"] == -1.8
+              and {r["Symbol"]: r["Chặn mở"] for r in rows[1:]}
+              == {"ETHUSDT": "—", "SOLUSDT": "SHORT"}, rows)
+        check("BTC giam + market_filter bat -> canh bao chan long",
+              any("BTC đang giảm" in w for w in fst.warnings), fst.warnings)
+        check("tieu de: lop bat + tran cung chieu",
+              "xu hướng BTC + xu hướng từng coin" in fst.md[0]
+              and "trần cùng chiều: 2" in fst.md[0], fst.md)
+        fst2 = FakeSt()
+        ns["st"] = fst2
+        ns["_trend_section"](dict(cfg, **{"trend.market_filter": False,
+                                          "trend.symbol_filter": False,
+                                          "grid.max_same_side": 0}))
+        check("tat loc -> tieu de TAT, khong canh bao BTC",
+              "TẮT" in fst2.md[0] and "không giới hạn" in fst2.md[0]
+              and not fst2.warnings, (fst2.md, fst2.warnings))
+        fst3 = FakeSt()
+        ns["st"] = fst3
+        ns["BINANCE_STATE"] = os.path.join(d, "nope.json")
+        ns["_trend_section"](cfg)
+        check("chua co state -> info, khong loi", fst3.infos
+              and not fst3.frames)
+    check("config tab hien canh bao rui ro + notional cung chieu",
+          "bc.risk_warnings(clean)" in SRC
+          and "bc.same_side_exposure(clean)" in SRC)
 
 
 def test_session_cookie():
@@ -399,7 +479,7 @@ def test_helius_key():
 
 
 TESTS = [test_session_cookie, test_helius_key, test_sol_wallet, test_live_radar_halt_status, test_config_helpers,
-         test_scanner_tab_levels, test_monitor_pm2]
+         test_scanner_tab_levels, test_trend_section, test_monitor_pm2]
 
 
 if __name__ == "__main__":

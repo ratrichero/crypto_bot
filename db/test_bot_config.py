@@ -58,6 +58,29 @@ _, err = bc.validate(dict(d, **{"khong.ton.tai": 1}))
 check("khoa la bi tu choi", err and "không tồn tại" in err[0], err)
 _, err = bc.validate(dict(d, **{"scanner.mode": "yolo"}))
 check("enum sai bi chan", err, err)
+# ---- task 34: mac dinh chong om nhieu lot cung chieu + canh bao
+check("default D: scanner filter, max_positions 3, max_same_side 2, "
+      "loc xu huong bat", d["scanner.mode"] == "filter"
+      and d["grid.max_positions"] == 3 and d["grid.max_same_side"] == 2
+      and d["trend.market_filter"] and d["trend.symbol_filter"])
+check("default khong co canh bao rui ro", bc.risk_warnings(clean) == [],
+      bc.risk_warnings(clean))
+check("same_side_exposure: min(max_positions, max_same_side) x notional",
+      bc.same_side_exposure(clean) == (2, 2000.0))
+risky, _ = bc.validate(dict(d, **{"grid.max_same_side": 0,
+                                  "grid.max_positions": 10,
+                                  "max_total_positions": 10,
+                                  "scanner.mode": "observe",
+                                  "trend.market_filter": False,
+                                  "trend.symbol_filter": False}))
+w = bc.risk_warnings(risky)
+check("cau hinh kieu VPS (10 lot, observe, khong tran, tat loc) -> 4 canh bao",
+      len(w) == 4 and "$10,000" in w[0] and "filter" in w[2], w)
+check("same_side_exposure khong tran -> max_positions",
+      bc.same_side_exposure(risky) == (10, 10000.0))
+check("range engine khong canh bao scanner (range luon loc)",
+      not any("Scanner" in x for x in bc.risk_warnings(
+          dict(risky, **{"grid.engine": "range"}))))
 cfg = {"grid": {"step_pct": 0.005}, "leverage": 5}
 changed = bc.apply(cfg, dict(clean))
 check("apply ghi tai cho + giu khoa khong quan ly",
