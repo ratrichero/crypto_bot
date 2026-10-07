@@ -761,13 +761,10 @@ class BinanceEngine:
                 actual = self._aggregate_positions(rows).get(
                     (pos["symbol"], pos["side"]), 0.0
                 )
-                expected = float(pos.get("qty", 0) or 0)
-                step = 0.0
-                try:
-                    step = float((self._filters_for(pos["symbol"]) or (0,))[0] or 0)
-                except Exception:
-                    pass
-                tolerance = max(step * 1.1, abs(expected) * 0.001, 1e-10)
+                # Binance reports ONE aggregate per Hedge leg; compare it with
+                # the sum of every local lot on that leg, not this lot alone.
+                expected = self._local_qty(pos["symbol"], pos["side"])
+                tolerance = self._qty_tolerance(pos["symbol"], expected)
                 if actual <= 0 or abs(actual - expected) > tolerance:
                     raise RuntimeError(
                         "Hedge position changed while protection was absent "
@@ -939,6 +936,21 @@ class BinanceEngine:
             key = (symbol, position_side)
             result[key] = result.get(key, 0.0) + abs(amount)
         return result
+
+    def _local_qty(self, symbol, side, exclude_id=None):
+        """Sum of local lots for one Hedge leg (Binance only sees the sum)."""
+        return sum(float(p.get("qty", 0) or 0)
+                   for p in self.state.get("positions", [])
+                   if p.get("symbol") == symbol and p.get("side") == side
+                   and (exclude_id is None or p.get("id") != exclude_id))
+
+    def _qty_tolerance(self, symbol, qty):
+        step = 0.0
+        try:
+            step = float((self._filters_for(symbol) or (0,))[0] or 0)
+        except Exception:
+            pass
+        return max(step * 1.1, abs(float(qty or 0)) * 0.001, 1e-10)
 
     def reconcile_positions(self, force=False, rows=None):
         """Compare local grid lots with exchange aggregate Hedge positions.
@@ -1736,6 +1748,10 @@ class BinanceEngine:
         if cooldown:
             return None
         try:
+            # Other local lots on the same Hedge leg stay open; the exchange
+            # aggregate after this close must still contain them.
+            remaining_expected = self._local_qty(symbol, side,
+                                                 exclude_id=pos.get("id"))
             self._cancel_exchange_protection(pos)
             bside = "sell" if side == "long" else "buy"
             ps = "LONG" if side == "long" else "SHORT"
@@ -1775,11 +1791,20 @@ class BinanceEngine:
                     self._private_call("private:account",
                                        self.ex.fetch_positions, _weight=5)
                 ).get((symbol, side), 0)
-                # Cho phep sai so nho do lam tron
-                if abs(actual) > pos["qty"] * 0.01:
+                # Cho phep sai so nho do lam tron. San gop moi lot cung
+                # (symbol, side): sau khi dong, phan con lai phai bang tong
+                # cac lot khac, khong phai 0.
+                tolerance = max(self._qty_tolerance(symbol, pos["qty"]),
+                                float(pos["qty"]) * 0.01)
+                if actual > remaining_expected + tolerance:
                     raise RuntimeError(
-                        f"close partial: san con {actual}, bot nghi {pos['qty']} "
+                        f"close partial: san con {actual}, cac lot khac "
+                        f"{remaining_expected}, lot nay {pos['qty']} "
                         f"-> se retry")
+                if actual < remaining_expected - tolerance:
+                    self.log("WARNING close #%s: san con %s < cac lot khac %s; "
+                             "reconcile/sync se doi chieu" %
+                             (pos["id"], actual, remaining_expected))
             rec = {
                 "id": pos["id"], "symbol": symbol, "side": side,
                 "tag": pos["tag"], "entry": round(pos["entry"], 6),
