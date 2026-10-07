@@ -828,7 +828,12 @@ def describe(item, head):
     act = item["action"]
     tag = "[tien that] " if a.get("live") else ""
     if act == "missing":
-        return "%s: %schua chay duoi pm2 (git up setup)" % (a["name"], tag)
+        if a.get("live"):
+            return ("%s: %schua chay duoi pm2 -> git up setup --only %s "
+                    "(app tien that khong tu start)" % (a["name"], tag,
+                                                        a["name"]))
+        return "%s: chua chay duoi pm2 -> app moi, git up tu start" % (
+            a["name"])
     if act == "restart":
         return "%s: %sCAN RESTART - %s" % (a["name"], tag,
                                            "; ".join(item["reasons"]))
@@ -913,6 +918,31 @@ def start_or_restart(cfg, app, recreate, exists):
     return p.get("restarts") or 0
 
 
+def can_auto_start(cfg, app):
+    """App CHUA co trong pm2 (vd. app moi them vao APPS): git up duoc tu
+    start khong? -> (True, "") | (False, ly_do). App tien that luon phai qua
+    git up setup (kiem tra vi/key, chuyen tu systemd co chu dich)."""
+    name = app["name"]
+    if app.get("live"):
+        return False, ("app tien that -> chay git up setup --only %s"
+                       % name)
+    unit = systemd_unit(name)
+    if unit and (unit.get("ActiveState") in ("active", "activating",
+                                             "reloading")
+                 or unit.get("UnitFileState") == "enabled"):
+        return False, ("dang co service systemd %s.service -> git up setup "
+                       "--only %s de chuyen sang pm2" % (name, name))
+    errors, _warns = check_app_env(app, unit)
+    if errors:
+        return False, "; ".join(errors)
+    others = foreign_processes(app, managed_pids(pm2_list(cfg)))
+    if others:
+        return False, ("process ngoai pm2 dang chay cung app (pid %s) -> "
+                       "dung truoc, KHONG chay trung 2 ban"
+                       % ", ".join(str(pid) for pid, _ in others))
+    return True, ""
+
+
 def append_history(rec):
     rec["ts"] = datetime.now().isoformat(timespec="seconds")
     with open(_state_path("history.log"), "a") as f:
@@ -975,6 +1005,8 @@ def cmd_deploy(args, cfg):
         (skip if item["action"] == "skip" else warn)(describe(item, head))
 
     todo = [i for i in plan if i["action"] == "restart"]
+    new_apps = [i for i in plan if i["action"] == "missing"
+                and not i["app"].get("live")]
     results = {}
     failed = False
     if migrate_error and todo:
@@ -985,11 +1017,41 @@ def cmd_deploy(args, cfg):
     elif migrate_error:
         failed = True
     if args.no_restart or args.dry_run:
-        if todo:
-            skip("%s: khong restart" % ("--dry-run" if args.dry_run
-                                        else "--no-restart"))
-        todo = []
-    tree = TreeReader(head) if todo else None
+        if todo or new_apps:
+            skip("%s: khong restart/start" % ("--dry-run" if args.dry_run
+                                              else "--no-restart"))
+        todo, new_apps = [], []
+    if migrate_error:
+        new_apps = []
+    tree = TreeReader(head) if (todo or new_apps) else None
+    for item in new_apps:
+        a = item["app"]
+        name = a["name"]
+        good, why = can_auto_start(cfg, a)
+        if not good:
+            bad("%s: KHONG tu start - %s" % (name, why))
+            results[name] = "not-started"
+            failed = True
+            continue
+        good, msg = check_syntax(a, tree)
+        if not good:
+            bad("%s: loi cu phap Python -> KHONG start:\n%s" % (name, msg))
+            results[name] = "syntax-error"
+            failed = True
+            continue
+        info("  start app moi %s ..." % name)
+        try:
+            base = start_or_restart(cfg, a, False, False)
+        except DeployError as e:
+            bad(str(e))
+            results[name] = "error"
+            failed = True
+            continue
+        if health_check(cfg, a, base):
+            results[name] = "started"
+        else:
+            results[name] = "unhealthy"
+            failed = True
     for item in todo:
         a = item["app"]
         name = a["name"]
@@ -1034,11 +1096,11 @@ def cmd_deploy(args, cfg):
     info("  HEAD %s%s" % (short(head), "" if old == head
                          else " (truoc: %s)" % short(old)))
     for name, res in results.items():
-        (ok if res == "restarted" else bad if res != "skipped" else warn)(
-            "%s: %s" % (name, res))
+        (ok if res in ("restarted", "started")
+         else bad if res != "skipped" else warn)("%s: %s" % (name, res))
     if not results:
         skip("khong app nao duoc restart")
-    n_ok = sum(1 for r in results.values() if r == "restarted")
+    n_ok = sum(1 for r in results.values() if r in ("restarted", "started"))
     summary = ("xong trong %ds - code:%s thu-vien:%d migrate:%s build:%d "
                "restart:%d/%d%s" % (
                    time.time() - started, short(head) if old != head else "-",

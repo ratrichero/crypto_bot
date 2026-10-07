@@ -106,8 +106,12 @@ Bỏ qua mọi dấu "đã làm": chạy lại `pip install`, migrate, build, v�
 Tên app giữ nguyên tên service systemd cũ: `muse-dashboard`, `muse-radar`,
 `muse-live-trader`, `muse-binance`.
 App mới (10/2026): `muse-live-equity` (snapshot equity ví Solana live mỗi 15s cho
-tab Live Radar; chỉ đọc, không cần private key). Lần đầu khởi động:
-`git up setup --only muse-live-equity`.
+tab Live Radar; chỉ đọc, không cần private key).
+
+App mới thêm vào `APPS` mà chưa có trong pm2: `git up` **tự start** nếu không phải
+app tiền thật, không có service systemd cùng tên đang chạy/enabled, env hợp lệ và
+không có process trùng ngoài pm2 (không đạt → báo lý do, mã lỗi 1). App tiền thật
+mới vẫn phải qua `git up setup --only <app>`.
 
 - Dừng sạch: pm2 gửi SIGINT. Bot làm nốt vòng lặp hoặc swap đang chạy, lưu
   state rồi thoát. `kill_timeout` là 60s cho Binance, 180s cho Live Trader.

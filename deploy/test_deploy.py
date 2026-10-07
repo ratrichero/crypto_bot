@@ -949,6 +949,120 @@ def test_migrate_error_blocks_restart():
         shutil.rmtree(tmp)
 
 
+def test_auto_start_new_app():
+    print("\n[git up tu start app moi (khong phai tien that)]")
+    tmp = _fake_repo()
+    commit(tmp, "c1")
+    names = ("check_branch", "step_pull", "step_deps", "step_migrate",
+             "step_build", "plan_restarts", "start_or_restart", "pm2",
+             "acquire_lock", "health_check", "check_syntax",
+             "step_switch_branch", "can_auto_start")
+    saved = {n: getattr(d, n) for n in names}
+    started = []
+    try:
+        head = sh(["git", "rev-parse", "HEAD"], tmp)
+        eq = {"name": "muse-live-equity", "live": False}
+        lt = {"name": "muse-live-trader", "live": True}
+        d.check_branch = lambda cfg: "main"
+        d.step_pull = lambda cfg, b, dry: (head, head, False)
+        d.step_deps = lambda *a: set()
+        d.step_build = lambda *a, **k: set()
+        d.step_migrate = lambda cfg, dry, force=False: "skip"
+        d.plan_restarts = lambda *a, **k: [
+            {"app": eq, "info": None, "reasons": [], "recreate": False,
+             "action": "missing", "running": None},
+            {"app": lt, "info": None, "reasons": [], "recreate": False,
+             "action": "missing", "running": None}]
+        d.start_or_restart = lambda cfg, a, r, e: started.append(
+            (a["name"], r, e)) or 0
+        d.health_check = lambda *a: True
+        d.check_syntax = lambda a, t: (True, "")
+        d.pm2 = lambda *a, **k: None
+        d.acquire_lock = lambda: None
+        d.can_auto_start = lambda cfg, a: (True, "")
+
+        class A(object):
+            only = None
+            dry_run = no_restart = restart = yes = force_deps = False
+            force = False
+            resume_from = None
+        with use_root(tmp):
+            rc = d.cmd_deploy(A(), {"APPS": "muse-live-equity"})
+        check("app moi -> pm2 start (exists=False); app tien that KHONG",
+              started == [("muse-live-equity", False, False)] and rc == 0,
+              (started, rc))
+        del started[:]
+        a = A()
+        a.dry_run = True
+        with use_root(tmp):
+            d.cmd_deploy(a, {"APPS": "muse-live-equity"})
+        check("--dry-run -> khong start", started == [], started)
+        a = A()
+        a.no_restart = True
+        with use_root(tmp):
+            d.cmd_deploy(a, {"APPS": "muse-live-equity"})
+        check("--no-restart -> khong start", started == [], started)
+        d.can_auto_start = lambda cfg, a: (False, "dang co service systemd")
+        with use_root(tmp):
+            rc = d.cmd_deploy(A(), {"APPS": "muse-live-equity"})
+        check("khong du dieu kien -> khong start, ma loi 1",
+              started == [] and rc == 1, (started, rc))
+        d.can_auto_start = lambda cfg, a: (True, "")
+        d.health_check = lambda *a: False
+        with use_root(tmp):
+            rc = d.cmd_deploy(A(), {"APPS": "muse-live-equity"})
+        check("start nhung khong on dinh -> ma loi 1", rc == 1, rc)
+        d.health_check = lambda *a: True
+
+        def boom(cfg, dry, force=False):
+            raise d.DeployError("migrate LOI")
+        d.step_migrate = boom
+        del started[:]
+        with use_root(tmp):
+            d.cmd_deploy(A(), {"APPS": "muse-live-equity"})
+        check("migrate loi -> khong start app moi", started == [], started)
+    finally:
+        for n, f in saved.items():
+            setattr(d, n, f)
+        shutil.rmtree(tmp)
+
+    # can_auto_start that (gia systemd/env/process)
+    saved = {n: getattr(d, n) for n in ("systemd_unit", "check_app_env",
+                                         "foreign_processes", "pm2_list")}
+    try:
+        d.pm2_list = lambda cfg: {}
+        d.systemd_unit = lambda name: None
+        d.check_app_env = lambda app, unit: ([], [])
+        d.foreign_processes = lambda app, pids: []
+        app = {"name": "muse-live-equity", "live": False}
+        check("du dieu kien -> True", d.can_auto_start({}, app) == (True, ""))
+        ok_, why = d.can_auto_start({}, dict(app, live=True))
+        check("app tien that -> False + huong dan setup",
+              not ok_ and "git up setup --only" in why, why)
+        d.systemd_unit = lambda name: {"ActiveState": "active"}
+        check("systemd dang chay -> False",
+              not d.can_auto_start({}, app)[0])
+        d.systemd_unit = lambda name: {"ActiveState": "inactive",
+                                       "UnitFileState": "enabled"}
+        check("systemd enabled -> False", not d.can_auto_start({}, app)[0])
+        d.systemd_unit = lambda name: None
+        d.check_app_env = lambda app, unit: (["khong doc duoc ENV_FILE"], [])
+        check("loi env -> False", not d.can_auto_start({}, app)[0])
+        d.check_app_env = lambda app, unit: ([], [])
+        d.foreign_processes = lambda app, pids: [(123, "python x.py")]
+        ok_, why = d.can_auto_start({}, app)
+        check("process ngoai pm2 -> False", not ok_ and "123" in why, why)
+        check("describe: app moi / app tien that",
+              "git up tu start" in d.describe(
+                  {"app": app, "info": None, "action": "missing"}, "h")
+              and "khong tu start" in d.describe(
+                  {"app": dict(app, live=True), "info": None,
+                   "action": "missing"}, "h"))
+    finally:
+        for n, f in saved.items():
+            setattr(d, n, f)
+
+
 def test_switch_branch():
     print("\n[git up --branch: doi nhanh deploy]")
     tmp = tempfile.mkdtemp()
@@ -1042,6 +1156,7 @@ def main():
     test_step_deps()
     test_step_migrate()
     test_migrate_error_blocks_restart()
+    test_auto_start_new_app()
     test_reflog_real()
     test_step_pull()
     test_switch_branch()

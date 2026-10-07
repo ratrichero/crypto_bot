@@ -195,5 +195,5 @@ Tat: `"tx_accounting": false` trong config.live.json.
 Mỗi 15s ghi `equity_snapshots(system='radar_live')` = SOL trong ví × giá SOL + token
 của vị thế đang mở (giá Jupiter; thiếu giá → giá vào). Tab Live Radar vẽ "Equity ví
 6h qua" giống tab Binance LIVE. Chỉ đọc (Helius getBalance + Jupiter price), không
-cần private key. Lần đầu: `git up setup --only muse-live-equity`; log:
+cần private key. `git up` tự start app này lần đầu; log:
 `pm2 logs muse-live-equity`.

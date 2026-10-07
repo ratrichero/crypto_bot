@@ -201,6 +201,13 @@ def main():
         log("ERROR: thieu %s" % ("vi (SOL_WALLET/config.live.json)"
                                  if not wallet else "DATABASE_URL"))
         raise SystemExit(1)
+    try:
+        import psycopg  # noqa: F401
+    except ImportError:
+        log("ERROR: python nay thieu psycopg (%s) -> pip install "
+            "'psycopg[binary]>=3.1' (meme-radar/requirements.txt)"
+            % sys.executable)
+        raise SystemExit(1)
     jk = jupiter_key()
     sn = Snapper(helius, wallet, jk, url)
     log("live_equity_snap start: system=%s, moi %gs, vi %s...%s, RPC %s, "
