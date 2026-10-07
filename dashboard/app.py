@@ -611,6 +611,33 @@ def live_trade_kpi_rows(trades):
     return rows
 
 
+def live_trade_fee(t):
+    """(phi_mang_usd, truoc_phi_usd) cua 1 lenh live, hoac (None, None) neu
+    bot chua ghi du phi (lenh cu / co leg uoc tinh). realized_usd DA tru phi
+    mang (bot tinh tu so du SOL); app vi thuong hien so truoc phi."""
+    if not t.get("fee_known") or t.get("fee_usd") is None:
+        return None, None
+    try:
+        fee = float(t["fee_usd"])
+        return fee, float(t.get("realized_usd") or 0) + fee
+    except (TypeError, ValueError):
+        return None, None
+
+
+def live_fee_summary(trades):
+    """-> (so_lenh_co_phi, tong_phi, tong_rong_cua_lenh_do, tong_truoc_phi)."""
+    n, fee, net, gross = 0, 0.0, 0.0, 0.0
+    for t in trades:
+        f, g = live_trade_fee(t)
+        if f is None:
+            continue
+        n += 1
+        fee += f
+        net += float(t.get("realized_usd") or 0)
+        gross += g
+    return n, fee, net, gross
+
+
 def filter_live_trades(trades, days, live_only=False):
     if live_only:
         trades = [t for t in trades if t.get("mode") == "live"]
@@ -666,6 +693,18 @@ def live_radar_kpi_frag(days):
     # Chi tinh lenh tien that (mode=live), khong tron dry-run
     trades = filter_live_trades(load_live_trades(), days, live_only=True)
     kpi_cards("Hieu suat live (tien that)", live_trade_kpi_rows(trades))
+    n_fee, fee, net_f, gross_f = live_fee_summary(trades)
+    if n_fee:
+        st.caption(
+            f"P&L rong = SOL that nhan/chi, DA tru phi mang. {n_fee}/"
+            f"{len(trades)} lenh co du lieu phi: rong {net_f:+.2f} U · phi "
+            f"mang {fee:.2f} U · truoc phi {gross_f:+.2f} U (app vi thuong "
+            "hien so truoc phi). Doi chieu tung tx: meme-radar/"
+            "reconcile_wallet.py")
+    else:
+        st.caption("P&L rong = SOL that nhan/chi, DA tru phi mang (app vi "
+                   "thuong hien so truoc phi -> lech vai cent/lenh). Doi "
+                   "chieu tung tx: meme-radar/reconcile_wallet.py")
     df = daily_df(live_trade_kpi_rows(trades))
     pnl_charts(df, "Live Radar")
 
@@ -747,11 +786,16 @@ def live_radar_trades_frag(days):
             "symbol": t.get("symbol"),
             "mode": t.get("mode"),
             "net": round(float(t.get("realized_usd") or 0), 2),
+            "fee": (round(live_trade_fee(t)[0], 3)
+                    if live_trade_fee(t)[0] is not None else None),
+            "gross": (round(live_trade_fee(t)[1], 2)
+                      if live_trade_fee(t)[1] is not None else None),
             "reason": t.get("reason"),
         })
     trades_table(rows,
                  {"closed_at": "Dong luc", "symbol": "Symbol",
                   "mode": "Che do", "net": "P&L rong (U)",
+                  "fee": "Phi mang (U)", "gross": "Truoc phi (U)",
                   "reason": "Ly do"},
                  "50 lenh live gan nhat")
 

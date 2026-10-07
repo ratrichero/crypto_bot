@@ -502,9 +502,31 @@ def test_helius_key():
           "/home/ubuntu/muse_bot" not in code)
 
 
+def test_live_fee():
+    print("== Live radar: phi mang / truoc phi (doi chieu app vi) ==")
+    ns = load("live_trade_fee", "live_fee_summary")
+    f, summ = ns["live_trade_fee"], ns["live_fee_summary"]
+    check("lenh cu (khong fee) -> None", f({"realized_usd": 1}) == (None, None))
+    check("fee_known False -> None",
+          f({"realized_usd": 1, "fee_usd": 0.1, "fee_known": False})
+          == (None, None))
+    fee, gross = f({"realized_usd": -0.38, "fee_usd": 0.09, "fee_known": True})
+    check("truoc phi = rong + phi", abs(fee - 0.09) < 1e-9
+          and abs(gross - (-0.29)) < 1e-9, (fee, gross))
+    check("fee rac -> None", f({"fee_usd": "x", "fee_known": True})
+          == (None, None))
+    n, fe, net, gr = summ([
+        {"realized_usd": -0.38, "fee_usd": 0.09, "fee_known": True},
+        {"realized_usd": 7.25, "fee_usd": 0.11, "fee_known": True},
+        {"realized_usd": 1.0}])
+    check("tong chi tinh lenh co phi", n == 2 and abs(fe - 0.2) < 1e-9
+          and abs(net - 6.87) < 1e-9 and abs(gr - 7.07) < 1e-9,
+          (n, fe, net, gr))
+
+
 TESTS = [test_session_cookie, test_helius_key, test_sol_wallet, test_live_radar_halt_status, test_config_helpers,
          test_scanner_tab_levels, test_trend_section, test_bot_runtime_note,
-         test_monitor_pm2]
+         test_monitor_pm2, test_live_fee]
 
 
 if __name__ == "__main__":
