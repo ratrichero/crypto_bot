@@ -12,6 +12,7 @@ import copy
 import json
 import os
 import queue as queue_mod
+import signal
 import subprocess
 import threading
 import time
@@ -615,7 +616,46 @@ def handle_sells(st, new_sells, now):
                 f"xa -> smart exit")
 
 
+# Dung sach khi nhan SIGINT/SIGTERM (pm2 stop/restart, Ctrl+C): chi dat co,
+# thoat GIUA 2 vong lap -> khong cat ngang swap/ghi state. Lan 2 -> dung ngay.
+_SHUTDOWN = {"signal": None}
+
+
+def _request_shutdown(signum, frame):
+    if _SHUTDOWN["signal"] is not None:
+        raise KeyboardInterrupt
+    _SHUTDOWN["signal"] = signum
+    try:
+        name = signal.Signals(signum).name
+    except Exception:
+        name = str(signum)
+    log("%s -> dung sau vong lap hien tai (gui lan nua de dung ngay)" % name)
+
+
+def install_signal_handlers():
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, _request_shutdown)
+        except (ValueError, OSError):      # khong o main thread
+            pass
+
+
+def shutdown_requested():
+    return _SHUTDOWN["signal"] is not None
+
+
+def sleep_unless_shutdown(seconds):
+    """Ngu tung nhip ngan de dung nhanh khi co tin hieu."""
+    end = time.time() + max(0.0, float(seconds))
+    while not shutdown_requested():
+        left = end - time.time()
+        if left <= 0:
+            return
+        time.sleep(min(0.5, left))
+
+
 def main():
+    install_signal_handlers()
     st = load_state()
     seen = set(st["seen"])
     log(f"Radar start. chain={CFG['chain']} poll={CFG['poll_seconds']}s PAPER MODE")
@@ -630,8 +670,9 @@ def main():
             log(f"ws feed khong khoi dong duoc: {e}")
     while True:
         try:
-            if os.path.exists(STOP_P):
-                log("STOP -> shutdown")
+            if os.path.exists(STOP_P) or shutdown_requested():
+                log("STOP -> shutdown" if os.path.exists(STOP_P)
+                    else "signal -> shutdown (da luu state)")
                 ws_stop.set()
                 save_state(st)
                 return
@@ -754,7 +795,7 @@ def main():
             save_state(st)
         except Exception:
             log("LOOP ERROR:\n" + traceback.format_exc())
-        time.sleep(CFG["poll_seconds"])
+        sleep_unless_shutdown(CFG["poll_seconds"])
 
 
 if __name__ == "__main__":

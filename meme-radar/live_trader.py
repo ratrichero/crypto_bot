@@ -28,6 +28,7 @@ import json
 import math
 import os
 import re
+import signal
 import sys
 import time
 import traceback
@@ -2410,7 +2411,46 @@ class LiveTrader:
         return "paused" if paused else "ok"
 
 
+# Dung sach khi nhan SIGINT/SIGTERM (pm2 stop/restart, Ctrl+C): chi dat co,
+# thoat GIUA 2 vong lap -> khong cat ngang swap/ghi state. Lan 2 -> dung ngay.
+_SHUTDOWN = {"signal": None}
+
+
+def _request_shutdown(signum, frame):
+    if _SHUTDOWN["signal"] is not None:
+        raise KeyboardInterrupt
+    _SHUTDOWN["signal"] = signum
+    try:
+        name = signal.Signals(signum).name
+    except Exception:
+        name = str(signum)
+    log("%s -> dung sau vong lap hien tai (gui lan nua de dung ngay)" % name)
+
+
+def install_signal_handlers():
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, _request_shutdown)
+        except (ValueError, OSError):      # khong o main thread
+            pass
+
+
+def shutdown_requested():
+    return _SHUTDOWN["signal"] is not None
+
+
+def sleep_unless_shutdown(seconds):
+    """Ngu tung nhip ngan de dung nhanh khi co tin hieu."""
+    end = time.time() + max(0.0, float(seconds))
+    while not shutdown_requested():
+        left = end - time.time()
+        if left <= 0:
+            return
+        time.sleep(min(0.5, left))
+
+
 def main():
+    install_signal_handlers()
     cfg = load_config()
     if cfg["mode"] not in ("dry_run", "live"):
         raise SystemExit(f"FATAL: mode '{cfg['mode']}' khong hop le "
@@ -2419,10 +2459,11 @@ def main():
     log(f"LiveTrader start mode={cfg['mode']} "
         f"size=${cfg['trade_size_usd']} maxpos={cfg['max_positions']} "
         f"slippage={cfg['slippage_bps']}bps")
-    while True:
+    while not shutdown_requested():
         if trader.run_once() == "stop":
             return
-        time.sleep(cfg["loop_seconds"])
+        sleep_unless_shutdown(cfg["loop_seconds"])
+    log("LiveTrader: signal -> dung (giua 2 vong lap)")
 
 
 if __name__ == "__main__":

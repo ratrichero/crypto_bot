@@ -721,6 +721,52 @@ def test_close_empty_script():
           == [8, 8, 3])
 
 
+def test_graceful_signal_shutdown():
+    """pm2 stop/restart gui SIGINT: vong run_once dang chay phai xong,
+    khong vong moi, main() tra ve binh thuong (khong KeyboardInterrupt)."""
+    import signal as _signal
+    print("\n[dung sach khi nhan SIGINT/SIGTERM]")
+    calls = []
+
+    class FakeTrader:
+        def __init__(self, cfg):
+            pass
+
+        def run_once(self):
+            calls.append("start")
+            os.kill(os.getpid(), _signal.SIGINT)    # giua luc swap
+            calls.append("done")
+            return "ok"
+
+    saved = (lt.LiveTrader, lt.load_config, lt._SHUTDOWN["signal"],
+             _signal.getsignal(_signal.SIGINT),
+             _signal.getsignal(_signal.SIGTERM))
+    lt.LiveTrader = FakeTrader
+    lt.load_config = lambda: {"mode": "dry_run", "trade_size_usd": 1,
+                              "max_positions": 1, "slippage_bps": 1,
+                              "loop_seconds": 30}
+    lt._SHUTDOWN["signal"] = None
+    err = None
+    t0 = lt.time.time()
+    try:
+        lt.main()
+    except BaseException as e:            # KeyboardInterrupt = loi
+        err = e
+    finally:
+        lt.LiveTrader, lt.load_config, lt._SHUTDOWN["signal"] = saved[:3]
+        _signal.signal(_signal.SIGINT, saved[3])
+        _signal.signal(_signal.SIGTERM, saved[4])
+    check("SIGINT giua run_once: vong do chay xong, khong vong moi",
+          calls == ["start", "done"] and err is None, (calls, err))
+    check("SIGINT: khong ngu het loop_seconds (30s)",
+          lt.time.time() - t0 < 5, lt.time.time() - t0)
+    lt._SHUTDOWN["signal"] = None
+    slept = lt.time.time()
+    lt.sleep_unless_shutdown(0.2)
+    check("sleep_unless_shutdown ngu du khi khong co tin hieu",
+          lt.time.time() - slept >= 0.19)
+
+
 if __name__ == "__main__":
     test_token_risk_reasons()
     test_entry_checks()
@@ -734,5 +780,6 @@ if __name__ == "__main__":
     test_jupiter_client()
     test_copy_exit()
     test_close_empty_script()
+    test_graceful_signal_shutdown()
     print(f"\n{PASS} pass, {FAIL} fail")
     sys.exit(1 if FAIL else 0)

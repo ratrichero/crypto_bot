@@ -19,6 +19,7 @@ Modes (config "mode"): "data_only" | "dry_run" | "live"
 """
 import json
 import os
+import signal
 import time
 import traceback
 from datetime import datetime, timezone
@@ -284,6 +285,35 @@ def manage_scalp(engine, st, symbol, price, c5, c15):
         return False
     log(f"Scalp {symbol} {sig} rejected: {why}")
     return False
+
+
+# Dung sach khi nhan SIGINT/SIGTERM (pm2 stop/restart, Ctrl+C): chi dat co,
+# vong lap chinh thoat o dau vong ke tiep giong file STOP (luu state, dong WS)
+# -> khong bi cat ngang giua luc dat/huy lenh. Tin hieu thu 2 -> dung ngay.
+_SHUTDOWN = {"signal": None}
+
+
+def _request_shutdown(signum, frame):
+    if _SHUTDOWN["signal"] is not None:
+        raise KeyboardInterrupt
+    _SHUTDOWN["signal"] = signum
+    try:
+        name = signal.Signals(signum).name
+    except Exception:
+        name = str(signum)
+    log("%s -> dung sau vong lap hien tai (gui lan nua de dung ngay)" % name)
+
+
+def install_signal_handlers():
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, _request_shutdown)
+        except (ValueError, OSError):      # khong o main thread
+            pass
+
+
+def shutdown_requested():
+    return _SHUTDOWN["signal"] is not None
 
 
 def acquire_instance_lock():
@@ -965,6 +995,7 @@ def protect_during_hold(engine):
 
 
 def main():
+    install_signal_handlers()
     # One process per host/IP.  This lock is held for the lifetime of main.
     lock_handle = acquire_instance_lock()
     binance_client.configure(log, state_path=CIRCUIT_P)
@@ -1035,6 +1066,8 @@ def main():
             return
         except Exception as e:
             log(f"warmup {symbol} failed: {e}")
+        if shutdown_requested():
+            break
         # Stagger symbols so startup does not create a request burst.
         time.sleep(WARMUP_DELAY)
     log(f"Warmup done: {len(candles)}/{len(SYMBOLS)}")
@@ -1048,8 +1081,9 @@ def main():
     loop = 0
     while True:
         try:
-            if os.path.exists(STOP_P):
-                log("STOP file -> shutdown")
+            if os.path.exists(STOP_P) or shutdown_requested():
+                log("STOP file -> shutdown" if os.path.exists(STOP_P)
+                    else "signal -> shutdown (da luu state)")
                 ws.stop()
                 getattr(engine, "stop_user_stream", lambda: None)()
                 save_state(st)
