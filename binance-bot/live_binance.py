@@ -1077,7 +1077,25 @@ class BinanceEngine:
                     fired, exit_px = "TP?", tp
                 elif sl:
                     fired, exit_px = "SL?", sl
-            if exit_px is None:
+            # Thu lay gia khop that tu lich su giao dich san
+            actual_exit = None
+            try:
+                trades = self._private_call(
+                    "private:account", self.ex.fetch_my_trades, symbol, None,
+                    5, _weight=5)
+                # Tim lenh dong gan nhat (nguoc chieu voi side)
+                close_side = "sell" if side == "long" else "buy"
+                for t in reversed(trades or []):
+                    if str(t.get("side", "")).lower() == close_side:
+                        actual_exit = float(t.get("price") or 0)
+                        if actual_exit > 0:
+                            fired = "EXCHANGE"
+                            break
+            except Exception:
+                pass
+            if actual_exit:
+                exit_px = actual_exit
+            elif exit_px is None:
                 exit_px = mark if mark else entry
             if side == "long":
                 pnl = (exit_px - entry) * local_qty
@@ -1104,7 +1122,7 @@ class BinanceEngine:
                 "pnl": round(net, 2), "reason": "CLOSED_ON_EXCHANGE",
                 "closed_at": int(now),
                 "live": True, "dry": self.dry_run,
-                "estimated": True, "exit_fired": fired,
+                "estimated": fired != "EXCHANGE", "exit_fired": fired,
             }
             self.state["positions"] = [p for p in self.state["positions"]
                                        if p.get("id") != pos["id"]]
