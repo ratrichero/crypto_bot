@@ -282,7 +282,7 @@ def binance_live_positions_block():
             "ID": p.get("id"), "Symbol": p.get("symbol"),
             "Chieu": p.get("side"), "Loai": p.get("tag"),
             "Entry": p.get("entry"),
-            "Gia live": round(mk, 4) if mk else None,
+            "Gia live": round(mk, 6) if mk else None,
             "Lãi/lỗ live (U)": round(upnl, 2),
             "SL": p.get("sl"), "TP": p.get("tp"),
             "Notional": p.get("notional"),
