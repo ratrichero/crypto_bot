@@ -916,6 +916,8 @@ class BinanceEngine:
         if mismatches:
             self.state["halted"] = True
             self.state["halt_reason"] = "exchange position reconciliation mismatch"
+            self.state["halted_at"] = time.strftime("%Y-%m-%d %H:%M:%S UTC",
+                                                    time.gmtime())
             self.log("CRITICAL POSITION RECONCILE mismatch=%s; halt new entries"
                      % mismatches)
             return False
@@ -924,7 +926,10 @@ class BinanceEngine:
                 self.state.get("halt_reason") == "exchange position reconciliation mismatch"):
             self.state["halted"] = False
             self.state["halt_reason"] = None
-            self.log("RECOVERY: position reconciliation da khop, tu dong unhalt")
+            self.log("RECOVERY: position reconciliation OK - "
+                     "tat ca vi the tren san khop voi state, tu dong unhalt. "
+                     "Thoi gian halt: tu %s" %
+                     self.state.get("halted_at", "unknown"))
         return True
 
     def _reconcile_startup_open_orders(self):
@@ -1128,6 +1133,8 @@ class BinanceEngine:
             self.state["halt_reason"] = (
                 "exchange protection reconciliation mismatch"
             )
+            self.state["halted_at"] = time.strftime("%Y-%m-%d %H:%M:%S UTC",
+                                                    time.gmtime())
             self.log("CRITICAL Algo protection mismatch missing=%s "
                      "missing_required=%s unknown=%s guard_mismatch=%s; "
                      "halt until manually reconciled"
@@ -1138,7 +1145,10 @@ class BinanceEngine:
                 self.state.get("halt_reason") == "exchange protection reconciliation mismatch"):
             self.state["halted"] = False
             self.state["halt_reason"] = None
-            self.log("RECOVERY: protection reconciliation da khop, tu dong unhalt")
+            self.log("RECOVERY: protection reconciliation OK - "
+                     "tat ca SL/TP tren san khop voi state, tu dong unhalt. "
+                     "Thoi gian halt: tu %s" %
+                     self.state.get("halted_at", "unknown"))
         return True
 
     def _reconcile_startup(self):
