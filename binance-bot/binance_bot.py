@@ -382,7 +382,7 @@ def manage_grid(engine, st, symbol, price):
         if price <= anchor * (1 - k * step) and bk not in grid["taken"]:
             pos, _ = engine.open(symbol, "long", notional,
                                  anchor * (1 - k * step),
-                                 0, step, "grid", level=bk)
+                                 0.03, step, "grid", level=bk)
             if pos:
                 grid["taken"][bk] = pos["id"]
                 n_grid += 1
@@ -395,7 +395,7 @@ def manage_grid(engine, st, symbol, price):
         if price >= anchor * (1 + k * step) and sk not in grid["taken"]:
             pos, _ = engine.open(symbol, "short", notional,
                                  anchor * (1 + k * step),
-                                 0, step, "grid", level=sk)
+                                 0.03, step, "grid", level=sk)
             if pos:
                 grid["taken"][sk] = pos["id"]
                 n_grid += 1
