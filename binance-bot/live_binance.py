@@ -1483,6 +1483,20 @@ class BinanceEngine:
                 self.state["stats"]["wins"] += 1
             else:
                 self.state["stats"]["losses"] += 1
+            # Verify vi the da dong that tren san truoc khi xoa khoi state.
+            # Neu partial fill -> giu lai de retry, khong danh dau da dong.
+            if not self.dry_run:
+                import time as _t
+                _t.sleep(2)
+                actual = self._aggregate_positions(
+                    self._private_call("private:account",
+                                       self.ex.fetch_positions, _weight=5)
+                ).get((symbol, side), 0)
+                # Cho phep sai so nho do lam tron
+                if abs(actual) > pos["qty"] * 0.01:
+                    raise RuntimeError(
+                        f"close partial: san con {actual}, bot nghi {pos['qty']} "
+                        f"-> se retry")
             rec = {
                 "id": pos["id"], "symbol": symbol, "side": side,
                 "tag": pos["tag"], "entry": round(pos["entry"], 6),
