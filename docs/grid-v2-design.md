@@ -1,6 +1,8 @@
 # Grid v2 — thiết kế đề xuất (chờ duyệt trước khi code)
 
-Trạng thái: **ĐỀ XUẤT**. Phần đã làm xong: mục 0 (commit `8b95587`).
+Trạng thái: **ĐÃ TRIỂN KHAI G0–G5** (mặc định tắt: `grid.engine = classic`,
+`grid.entry_mode = market`). Hướng dẫn vận hành và các điểm lệch so với bản
+thiết kế: `docs/upgrade.md` mục 9–10.
 Phạm vi: `binance-bot/` (grid), `dashboard/`, `db/`, `backtest.py`.
 
 Ưu tiên của anh: **tìm đúng coin/thời điểm đang thực sự đi ngang** để vào lệnh;
@@ -200,6 +202,6 @@ lệnh và mẫu báo cáo.
 | G0 | Sửa basket + trần tổng 10% | ✅ đã xong (`8b95587`) |
 | G1 | Config runtime DB + cache + trang dashboard (đăng nhập, user lưu DB) | ✅ xong (`869aba8`, `7641978`) — xem `docs/upgrade.md` mục 9 |
 | G2 | Scanner đi ngang, **chế độ quan sát** + bảng xếp hạng trên dashboard | ✅ xong — ngưỡng CHOP/percentile đã chỉnh, xem `docs/upgrade.md` mục 9.3 |
-| G3 | Backtest: kiểm chứng scanner + grid v2 | Không |
-| G4 | Range grid 2 chiều theo scanner, `max_symbols`, SL biên, giảm vị thế khi trend | Có (dry-run → testnet) |
-| G5 | Lệnh vào LIMIT post-only + quản lý slot + xử lý khớp một phần | Có (testnet bắt buộc) |
+| G3 | Backtest: kiểm chứng scanner + grid v2 | ✅ xong (`983a5c2`) — `backtest_v2.py`, xem `docs/upgrade.md` mục 10.1 |
+| G4 | Range grid 2 chiều theo scanner, `max_symbols`, SL biên, giảm vị thế khi trend | ✅ code xong (`047ae0d`), mặc định tắt — cần dry-run → testnet |
+| G5 | Lệnh vào LIMIT post-only + quản lý slot + xử lý khớp một phần | ✅ code xong (`d40bd30`), mặc định tắt — testnet bắt buộc |

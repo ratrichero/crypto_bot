@@ -37,6 +37,9 @@ deploy thử nghiệm trực tiếp từ nhánh này.
    - Mở dashboard **ngay sau deploy** để tạo admin.
    - Kiểm tra log bot có dòng `CONFIG ap dung version 1 (nguon db)`.
    - Grid lot mới có **TP 1%** (trước đây TP = 1 step 0.4–0.8%).
+9. **Từ `983a5c2`–`d40bd30` (G3/G4/G5):** xem mục 10. Mặc định **không đổi
+   hành vi**: `grid.engine = classic`, `grid.entry_mode = market`. Chỉ bật range
+   grid / entry LIMIT sau khi chạy backtest và dry-run (mục 10.4).
 
 ---
 
@@ -299,7 +302,8 @@ có thể tăng lên 10 nếu muốn giảm 30 weight/phút. Không nên giảm
 ```bash
 # Binance
 cd binance-bot
-for t in test_binance.py test_backtest.py test_protection.py test_scanner.py; do python $t; done
+for t in test_binance.py test_backtest.py test_protection.py test_scanner.py \
+         test_backtest_v2.py test_range_live.py test_entry_orders.py; do python $t; done
 rm -f config.json universe.json        # file do test sinh ra, không commit
 # DB (Postgres thật qua pgserver)
 python db/test_binance_trades_pg.py
@@ -315,6 +319,9 @@ cd dashboard && python test_dashboard.py
 | `binance-bot/test_backtest.py` | 17 pass |
 | `binance-bot/test_protection.py` (harness sàn giả lập) | 143 pass |
 | `binance-bot/test_scanner.py` (scanner + luật mở grid) | 48 pass |
+| `binance-bot/test_backtest_v2.py` (range grid thuần + backtest v2) | 52 pass |
+| `binance-bot/test_range_live.py` (range grid trên bot, G4) | 39 pass |
+| `binance-bot/test_entry_orders.py` (entry LIMIT, sàn giả lập, G5) | 52 pass |
 | `db/test_binance_trades_pg.py` | 7 pass |
 | `db/test_bot_config.py` (config/tài khoản, Postgres thật) | 54 pass |
 | `meme-radar/test_live_trader.py` | 145 pass |
@@ -410,5 +417,154 @@ Net mỗi lot ước tính ở mặc định ($1000, TP 1%): **≈ $8.8** khi v�
   - **Khuyến nghị:** để `observe` 1–2 tuần, đối chiếu bảng xếp hạng với chart
     thật, sau đó mới bật `filter`.
 - Universe scanner = universe bot đang chạy (`universe.json`, top 30). Mở rộng
-  universe sang 50–80 là việc của G4.
+  universe sang 50–80: xem mục 10.5.
+
+---
+
+## 10. G3 + G4 + G5 — backtest v2, range grid 2 chiều, entry LIMIT
+
+Commit: G3 `983a5c2`, G4 `047ae0d`, G5 `d40bd30`. Thiết kế gốc:
+`docs/grid-v2-design.md` mục 2–5, 7.
+
+### 10.1 G3 — `binance-bot/backtest_v2.py`
+
+Dùng chung code với bot live: `scanner.compute_metrics` / `scanner.judge`
+(cùng ngưỡng `scanner.*`) và `range_grid.py` (biên, tầng, SL biên, biên vỡ,
+phân slot). Backtest vì thế phản ánh đúng điều bot sẽ làm.
+
+```bash
+cd binance-bot
+# 1. tải nến 5m công khai (không cần key), 120 ngày
+python backtest_v2.py download --symbols BTCUSDT,ETHUSDT,SOLUSDT,... \
+    --days 120 --data-dir /tmp/bt5m
+# 2. scanner có tách được symbol đi ngang không? (quan trọng nhất)
+python backtest_v2.py study --data-dir /tmp/bt5m --scan-cache /tmp/scan.json \
+    --horizon-hours 24 --every-hours 4 --entry limit --json-out /tmp/study.json
+# 3. mô phỏng portfolio với config hiện tại (ghi đè bằng --set)
+python backtest_v2.py run --data-dir /tmp/bt5m --scan-cache /tmp/scan.json \
+    --entry limit --set grid.tp_pct=0.012 --set risk.grid_basket_max_loss_pct=0.03
+# 4. walk-forward tp_pct × step_mult
+python backtest_v2.py walk-forward --data-dir /tmp/bt5m --scan-cache /tmp/scan.json \
+    --train-days 21 --test-days 7 \
+    --space "grid.tp_pct=0.008,0.01,0.012;grid.step_mult=0.8,1.2,1.6"
+```
+
+- `study`: cứ mỗi `every` giờ, với mỗi symbol, bot chạy grid **cô lập**
+  `horizon` giờ bằng biên của scan tại thời điểm đó, rồi so PnL giữa nhóm
+  ĐẠT và nhóm TRƯỢT, chia thêm theo bucket điểm.
+  - Kết luận in ở `verdict`: scanner có ích / chỉ lọc bớt lỗ / không tách được.
+  - Chỉ bật `filter` hoặc range grid khi nhóm ĐẠT lãi và hơn hẳn nhóm TRƯỢT.
+- Giả định (in trong report, mục `assumptions`):
+  - LIMIT = maker 0.02%, chỉ tính khớp khi giá **xuyên** qua 0.02%.
+  - Market / TP / SL = taker 0.05% + trượt giá 0.01% mỗi phía.
+  - Thứ tự giá trong nến 5m: nến tăng O→L→H→C, nến giảm O→H→L→C. Cùng giá thì
+    SL được tính trước. Basket cắt đúng tại giá chạm ngưỡng.
+  - Không tính funding.
+- Scanner chỉ dùng nến 1h/15m **đã đóng** trước thời điểm quét (đã có test
+  chống lookahead). Cần 498 nến 1h như live, nên khoảng 21 ngày đầu chỉ dùng
+  để làm nóng chỉ báo. Vì vậy nên tải ≥ 90–120 ngày.
+- `rescan_minutes` mặc định 60 cho nhanh (live dùng 15). Cache scan được ghi
+  vào `--scan-cache` để dùng lại giữa các lệnh.
+- Tốc độ: 10 symbol × 30 ngày ≈ 1 giây/lần mô phỏng.
+- **Phát hiện từ dữ liệu tổng hợp, cần kiểm lại bằng dữ liệu thật:**
+  - Basket 2% với lot $1000 / equity $1000 và 4 lot/symbol nghĩa là giá đi
+    ngược chỉ khoảng 0.5% là basket cắt. Trong study, tỷ lệ cửa sổ dính
+    basket của nhóm ĐẠT rất cao.
+  - Nếu backtest thật cũng vậy, nên thử 1 trong 3 hướng (đều chỉnh được trên
+    dashboard): basket 3–4%, `max_lots_per_symbol` 2–3, hoặc lot nhỏ hơn.
+
+### 10.2 G4 — range grid 2 chiều (`grid.engine = range`)
+
+- Biên lấy từ scanner (high/low 48h). Mid = (low + high) / 2.
+  - Nửa dưới **chỉ long**: mid × (1 − k·step).
+  - Nửa trên **chỉ short**: mid × (1 + k·step).
+  - Step = clamp(step_mult × ATR15m, step_min, step_max), cùng công thức grid
+    classic.
+- TP = `grid.tp_pct`. SL tính từ biên:
+  - Long: đáy × (1 − `boundary_sl_buffer`).
+  - Short: đỉnh × (1 + buffer).
+  - Không bao giờ xa hơn `grid.sl_pct`. SL vẫn đặt trên sàn như cũ.
+- Chọn symbol: chỉ symbol **đạt chuẩn + top K**, bất kể `scanner.mode`
+  (range grid cần biên của scanner nên luôn lọc), và không phụ thuộc regime
+  15m. Scanner tắt hoặc dữ liệu quá hạn thì không mở mới (fail-closed).
+- Biên chỉ được dựng lại khi symbol **flat** (không lot, không lệnh chờ) và có
+  scan mới hơn. Lot đang mở luôn thuộc biên đã sinh ra nó.
+- Biên vỡ khi giá vượt biên quá `break_buffer` (0.3%), hoặc ADX 1h >
+  `trend_exit_adx` (25):
+  - Không mở mới, huỷ lệnh chờ của symbol.
+  - `derisk_on_trend` (mặc định tắt): cắt các lot đang lỗ > `derisk_loss_pct`.
+  - Phần này chạy trong `run_risk_controls`, nên vẫn chạy khi đang halt.
+- Slot giới hạn bởi 3 tham số: `grid.max_positions` (tổng),
+  `grid.max_lots_per_symbol` (4), `grid.max_symbols`.
+- Lot vẫn mang tag `grid`, nên basket / trần tổng / daily stop áp dụng như cũ.
+- Đổi engine khi đang còn lot: lot cũ vẫn được quản lý tới khi đóng, và không
+  chồng grid kiểu mới lên symbol đó.
+- Ràng buộc trên dashboard:
+  - range cần scanner bật.
+  - `trend_exit_adx` ≥ `scanner.adx_1h_max`.
+
+### 10.3 G5 — entry LIMIT post-only (`grid.entry_mode = limit`, chỉ với range)
+
+- Mỗi vòng, bot đặt trước lệnh LIMIT **GTX** (post-only, phí maker) ở các tầng
+  gần giá nhất. Long đặt dưới giá, short đặt trên giá, cách giá ≥
+  `limit_min_gap_pct`.
+  - Phân slot: lot + lệnh chờ ≤ trần. Ưu tiên giữ lệnh cũ, sau đó đến tầng gần
+    giá, rồi symbol điểm cao.
+  - Mỗi vòng đặt mới tối đa `max_new_orders_per_cycle` (2) lệnh.
+  - Hết slot thì huỷ lệnh chờ xa nhất.
+- Lệnh chờ **chiếm slot** (`max_total_positions`) và **exposure** ngay khi đặt.
+  Nhờ vậy, kể cả khi mọi lệnh cùng khớp thì vẫn không vượt trần.
+- Vòng đời lệnh (`state["entry_orders"]`, file `entry_orders.py`):
+  - Ghi state **trước khi gửi**. clientOrderId có dạng `e<SYM><L|S><n>`.
+  - Giá BUY làm tròn xuống tick, SELL làm tròn lên.
+  - Sàn từ chối vì lệnh sẽ khớp ngay (EXPIRED / -5022): bỏ lệnh, cooldown.
+  - Lỗi mạng: lệnh chuyển sang UNKNOWN, tra lại theo cid. Không tìm thấy sau
+    60 giây thì bỏ. Không bao giờ gửi lại mù.
+  - Trạng thái lấy từ WS `ORDER_TRADE_UPDATE`. REST chỉ poll tối đa 1 lệnh mỗi
+    vòng, vì governor giãn `order_status` 1 giây/lần.
+  - Hết `entry_ttl_minutes` (60): huỷ, bot đặt lại nếu tầng còn hợp lệ.
+  - **Khớp một phần:** quá `partial_fill_timeout_seconds` (60) thì huỷ phần còn
+    lại. Phần đã khớp thành **1 lot riêng có SL/TP trên sàn ngay**. Phần khớp
+    dưới minNotional thì đóng ngay (`ENTRY_DUST`).
+  - Huỷ gặp -2011: tra lại lệnh. Nếu lệnh đã khớp thì vẫn nhận lot.
+- Đối chiếu: phần đã khớp của lệnh chưa kết thúc được cộng vào `_local_qty` và
+  reconcile, đồng thời trừ khỏi `detect_exchange_closed`. Vì vậy bot không halt
+  nhầm và không ghi nhầm lot đã đóng.
+- Khởi động lại:
+  - Bot tra trạng thái mọi lệnh chờ trên sàn **trước** khi đối chiếu vị thế.
+    Lệnh đã khớp lúc bot tắt sẽ thành lot ngay.
+  - Lệnh entry của bot đang được quản lý thì không gây halt.
+  - Lệnh entry của bot nhưng mất state: huỷ. Lệnh lạ: halt như cũ.
+- Khi halt / có file `PAUSE` / tắt chế độ limit / biên vỡ / symbol rời top K /
+  `risk_halted`: bot huỷ lệnh chờ. Đồng bộ lệnh vẫn chạy mỗi vòng, kể cả khi
+  halt.
+- TP vẫn là market (`TAKE_PROFIT_MARKET` trên sàn), theo yêu cầu.
+- Lưu ý: trong tối đa 60 giây (timeout khớp một phần), phần đã khớp nhưng chưa
+  thành lot không được basket tính vào.
+
+### 10.4 Lộ trình bật (đề xuất)
+
+1. `backtest_v2.py study` + `run` + `walk-forward` trên 30 symbol hiện tại,
+   90–120 ngày. Gửi kết quả để duyệt ngưỡng scanner, basket, TP.
+2. Dry-run trên VPS (`mode = dry_run`) với `grid.engine = range` và
+   `grid.entry_mode = limit` trong 3–7 ngày. Đối chiếu log `RANGE GRID`,
+   `dat LIMIT GTX`, `KHOP LIMIT`, `huy LIMIT` / `HUY LIMIT` với chart.
+3. Testnet (bắt buộc cho G5): kiểm tra GTX, huỷ, khớp một phần, restart giữa
+   lúc lệnh chờ.
+4. Live từng bước, Cường duyệt (luật repo): trước tiên `engine = range` +
+   `entry_mode = market`, sau đó mới bật `limit`.
+
+### 10.5 Universe 50–80 symbol (chỉ hướng dẫn, chưa đổi code)
+
+- Chạy `python3 build_universe.py 60` (tham số = số symbol, mặc định 30), rồi
+  restart bot (`universe.json` và WS subscription chỉ được đọc lúc khởi động).
+  Key `universe_top_n` trong config hiện **không được code nào đọc**.
+  - Symbol rơi khỏi universe mà còn lot vẫn được theo dõi tới khi đóng.
+- Chi phí API tăng tuyến tính:
+  - Scanner: 1h × 499 cho mỗi symbol, 15 phút một lần ≈ 8 weight/phút với 60
+    symbol.
+  - Nến 5m/15m: làm mới 2 symbol mỗi slow tick, nên với 60 symbol mỗi symbol
+    được làm mới khoảng 2.5 phút/lần. Scanner dùng nến 15m đã đóng nên vẫn đủ.
+- Khuyến nghị: chạy `study` trên 60 symbol trước. Coin vốn hoá nhỏ đi ngang
+  "đẹp" nhưng hay có râu dài, dễ chạm SL biên.
 
