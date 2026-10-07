@@ -530,7 +530,30 @@ class BinanceEngine(EntryOrdersMixin):
             return cost / filled
         return None
 
-    def _validate_order_result(self, order, context, expected_qty=None):
+    # NEW/PARTIALLY_FILLED (ccxt: "open") la lenh DANG khop - chua phai ket
+    # qua. Lenh MARKET quet nhieu muc gia phat PARTIALLY_FILLED truoc FILLED.
+    _IN_PROGRESS = frozenset({"NEW", "PARTIALLY_FILLED", "PARTIAL", "OPEN",
+                              "PENDING_NEW"})
+
+    @classmethod
+    def _order_in_progress(cls, order):
+        return cls._order_status(order) in cls._IN_PROGRESS
+
+    @staticmethod
+    def _order_qtys(order, expected_qty=None):
+        """(filled, requested) tu field ccxt/REST/WS (z = filled, q = qty)."""
+        order = order or {}
+        try:
+            filled = float(order.get("filled") or order.get("executedQty")
+                           or order.get("z") or 0)
+            requested = float(expected_qty or order.get("amount")
+                              or order.get("origQty") or order.get("q") or 0)
+        except (TypeError, ValueError):
+            filled = requested = 0.0
+        return filled, requested
+
+    def _validate_order_result(self, order, context, expected_qty=None,
+                               allow_in_progress=False):
         """Reject a failed/partial result instead of creating false state.
 
         A GET order response always contains an order id, including for
@@ -538,18 +561,20 @@ class BinanceEngine(EntryOrdersMixin):
         successful MARKET fill would create a local position that Binance does
         not have. A partial MARKET result is also unsafe to model as the
         requested quantity, so it fails closed and requires reconciliation.
+
+        allow_in_progress=True: snapshot NEW/PARTIALLY_FILLED (lenh con dang
+        khop) KHONG phai loi - tra ve False de caller cho trang thai cuoi.
+        Chi trang thai CUOI voi 0 < filled < qty moi la khop mot phan that.
+        Tra ve True khi order la ket qua cuoi hop le.
         """
         order = order or {}
         status = self._order_status(order)
+        if allow_in_progress and status in self._IN_PROGRESS:
+            return False
         failed = {"CANCELED", "CANCELLED", "REJECTED", "EXPIRED",
                   "EXPIRED_IN_MATCH"}
         partial = {"PARTIALLY_FILLED", "PARTIAL"}
-        try:
-            filled = float(order.get("filled") or order.get("executedQty") or 0)
-            requested = float(expected_qty or order.get("amount")
-                              or order.get("origQty") or 0)
-        except (TypeError, ValueError):
-            filled = requested = 0.0
+        filled, requested = self._order_qtys(order, expected_qty)
         is_partial_qty = (filled > 0 and requested > 0
                           and filled < requested - max(1e-12, requested * 1e-9))
         if status in failed and (filled <= 0 or not is_partial_qty):
@@ -568,6 +593,7 @@ class BinanceEngine(EntryOrdersMixin):
             raise RuntimeError("%s returned partial order status %s; "
                                "manual reconciliation required"
                                % (context, status or "quantity"))
+        return True
 
     def start_user_stream(self):
         """Start private ORDER_TRADE_UPDATE/ACCOUNT_UPDATE listener."""
@@ -666,18 +692,26 @@ class BinanceEngine(EntryOrdersMixin):
             # periodic guard below also catches a dropped/private-stream gap.
             self._last_reconcile = 0.0
 
-    def _wait_order_event(self, order_id, timeout):
+    def _wait_order_event(self, order_id, timeout, terminal=False):
+        """Cho ORDER_TRADE_UPDATE cua order.
+
+        terminal=True: bo qua event NEW/PARTIALLY_FILLED (lenh MARKET quet
+        nhieu muc gia phat PARTIALLY_FILLED truoc FILLED) va cho tiep toi
+        trang thai cuoi; het timeout -> None. Moi order chi giu event MOI
+        nhat nen FILLED den sau se de len PARTIALLY_FILLED."""
         key = str(order_id)
         deadline = time.monotonic() + max(0.0, timeout)
         with self._order_condition:
-            while key not in self._order_events:
+            while True:
+                event = self._order_events.pop(key, None)
+                if event is not None:
+                    event = dict(event)
+                    if not terminal or not self._order_in_progress(event):
+                        return event
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return None
                 self._order_condition.wait(timeout=remaining)
-            event = dict(self._order_events[key])
-            self._order_events.pop(key, None)
-            return event
 
     def _action_key(self, action, symbol, side=None, tag=None, level=None):
         return ":".join(str(x) for x in (action, symbol, side or "-",
@@ -2574,11 +2608,9 @@ class BinanceEngine(EntryOrdersMixin):
             if uncertain:
                 existing = self._find_order_by_client_id(symbol, client_order_id)
                 if existing and existing.get("orderId") is not None:
-                    self._validate_order_result(
-                        existing,
-                        "reconciled order %s" % client_order_id,
-                        expected_qty=qty,
-                    )
+                    self._validate_created(
+                        existing, "reconciled order %s" % client_order_id,
+                        symbol, client_order_id, qty, reduce_only)
                     self.log("ORDER reconciled after transport failure "
                              "clientOrderId=%s orderId=%s"
                              % (client_order_id, existing.get("orderId")))
@@ -2600,11 +2632,32 @@ class BinanceEngine(EntryOrdersMixin):
                 )
             raise RuntimeError("dat lenh %s %s that bai: %s"
                                % (symbol, side, e))
-        self._validate_order_result(od, "created order", expected_qty=qty)
+        self._validate_created(od, "created order", symbol, client_order_id,
+                               qty, reduce_only)
         self._last_order_response = od
         return (od.get("id") or od.get("orderId"),
                 od.get("clientOrderId") or od.get("origClientOrderId")
                 or client_order_id)
+
+    def _validate_created(self, od, context, symbol, client_order_id, qty,
+                          reduce_only):
+        """Kiem response dat lenh. Snapshot dang khop (NEW/PARTIALLY_FILLED)
+        la binh thuong -> _fill_price cho trang thai cuoi. Lenh da duoc san
+        nhan ma ket qua cuoi la khop mot phan -> ghi _ambiguous_order de
+        resolve_ambiguous_orders nhan lot voi qty THAT (khong treo halt)."""
+        try:
+            self._validate_order_result(od, context, expected_qty=qty,
+                                        allow_in_progress=True)
+        except RuntimeError:
+            filled, _ = self._order_qtys(od)
+            if filled > 0 and client_order_id:
+                self._ambiguous_order = {
+                    "symbol": symbol, "client_order_id": client_order_id,
+                    "qty": qty, "reduce_only": bool(reduce_only),
+                    "ts": time.time(),
+                    "order_id": od.get("id") or od.get("orderId"),
+                }
+            raise
 
     def _fill_price(self, symbol, order_id, ref_price):
         if self.dry_run:
@@ -2612,10 +2665,13 @@ class BinanceEngine(EntryOrdersMixin):
 
         response = self._last_order_response or {}
         self._last_order_response = None
-        self._validate_order_result(response, "order %s" % order_id)
-        average = self._order_average(response)
-        if average is not None:
-            return average
+        # Snapshot NEW/PARTIALLY_FILLED: avgPrice chi la cua phan da khop ->
+        # khong dung, cho trang thai cuoi qua WS/REST.
+        if self._validate_order_result(response, "order %s" % order_id,
+                                       allow_in_progress=True):
+            average = self._order_average(response)
+            if average is not None:
+                return average
 
         # Prefer the ordered private stream. This removes the old six-request
         # polling burst when ORDER_TRADE_UPDATE is healthy.
@@ -2623,6 +2679,7 @@ class BinanceEngine(EntryOrdersMixin):
             event_order = self._wait_order_event(
                 order_id,
                 float(self.cfg.get("order_event_timeout_seconds", 8)),
+                terminal=True,
             )
             if event_order:
                 self._validate_order_result(
@@ -2637,7 +2694,9 @@ class BinanceEngine(EntryOrdersMixin):
         if not ccxt_symbol:
             raise RuntimeError("unknown_symbol: %s" % symbol)
         # REST is now a bounded fallback, not the normal order-status path.
-        for attempt in range(2):
+        attempts = max(2, int(self.cfg.get("order_poll_attempts", 4)))
+        in_progress = False
+        for attempt in range(attempts):
             try:
                 od = self._private_call(
                     "private:order_status",
@@ -2645,24 +2704,29 @@ class BinanceEngine(EntryOrdersMixin):
                     order_id,
                     ccxt_symbol,
                 )
-                self._validate_order_result(od, "order poll %s" % order_id)
-                average = self._order_average(od)
-                if average is not None:
-                    return average
-                if self._order_status(od) in ("CLOSED", "FILLED"):
-                    break
+                in_progress = not self._validate_order_result(
+                    od, "order poll %s" % order_id, allow_in_progress=True)
+                if not in_progress:
+                    average = self._order_average(od)
+                    if average is not None:
+                        return average
+                    if self._order_status(od) in ("CLOSED", "FILLED"):
+                        break
             except binance_safety.BinanceSafetyStop:
                 raise
             except RuntimeError:
                 raise
             except Exception as e:
                 self.log("WARNING poll order %s: %s" % (order_id, e))
-            if attempt == 0:
+            if attempt < attempts - 1:
                 time.sleep(1)
         # Nguon su that cuoi: userTrades cua chinh order (lenh MARKET da khop
         # co trade du order response/WS/fetch_order thieu avgPrice). Neu bo
         # qua, vi the da khop tren san se khong duoc ghi va khong co SL/TP.
-        summary = self._order_fill_summary(symbol, order_id)
+        # Lenh VAN dang khop -> userTrades chi la mot phan: khong dung, de
+        # resolve_ambiguous_orders nhan lot khi lenh ket thuc.
+        summary = (None if in_progress
+                   else self._order_fill_summary(symbol, order_id))
         if summary is not None and summary.get("avg"):
             self.log("WARNING order %s: lay gia fill tu userTrades %.8f"
                      % (order_id, summary["avg"]))

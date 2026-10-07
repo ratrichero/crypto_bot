@@ -175,7 +175,8 @@ class FakeBinance:
         for o in self.orders.values():
             if (o.get("clientOrderId") == params.get("origClientOrderId")
                     and CLOCK.now >= o.get("_hidden_until", 0)):
-                return {"orderId": o["orderId"], "status": "FILLED",
+                return {"orderId": o["orderId"],
+                        "status": o.get("_raw_status", "FILLED"),
                         "executedQty": str(o["filled"]),
                         "avgPrice": str(o["average"]),
                         "clientOrderId": o["clientOrderId"],
@@ -1449,6 +1450,103 @@ def test_unknown_fill_price_is_resolved_later():
 
 
 # ===================================================================
+# Lenh MARKET khop qua nhieu muc gia: PARTIALLY_FILLED -> FILLED
+# (su co SOL live: halt "partial market order..." treo vinh vien)
+# ===================================================================
+class _RunningWS:
+    running = True
+    fatal_error = None
+
+
+def _partial_snapshot(fake, eng, ws_final=None, ws_delay=0.05):
+    """San khop DU qty nhung response chi la snapshot dang khop (ccxt
+    status open, filled = 1/2). ws_final: gia event FILLED gui tre."""
+    import threading
+    real = fake._market
+
+    def market(symbol, side, qty, params):
+        order = real(symbol, side, qty, params)
+        snap = dict(order, status="open", filled=qty / 2,
+                    average=order["average"] - 10)
+        oid = order["orderId"]
+        eng.on_user_event({"e": "ORDER_TRADE_UPDATE", "o": {
+            "s": symbol, "i": oid, "X": "PARTIALLY_FILLED", "x": "TRADE",
+            "z": str(qty / 2), "q": str(qty), "ap": str(order["average"] - 10),
+            "ps": params["positionSide"]}})
+        if ws_final is not None:
+            threading.Timer(ws_delay, eng.on_user_event, args=({
+                "e": "ORDER_TRADE_UPDATE", "o": {
+                    "s": symbol, "i": oid, "X": "FILLED", "x": "TRADE",
+                    "z": str(qty), "q": str(qty), "ap": str(ws_final),
+                    "ps": params["positionSide"]}},)).start()
+        return snap
+    fake._market = market
+
+
+def test_market_partial_event_then_filled_ws():
+    fake = FakeBinance()
+    eng, st = make_engine(fake, order_event_timeout_seconds=2)
+    eng._user_ws = _RunningWS()
+    _partial_snapshot(fake, eng, ws_final=60010.0)
+    pos, why = eng.open("BTCUSDT", "long", 600.0, 60000, 0.03, 0.005, "grid",
+                        level="b1")
+    eng._user_ws = None
+    check("partial->filled WS: nhan lot qty du, gia tu event FILLED",
+          pos is not None and pos["qty"] == 0.01 and pos["entry"] == 60010.0,
+          (why, pos))
+    check("partial->filled WS: khong halt, khong ambiguous",
+          not st.get("halted") and not st.get("ambiguous_orders"),
+          (st.get("halt_reason"), st.get("ambiguous_orders")))
+    check("partial->filled WS: lot co du SL/TP",
+          pos is not None and len(guards_of(fake, pos)) == 2)
+    check("partial->filled WS: san khop state",
+          eng.reconcile_positions(force=True) and not st.get("halted"))
+
+
+def test_market_partial_snapshot_rest_poll_waits():
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    _partial_snapshot(fake, eng)
+    real_fetch = fake.fetch_order
+    polls = []
+
+    def fetch(order_id, symbol=None, params=None):
+        od = real_fetch(order_id, symbol, params)
+        polls.append(od["status"])
+        if len(polls) == 1:                      # lan 1: van dang khop
+            od.update(status="open", filled=od["amount"] / 2)
+        return od
+    fake.fetch_order = fetch
+    pos, why = eng.open("BTCUSDT", "long", 600.0, 60000, 0.03, 0.005, "grid")
+    check("partial snapshot REST: poll lai toi khi FILLED, nhan lot du qty",
+          pos is not None and pos["qty"] == 0.01 and pos["entry"] == 60000.0
+          and len(polls) == 2, (why, polls))
+    check("partial snapshot REST: khong halt",
+          not st.get("halted"), st.get("halt_reason"))
+
+
+def test_validate_reads_ws_cumulative_fields():
+    eng, st = make_engine(FakeBinance())
+    ok = eng._validate_order_result(
+        {"X": "FILLED", "z": "0.01", "q": "0.01", "ap": "60000"}, "ev")
+    check("validate WS: FILLED z=q -> hop le", ok is True)
+    check("validate WS: PARTIALLY_FILLED + allow_in_progress -> cho, khong halt",
+          eng._validate_order_result(
+              {"X": "PARTIALLY_FILLED", "z": "0.005", "q": "0.01"}, "ev",
+              allow_in_progress=True) is False and not st.get("halted"))
+    try:
+        eng._validate_order_result(
+            {"X": "EXPIRED", "z": "0.004", "q": "0.01"}, "ev")
+        raised = False
+    except RuntimeError:
+        raised = True
+    check("validate WS: EXPIRED z<q -> khop mot phan that, halt",
+          raised and st.get("halt_reason")
+          == "partial market order requires exchange reconciliation",
+          st.get("halt_reason"))
+
+
+# ===================================================================
 # Kiem soat rui ro LUON chay (halt chi chan mo lenh moi)
 # ===================================================================
 def test_basket_runs_during_reconcile_hold():
@@ -1589,6 +1687,9 @@ TESTS = [
     test_ambiguous_open_never_accepted_expires,
     test_failed_close_rearms_guards_and_recovers,
     test_unknown_fill_price_is_resolved_later,
+    test_market_partial_event_then_filled_ws,
+    test_market_partial_snapshot_rest_poll_waits,
+    test_validate_reads_ws_cumulative_fields,
     test_basket_runs_during_reconcile_hold,
     test_basket_evaluates_risk_halted_symbol_with_lots,
     test_grid_total_stop_across_symbols,
