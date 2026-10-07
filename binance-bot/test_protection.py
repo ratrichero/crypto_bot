@@ -1731,9 +1731,11 @@ def test_ensure_hedge_mode_reads_mode_first():
     err_4067 = BinanceError('binance {"code":-4067,"msg":"Position side '
                             'cannot be changed if there exists open orders."}')
 
-    def run(dual, set_exc=None):
+    def run(dual, set_exc=None, prep=None):
         fake = FakeBinance()
         eng, st = make_engine(fake)
+        if prep:
+            prep(fake, eng)
         calls = []
 
         def get_dual(params=None):
@@ -1772,6 +1774,19 @@ def test_ensure_hedge_mode_reads_mode_first():
     err, calls = run(BinanceError("binance -1001 internal"), err_4067)
     check("hedge: doc mode loi + -4067 -> dung, KHONG khuyen dong SL/TP",
           err and "Khong xac dinh" in err and "KHONG can dong" in err, err)
+    read_err = BinanceError("binance -1001 internal")
+    err, calls = run(read_err, err_4067,
+                     prep=lambda fake, eng: open_lot(eng, "long", 60000))
+    check("hedge: doc mode loi + guard LONG dang mo (VPS) -> suy ra HEDGE, "
+          "khong goi doi mode", err is None and calls == [], (err, calls))
+
+    def one_way(fake, eng):
+        fake.positions_override = [{"symbol": "BTCUSDT", "contracts": 0.01,
+                                    "info": {"symbol": "BTCUSDT",
+                                             "positionSide": "BOTH"}}]
+    err, calls = run(read_err, err_4067, prep=one_way)
+    check("hedge: doc mode loi + vi the BOTH -> ONE-WAY, dung bao ro",
+          err and "ONE-WAY" in err and calls == [True], err)
 
 
 # ===================================================================

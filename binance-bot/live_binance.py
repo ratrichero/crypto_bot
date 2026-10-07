@@ -819,14 +819,55 @@ class BinanceEngine(EntryOrdersMixin):
         except binance_safety.BinanceSafetyStop:
             raise
         except Exception as e:
-            self.log("WARNING khong doc duoc position mode: %s"
-                     % binance_safety.redact_body(e))
+            self.log("WARNING khong doc duoc position mode (GET "
+                     "positionSide/dual): %s: %s"
+                     % (type(e).__name__, binance_safety.redact_body(e)))
             return None
+        if not isinstance(value, (bool, str)):
+            self.log("WARNING position mode: response la %r" % (row,))
         if isinstance(value, str):
             value = value.strip().lower()
             return True if value == "true" else (
                 False if value == "false" else None)
         return value if isinstance(value, bool) else None
+
+    def _infer_hedge_mode(self):
+        """Suy ra mode tu lenh algo dang mo + vi the tren san.
+
+        positionSide LONG/SHORT chi hop le o hedge mode, va Binance khong cho
+        doi mode khi con lenh/vi the -> mot lenh/vi the LONG/SHORT dang ton
+        tai CHUNG MINH tai khoan dang hedge; BOTH -> one-way. Khong co gi ->
+        None (luc do doi mode se khong bi -4067/-4068 chan)."""
+        sides = set()
+        try:
+            for row in self._fetch_open_algo_orders():
+                if isinstance(row, dict):
+                    sides.add(str(row.get("positionSide") or "").upper())
+        except binance_safety.BinanceSafetyStop:
+            raise
+        except Exception as e:
+            self.log("WARNING suy mode: khong doc duoc algo orders: %s"
+                     % binance_safety.redact_body(e))
+        try:
+            rows = self._private_call("private:account",
+                                      self.ex.fetch_positions, _weight=5)
+            for row in rows or []:
+                if float(row.get("contracts", 0) or 0) == 0:
+                    continue
+                info = row.get("info") or {}
+                sides.add(str(info.get("positionSide") or "").upper())
+        except binance_safety.BinanceSafetyStop:
+            raise
+        except Exception as e:
+            self.log("WARNING suy mode: khong doc duoc vi the: %s"
+                     % binance_safety.redact_body(e))
+        hedge = bool(sides & {"LONG", "SHORT"})
+        one_way = "BOTH" in sides
+        if hedge and not one_way:
+            return True
+        if one_way and not hedge:
+            return False
+        return None
 
     def _ensure_hedge_mode(self):
         """Dam bao tai khoan o hedge (dual-side) mode. Can cho grid 2 chieu.
@@ -836,6 +877,12 @@ class BinanceEngine(EntryOrdersMixin):
         tren san tra -4067/-4068 (khong phai -4059 'No need to change') ->
         truoc day bot khong khoi dong duoc du tai khoan da o hedge."""
         mode = self._read_hedge_mode()
+        if mode is None:
+            mode = self._infer_hedge_mode()
+            if mode is True:
+                self.log("Binance position mode: HEDGE (suy tu lenh/vi the "
+                         "positionSide LONG/SHORT dang mo), OK")
+                return
         if mode is True:
             self.log("Binance position mode: da o HEDGE (dual-side), OK")
             return
