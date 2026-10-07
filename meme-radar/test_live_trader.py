@@ -33,7 +33,7 @@ def isolated():
     """Cach ly moi path runtime cua module vao thu muc tam."""
     tmpd = tempfile.mkdtemp()
     olds = {}
-    for name in ("SIG_P", "ALERT_P", "SELL_P", "POS_P", "STATE_P",
+    for name in ("SIG_P", "ALERT_P", "POS_P", "STATE_P",
                  "TRADES_P", "LOG_P", "STOP_P", "RADAR_STOP_P", "PAUSE_P"):
         olds[name] = getattr(lt, name)
         setattr(lt, name, os.path.join(tmpd, name.lower()))
@@ -1036,6 +1036,24 @@ def test_radar_stop_does_not_stop_live():
           and os.path.basename(lt.RADAR_STOP_P) == "STOP")
 
 
+def test_no_dead_sells_source():
+    print("== Khong con nguon sells.jsonl khai bao thua ==")
+    with isolated() as tmpd:
+        logs = []
+        orig = lt.log
+        lt.log = logs.append
+        try:
+            tr, _ = _dry_trader(tmpd, {})
+        finally:
+            lt.log = orig
+        check("trader chi tail signals + alerts",
+              sorted(tr.paths) == ["alerts", "signals"], tr.paths)
+        check("khong con WARNING nguon sells chua ton tai",
+              not any("source sells" in m for m in logs), logs)
+        check("config mac dinh khong con sells_jsonl",
+              "sells_jsonl" not in lt.DEFAULTS)
+
+
 if __name__ == "__main__":
     test_exit_tp_ladder()
     test_exit_sl()
@@ -1052,6 +1070,7 @@ if __name__ == "__main__":
     test_run_once_dry_e2e()
     test_pause_still_manages_exits()
     test_pause_smart_exit()
+    test_no_dead_sells_source()
     test_time_stop_retry_after_fail()
     test_time_keep_retry_after_fail()
     test_unknown_error_rolls_back_tp()

@@ -48,7 +48,6 @@ TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
 
 SIG_P = os.path.join(BASE, "signals.jsonl")
 ALERT_P = os.path.join(BASE, "alerts.jsonl")
-SELL_P = os.path.join(BASE, "sells.jsonl")
 POS_P = os.path.join(BASE, "live_positions.json")
 STATE_P = os.path.join(BASE, "live_state.json")
 TRADES_P = os.path.join(BASE, "live_trades.jsonl")
@@ -117,7 +116,6 @@ DEFAULTS = {
     # "signals_jsonl": "/home/ubuntu/muse_bot/live-signals/signals.jsonl"
     "signals_jsonl": "",
     "alerts_jsonl": "",
-    "sells_jsonl": "",
     "reconcile_interval_seconds": 60,
     "signal_retry_seconds": 30,
     "max_signal_retry_seconds": 900,
@@ -858,10 +856,6 @@ def alert_path(cfg):
     return _configured_path(cfg, "alerts_jsonl", ALERT_P)
 
 
-def sell_path(cfg):
-    return _configured_path(cfg, "sells_jsonl", SELL_P)
-
-
 def tail_new(path, offset):
     """Read complete appended JSONL records without losing a partial tail.
 
@@ -927,11 +921,10 @@ class LiveTrader:
         self.paths = {
             "signals": os.path.abspath(sig_path(self.cfg)),
             "alerts": os.path.abspath(alert_path(self.cfg)),
-            "sells": os.path.abspath(sell_path(self.cfg)),
         }
         self.state = {
-            "sig_offset": 0, "alert_offset": 0, "sell_offset": 0,
-            "processed": [], "processed_sells": [],
+            "sig_offset": 0, "alert_offset": 0,
+            "processed": [],
             "signal_failures": {}, "pending_buys": {},
             "source_files": {}, "daily": {}, **st,
         }
@@ -954,7 +947,6 @@ class LiveTrader:
         key_to_offset = {
             "signals": "sig_offset",
             "alerts": "alert_offset",
-            "sells": "sell_offset",
         }
         source_files = self.state.setdefault("source_files", {})
         for key, path in self.paths.items():
@@ -995,8 +987,7 @@ class LiveTrader:
 
     @staticmethod
     def _offset_key(key):
-        return {"signals": "sig_offset", "alerts": "alert_offset",
-                "sells": "sell_offset"}[key]
+        return {"signals": "sig_offset", "alerts": "alert_offset"}[key]
 
     def _tail_source(self, key):
         path = self.paths[key]
@@ -1412,6 +1403,9 @@ class LiveTrader:
             f"size=${cost:.2f} (copy {pos['wallet'][:8]}...)")
 
     # -- sell-cluster intake --------------------------------------------
+    # Smart exit (>=2 vi smart money xa cung token trong cua so) den tu
+    # alerts.jsonl type=sell_cluster do radar.py ghi. Khong co nguon
+    # "sells.jsonl" rieng: truoc day duoc khai bao nhung khong ai ghi/doc.
 
     def ingest_alerts(self):
         alerts, _ = self._tail_source("alerts")
