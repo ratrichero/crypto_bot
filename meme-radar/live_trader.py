@@ -51,6 +51,7 @@ STATE_P = os.path.join(BASE, "live_state.json")
 TRADES_P = os.path.join(BASE, "live_trades.jsonl")
 LOG_P = os.path.join(BASE, "live_trader.log")
 STOP_P = os.path.join(BASE, "STOP")
+PAUSE_P = os.path.join(BASE, "PAUSE")
 CFG_P = os.path.join(BASE, "config.live.json")
 ENV_P = os.path.join(BASE, ".env")
 
@@ -1288,24 +1289,39 @@ class LiveTrader:
             return True
         return False
 
+    @staticmethod
+    def _rollback_leg(pos, frac, why):
+        """Hoan tac thay doi cua decide_exits khi leg ban that bai.
+
+        decide_exits da tru `remaining` va bat flag TRUOC khi lenh ban chay.
+        Neu khong hoan tac flag, dieu kien do se khong bao gio kich hoat lai
+        (vd. ts_done=True -> time stop khong thu lai, vi the bi om toi SL).
+        TRAIL/SL/SMART_EXIT khong co flag mot-lan nen tu thu lai poll sau.
+        """
+        pos["remaining"] = min(1.0, pos.get("remaining", 0.0) + frac)
+        if why == "TP1":
+            pos["tp1"] = False
+        elif why == "TP2":
+            pos["tp2"] = False
+        elif why == "TIME_KEEP":
+            pos["ts_done"] = False
+            pos["ts_keep"] = False
+        elif why == "TIME":
+            pos["ts_done"] = False
+
     def _sell_leg(self, pos, frac, why, price, now):
+        """Ban 1 leg. Tra ve True neu thanh cong, False neu da hoan tac."""
         try:
             r = self.swapper.execute_sell(pos["token"], frac, pos["symbol"])
         except (NoRoute, SwapError) as e:
             log(f"{pos['symbol']} ban {why} THAT BAI: {e} (se thu lai)")
-            # hoan tac flag trong decide_exits da tru? remaining da tru o
-            # decide_exits (pure) -> can phuc hoi de thu lai poll sau
-            pos["remaining"] = min(1.0, pos.get("remaining", 0.0) + frac)
-            if why in ("TP1",):
-                pos["tp1"] = False
-            elif why in ("TP2",):
-                pos["tp2"] = False
-            return
+            self._rollback_leg(pos, frac, why)
+            return False
         except Exception:
-            log(f"{pos['symbol']} ban {why} LOI khong xac dinh:\n"
+            log(f"{pos['symbol']} ban {why} LOI khong xac dinh (se thu lai):\n"
                 + traceback.format_exc())
-            pos["remaining"] = min(1.0, pos.get("remaining", 0.0) + frac)
-            return
+            self._rollback_leg(pos, frac, why)
+            return False
         if r.get("simulated"):
             proceeds = r["proceeds_usd"]
             # dry-run: tinh theo gia quote
@@ -1323,6 +1339,7 @@ class LiveTrader:
                             "at": int(now), "tx": r.get("tx")})
         log(f"{'DRY' if self.dry else 'LIVE'} SELL {pos['symbol']} {why} "
             f"{frac:.0%} +${proceeds:.2f} (pnl {pnl:+.2f})")
+        return True
 
     def _close_position(self, pos, reason, price, now):
         total_ret = pos.get("realized_usd", 0.0) / pos["size_usd"] \
@@ -1347,47 +1364,63 @@ class LiveTrader:
 
     # -- main loop --------------------------------------------------------
 
+    def manage_positions(self, now):
+        """Chay exit ladder cho moi vi the (stagger price poll)."""
+        for i, p in enumerate(list(self.positions)):
+            try:
+                self.manage_one(p, now + i * 0.05)
+            except Exception:
+                log(f"ERROR manage {p.get('symbol')}:\n"
+                    + traceback.format_exc())
+
+    def skip_signals_paused(self, now):
+        """Dang PAUSE: doc signal moi + signal retry den han, danh dau
+        skipped_paused (khong mua). Tra ve so signal da bo qua."""
+        sigs, _ = self._tail_source("signals")
+        processed = self.state.setdefault("processed", [])
+        n = 0
+        for s in list(self._retry_failed_signals(now)) + list(sigs):
+            tid = str(s.get("tid") or "")
+            if not tid or tid in processed:
+                continue
+            self._mark_processed(tid, "skipped_paused")
+            n += 1
+        if n:
+            log(f"PAUSE: bo qua {n} signal (khong mo vi the moi)")
+        return n
+
     def run_once(self, now=None):
-        """Mot vong lap. Tra ve 'stop' neu gap kill switch."""
+        """Mot vong lap. Tra ve 'stop' neu gap kill switch, 'paused' neu
+        dang PAUSE (van reconcile + smart exit + exit ladder), 'ok' neu binh
+        thuong."""
         now = now or time.time()
         if os.path.exists(STOP_P):
             log("STOP file -> shutdown. VI THE LIVE VAN MO — tu dong tay, "
                 "module KHONG tu dong dong.")
             self.save()
             return "stop"
-        # PAUSE: khong mo lenh moi, van quan ly vi the cu
-        paused = os.path.exists(os.path.join(os.path.dirname(__file__), "PAUSE"))
-        if paused:
-            # Van chay reconcile va quan ly vi the, chi skip mo moi
-            try:
-                self.reconcile_onchain(now)
-                self.manage_positions(now)
-            except Exception as e:
-                log(f"PAUSE loop loi: {e}")
-            self.save()
-            return None
+        paused = os.path.exists(PAUSE_P)
         try:
             self.reconcile_onchain(now)
         except Exception:
             log("ERROR reconcile:\n" + traceback.format_exc())
         try:
-            self.ingest_signals(now)
+            if paused:
+                # PAUSE: KHONG mo lenh moi. Van tieu thu signal (danh dau
+                # skipped_paused) de khi bo PAUSE khong mua don tin cu.
+                self.skip_signals_paused(now)
+            else:
+                self.ingest_signals(now)
         except Exception:
             log("ERROR ingest signals:\n" + traceback.format_exc())
+        # sell_cluster (smart exit) va exit ladder chay CA KHI PAUSE
         try:
             self.ingest_alerts()
         except Exception:
             log("ERROR ingest alerts:\n" + traceback.format_exc())
-        # stagger price poll giua cac vi the
-        for i, p in enumerate(list(self.positions)):
-            try:
-                # chi poll 1 vi the moi lan goi neu chua den han cua no
-                self.manage_one(p, now + i * 0.05)
-            except Exception:
-                log(f"ERROR manage {p.get('symbol')}:\n"
-                    + traceback.format_exc())
+        self.manage_positions(now)
         self.save()
-        return "ok"
+        return "paused" if paused else "ok"
 
 
 def main():

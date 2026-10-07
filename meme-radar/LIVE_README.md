@@ -45,6 +45,12 @@ trailing → SL → smart exit → time stop (giống paper).
   hoặc pubkey không khớp `wallet_address` → chương trình TỰ DỪNG.
 - **Kill switch**: tạo file `STOP` trong thư mục này → vòng lặp dừng
   nhẹ nhàng. ⚠️ **STOP không tự đóng vị thế đang mở** — phải xử lý tay.
+- **PAUSE**: tạo file `PAUSE` trong thư mục này → ngừng MỞ MỚI nhưng vẫn
+  reconcile ví, nhận smart exit (sell_cluster) và chạy đủ exit ladder
+  (TP/SL/trailing/time stop). Tín hiệu đến trong lúc PAUSE bị đánh dấu
+  `skipped_paused` — xoá PAUSE xong bot KHÔNG mua đón tín hiệu cũ.
+- **Leg bán thất bại** (no route, lỗi RPC…): hoàn tác `remaining` và cờ của
+  điều kiện đó (TP1/TP2/TIME/TIME_KEEP) để poll sau thử lại, không bị kẹt.
 - **Daily stop**: ngừng MỞ MỚI khi lỗ thực tế trong ngày (UTC) <
   `-daily_stop_pct` × portfolio đầu ngày. Vị thế cũ vẫn được quản lý exit.
 - **Fee buffer**: luôn giữ tối thiểu `fee_buffer_sol` SOL cho phí.

@@ -33,8 +33,8 @@ def isolated():
     """Cach ly moi path runtime cua module vao thu muc tam."""
     tmpd = tempfile.mkdtemp()
     olds = {}
-    for name in ("SIG_P", "ALERT_P", "POS_P", "STATE_P",
-                 "TRADES_P", "LOG_P", "STOP_P"):
+    for name in ("SIG_P", "ALERT_P", "SELL_P", "POS_P", "STATE_P",
+                 "TRADES_P", "LOG_P", "STOP_P", "PAUSE_P"):
         olds[name] = getattr(lt, name)
         setattr(lt, name, os.path.join(tmpd, name.lower()))
     olds["BASE"] = lt.BASE
@@ -314,6 +314,152 @@ def test_run_once_dry_e2e():
         check("khong goi swap that", jup.swaps == 0)
 
 
+# ---- PAUSE + rollback leg that bai ----
+
+def _dry_trader(tmpd, price_map):
+    cfg = dict(lt.DEFAULTS, mode="dry_run", price_poll_seconds=0)
+    jup = FakeJup(price_map=price_map)
+    rpc = FakeRpc()
+    tr = lt.LiveTrader(cfg, jup=jup, rpc=rpc)
+    tr.swapper = lt.Swapper(rpc, jup, None, cfg, dry_run=True)
+    return tr, jup
+
+
+def _sig(tid, token, ts=1000):
+    return {"detected_at": ts, "tid": tid, "wallet": "W", "token": token,
+            "symbol": token, "amount_usd": 500.0, "price_usd": 0.001,
+            "price_now": 0.001, "ts": ts, "tx": "x", "mcap_usd": 60000,
+            "src": "ws"}
+
+
+def test_pause_still_manages_exits():
+    print("== PAUSE: van chay SL, khong mo moi, khong mua tin cu sau PAUSE ==")
+    with isolated() as tmpd:
+        tr, jup = _dry_trader(tmpd, {"MINT": 0.74, "MINT_NEW": 0.001})
+        pos = mkpos(entry=1.0, opened_at=900)
+        pos["price_poll_at"] = 0
+        tr.positions = [pos]
+        with open(lt.SIG_P, "a") as f:
+            f.write(json.dumps(_sig("tid_paused", "MINT_NEW")) + "\n")
+        open(lt.PAUSE_P, "w").write("")
+        res = tr.run_once(now=1000)
+        check("run_once tra ve 'paused'", res == "paused", str(res))
+        check("SL van chay khi PAUSE (vi the da dong)",
+              not any(p["token"] == "MINT" for p in tr.positions),
+              str(tr.positions))
+        check("khong mo vi the moi khi PAUSE",
+              not any(p["token"] == "MINT_NEW" for p in tr.positions))
+        check("signal danh dau processed",
+              "tid_paused" in tr.state["processed"])
+        trades = [json.loads(l) for l in open(lt.TRADES_P)]
+        check("ghi trade reason=stop_loss",
+              trades and trades[-1]["reason"] == "stop_loss", str(trades))
+        os.unlink(lt.PAUSE_P)
+        res = tr.run_once(now=1100)
+        check("bo PAUSE -> 'ok'", res == "ok", str(res))
+        check("bo PAUSE khong mua don signal cu",
+              not any(p["token"] == "MINT_NEW" for p in tr.positions),
+              str(tr.positions))
+        check("khong goi swap that", jup.swaps == 0)
+
+
+def test_pause_smart_exit():
+    print("== PAUSE: sell_cluster van kich hoat smart exit ==")
+    with isolated() as tmpd:
+        tr, _ = _dry_trader(tmpd, {"MINT": 1.1})
+        pos = mkpos(entry=1.0, opened_at=900)
+        pos["price_poll_at"] = 0
+        tr.positions = [pos]
+        with open(lt.ALERT_P, "a") as f:
+            f.write(json.dumps({"ts": 1000, "type": "sell_cluster",
+                                "token": "MINT", "n_wallets": 2}) + "\n")
+        open(lt.PAUSE_P, "w").write("")
+        tr.run_once(now=1000)
+        check("smart exit dong vi the khi PAUSE", tr.positions == [],
+              str(tr.positions))
+
+
+class FlakySwapper:
+    """execute_sell nem loi `fails` lan dau, sau do thanh cong (dry)."""
+
+    def __init__(self, fails=1, exc=None):
+        self.fails = fails
+        self.exc = exc or lt.SwapError("no route tam thoi")
+        self.calls = []
+
+    def execute_sell(self, mint, frac, symbol="?"):
+        self.calls.append((mint, frac))
+        if self.fails > 0:
+            self.fails -= 1
+            raise self.exc
+        return {"sold_base": 0, "proceeds_usd": 0.0, "tx": None,
+                "dry": True, "simulated": True}
+
+
+def _trader_with(tmpd, price, swapper):
+    tr, _ = _dry_trader(tmpd, {"MINT": price})
+    tr.swapper = swapper
+    return tr
+
+
+def test_time_stop_retry_after_fail():
+    print("== TIME ban that bai -> poll sau thu lai (khong om toi SL) ==")
+    with isolated() as tmpd:
+        sw = FlakySwapper(fails=1)
+        tr = _trader_with(tmpd, 1.0, sw)  # ret 0% -> TIME cat het
+        pos = mkpos(entry=1.0, opened_at=0)
+        pos["price_poll_at"] = 0
+        tr.positions = [pos]
+        t = 481 * 60
+        closed = tr.manage_one(pos, t)
+        check("lan 1 that bai -> chua dong", closed is False)
+        check("remaining hoan lai 1.0", abs(pos["remaining"] - 1.0) < 1e-9,
+              str(pos["remaining"]))
+        check("ts_done hoan tac", pos["ts_done"] is False)
+        closed = tr.manage_one(pos, t + 30)
+        check("lan 2 thu lai TIME va dong", closed is True and not tr.positions)
+        check("2 lan goi sell", len(sw.calls) == 2, str(sw.calls))
+        trades = [json.loads(l) for l in open(lt.TRADES_P)]
+        check("reason=time_stop", trades[-1]["reason"] == "time_stop",
+              str(trades[-1]))
+
+
+def test_time_keep_retry_after_fail():
+    print("== TIME_KEEP ban that bai -> hoan tac ts_keep/ts_done ==")
+    with isolated() as tmpd:
+        sw = FlakySwapper(fails=1)
+        tr = _trader_with(tmpd, 1.25, sw)  # +25% -> TIME_KEEP 1/2
+        pos = mkpos(entry=1.0, opened_at=0)
+        pos["price_poll_at"] = 0
+        tr.positions = [pos]
+        t = 481 * 60
+        tr.manage_one(pos, t)
+        check("ts_keep hoan tac", pos["ts_keep"] is False)
+        check("ts_done hoan tac", pos["ts_done"] is False)
+        check("remaining 1.0", abs(pos["remaining"] - 1.0) < 1e-9)
+        tr.manage_one(pos, t + 30)
+        check("lan 2 TIME_KEEP thanh cong",
+              pos["ts_keep"] is True and abs(pos["remaining"] - 0.5) < 1e-9,
+              str((pos["ts_keep"], pos["remaining"])))
+        check("co leg TIME_KEEP", [l["why"] for l in pos["legs"]] == ["TIME_KEEP"])
+
+
+def test_unknown_error_rolls_back_tp():
+    print("== loi khong xac dinh khi ban TP1 -> hoan tac tp1 ==")
+    with isolated() as tmpd:
+        sw = FlakySwapper(fails=1, exc=RuntimeError("rpc timeout la"))
+        tr = _trader_with(tmpd, 1.6, sw)
+        pos = mkpos(entry=1.0, opened_at=900)
+        pos["price_poll_at"] = 0
+        tr.positions = [pos]
+        tr.manage_one(pos, 1000)
+        check("tp1 hoan tac", pos["tp1"] is False)
+        check("remaining 1.0", abs(pos["remaining"] - 1.0) < 1e-9)
+        tr.manage_one(pos, 1030)
+        check("lan 2 TP1 ban duoc", pos["tp1"] is True
+              and [l["why"] for l in pos["legs"]] == ["TP1"])
+
+
 if __name__ == "__main__":
     test_exit_tp_ladder()
     test_exit_sl()
@@ -328,5 +474,10 @@ if __name__ == "__main__":
     test_key_match_ok()
     test_stop_file()
     test_run_once_dry_e2e()
+    test_pause_still_manages_exits()
+    test_pause_smart_exit()
+    test_time_stop_retry_after_fail()
+    test_time_keep_retry_after_fail()
+    test_unknown_error_rolls_back_tp()
     print(f"\n{PASS} pass, {FAIL} fail")
     sys.exit(1 if FAIL else 0)
