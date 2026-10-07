@@ -877,6 +877,35 @@ def test_uncertain_pending_allows_full_sl():
         check("dong vi the", closed is True and w.balance == 0)
 
 
+
+# ---- vi het token: khong ghi lo gia ----
+
+class EmptyWallet(UncertainWallet):
+    def execute_sell(self, mint, frac, symbol="?"):
+        self.calls.append(round(frac, 4))
+        return {"sold_base": 0, "proceeds_usd": 0.0, "tx": None,
+                "dry": False, "note": "empty"}
+
+
+def test_empty_wallet_no_fake_loss():
+    print("== SL nhung vi da het token -> dong, khong ghi lo -100% ==")
+    with isolated() as tmpd:
+        w = EmptyWallet(0, [])
+        tr, _ = _live_wallet_trader(tmpd, 0.7, w)
+        pos = mkpos(entry=1.0, opened_at=900)
+        pos["price_poll_at"] = 0
+        tr.positions = [pos]
+        before = tr._daily().get("realized_usd", 0.0)
+        closed = tr.manage_one(pos, 1000)
+        check("dong vi the", closed is True and not tr.positions)
+        check("daily realized khong doi",
+              tr._daily().get("realized_usd", 0.0) == before,
+              str(tr._daily()))
+        rec = json.loads(open(lt.TRADES_P).read().splitlines()[-1])
+        check("reason=wallet_empty", rec["reason"] == "wallet_empty", str(rec))
+        check("realized 0 (khong -$10)", rec["realized_usd"] == 0.0, str(rec))
+
+
 if __name__ == "__main__":
     test_exit_tp_ladder()
     test_exit_sl()
@@ -913,5 +942,6 @@ if __name__ == "__main__":
     test_uncertain_partial_landed_no_double_sell()
     test_uncertain_partial_not_landed_waits_then_retries()
     test_uncertain_pending_allows_full_sl()
+    test_empty_wallet_no_fake_loss()
     print(f"\n{PASS} pass, {FAIL} fail")
     sys.exit(1 if FAIL else 0)

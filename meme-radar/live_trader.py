@@ -1420,7 +1420,9 @@ class LiveTrader:
                 log(f"{pos['symbol']}: dust {pos['remaining']:.2%} bo qua "
                     f"khi dong vi the")
                 pos["remaining"] = 0.0
-            self._close_position(pos, reason or "ladder_done", price, now)
+            self._close_position(
+                pos, pos.get("close_reason") or reason or "ladder_done",
+                price, now)
             return True
         return False
 
@@ -1548,6 +1550,21 @@ class LiveTrader:
                 log(f"{pos['symbol']} {why}: cho xac minh so du truoc khi "
                     "ban tung phan tiep")
             return False
+        if r.get("note") in ("empty", "dust"):
+            # Vi khong con token de ban (ban tay / chuyen di / dust): KHONG
+            # biet tien thu ve -> khong ghi lo gia (truoc day ghi -100% phan
+            # nay, co the kich hoat nham daily stop). Dong vi the.
+            pos["legs"].append({"frac": round(frac, 4), "why": why,
+                                "balance_frac": round(bal_frac, 4),
+                                "proceeds_usd": None, "pnl_usd": 0.0,
+                                "at": int(now), "tx": None,
+                                "note": f"wallet_{r['note']}"})
+            pos["remaining"] = 0.0
+            pos["close_reason"] = f"wallet_{r['note']}"
+            log(f"CANH BAO {pos['symbol']} {why}: vi khong con token "
+                f"({r['note']}) -> dong vi the, P&L phan con lai KHONG XAC "
+                "DINH (khong tinh vao daily)")
+            return True
         if r.get("simulated"):
             proceeds = r["proceeds_usd"]
             # dry-run: tinh theo gia quote
