@@ -641,7 +641,9 @@ def main():
                             dirty = True
                     except Exception as e:
                         log(f"retry_protection loi: {e}")
-                if not st["halted"]:
+                # Kiem tra PAUSE file - neu co thi khong mo lenh moi
+                paused = os.path.exists(os.path.join(BASE, "PAUSE"))
+                if not st["halted"] and not paused:
                     for symbol in SYMBOLS:
                         px = prices.get(symbol)
                         cc = candles.get(symbol)

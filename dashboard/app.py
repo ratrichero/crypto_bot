@@ -620,6 +620,53 @@ def tab_monitor():
 
     st.divider()
 
+    # Dieu khien bot chu dong: Pause/Resume
+    st.markdown("### ⏯️ Điều khiển bot")
+    pause_file = "/home/ubuntu/muse_bot/binance-bot/PAUSE"
+    is_paused = os.path.exists(pause_file)
+    col1, col2 = st.columns(2)
+    with col1:
+        if is_paused:
+            st.warning("⏸️ Bot đang PAUSE (không mở lệnh mới)")
+            if st.button("▶️ Resume bot", key="resume_binance"):
+                try:
+                    os.remove(pause_file)
+                    st.success("Đã resume - bot sẽ mở lệnh mới trở lại")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Lỗi: {e}")
+        else:
+            st.info("▶️ Bot đang chạy bình thường")
+            if st.button("⏸️ Pause bot", key="pause_binance"):
+                try:
+                    open(pause_file, 'w').write(
+                        f"Paused at {datetime.now(TZINFO).isoformat()}\n")
+                    st.warning("Đã pause - bot không mở lệnh mới nữa")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Lỗi: {e}")
+    with col2:
+        # Xoa halt
+        try:
+            with open(BINANCE_STATE) as f:
+                bs = json.load(f)
+            if bs.get("halted"):
+                st.error(f"🛑 HALT: {bs.get('halt_reason')}")
+                if st.button("✅ Xác nhận & xóa halt", key="clear_halt"):
+                    bs["halted"] = False
+                    bs["halt_reason"] = None
+                    bs.pop("halted_at", None)
+                    with open(BINANCE_STATE, 'w') as f:
+                        json.dump(bs, f)
+                    st.success("Đã xóa halt")
+                    st.rerun()
+            else:
+                st.success("✅ Không halt")
+        except Exception as e:
+            st.info(f"Không đọc được state: {e}")
+
+    st.divider()
+
     # Log realtime
     st.markdown("### Log realtime (20 dòng mới nhất)")
     svc_choice = st.selectbox(
