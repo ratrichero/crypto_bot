@@ -924,6 +924,29 @@ def test_reconcile_gone_writes_trade():
               and len(rec.get("legs", [])) == 1, str(rec))
 
 
+
+# ---- DexScreener chon dung pair ----
+
+def test_pick_dexscreener_price():
+    print("== DexScreener: chon pair mint la base, thanh khoan cao nhat ==")
+    rows = [
+        {"baseToken": {"address": "OTHER"}, "quoteToken": {"address": "MINT"},
+         "priceUsd": "150", "priceNative": "1000", "liquidity": {"usd": 9e6}},
+        {"baseToken": {"address": "MINT"}, "quoteToken": {"address": "SOL"},
+         "priceUsd": "0.20", "liquidity": {"usd": 500}},
+        {"baseToken": {"address": "MINT"}, "quoteToken": {"address": "USDC"},
+         "priceUsd": "0.15", "liquidity": {"usd": 80000}},
+    ]
+    check("chon 0.15 (base, liq cao nhat)", lt.pick_dexscreener_price(rows, "MINT") == 0.15)
+    only_quote = rows[:1]
+    check("chi co pair quote -> priceUsd/priceNative",
+          abs(lt.pick_dexscreener_price(only_quote, "MINT") - 0.15) < 1e-12)
+    check("rong -> None", lt.pick_dexscreener_price([], "MINT") is None)
+    check("rac -> None", lt.pick_dexscreener_price({"x": 1}, "MINT") is None)
+    check("khong lien quan -> None", lt.pick_dexscreener_price(
+        [{"baseToken": {"address": "X"}, "priceUsd": "1"}], "MINT") is None)
+
+
 if __name__ == "__main__":
     test_exit_tp_ladder()
     test_exit_sl()
@@ -962,5 +985,6 @@ if __name__ == "__main__":
     test_uncertain_pending_allows_full_sl()
     test_empty_wallet_no_fake_loss()
     test_reconcile_gone_writes_trade()
+    test_pick_dexscreener_price()
     print(f"\n{PASS} pass, {FAIL} fail")
     sys.exit(1 if FAIL else 0)

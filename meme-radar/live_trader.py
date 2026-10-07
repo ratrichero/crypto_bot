@@ -206,6 +206,49 @@ def signal_age_seconds(signal, now):
     return max(0.0, now - ts)
 
 
+def pick_dexscreener_price(rows, mint):
+    """Gia USD cua `mint` tu danh sach pair DexScreener.
+
+    rows[0] co the la pair ma mint la QUOTE token (priceUsd la gia cua base
+    token khac) hoac pool rac thanh khoan thap -> chon pair co mint la BASE,
+    thanh khoan USD cao nhat. Khong co -> suy tu pair mint la quote
+    (priceUsd / priceNative). Khong suy duoc -> None.
+    """
+    if not isinstance(rows, list):
+        return None
+
+    def liq(row):
+        try:
+            return float((row.get("liquidity") or {}).get("usd") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def num(v):
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return None
+        return f if f > 0 and f == f and f != float("inf") else None
+
+    best, best_liq = None, -1.0
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        base = (row.get("baseToken") or {}).get("address")
+        quote = (row.get("quoteToken") or {}).get("address")
+        px = None
+        if base == mint:
+            px = num(row.get("priceUsd"))
+            rank = liq(row) + 1e18  # uu tien tuyet doi pair mint la base
+        elif quote == mint:
+            pu, pn = num(row.get("priceUsd")), num(row.get("priceNative"))
+            px = pu / pn if pu and pn else None
+            rank = liq(row)
+        if px is not None and rank > best_liq:
+            best, best_liq = px, rank
+    return best
+
+
 def price_impact_pct(quote):
     """Price impact theo PHAN TRAM (5.0 = 5%) tu Jupiter quote.
 
@@ -447,10 +490,7 @@ class JupiterClient:
             f"https://api.dexscreener.com/tokens/v1/solana/{mint}",
             timeout=12)
         r.raise_for_status()
-        rows = r.json()
-        if not rows:
-            return None
-        return float(rows[0]["priceUsd"])
+        return pick_dexscreener_price(r.json(), mint)
 
 
 # ---------------------------------------------------------------- swapper
