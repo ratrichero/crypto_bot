@@ -163,3 +163,22 @@ lệnh cũ ở các mức thanh khoản giả định.
 - `feasibility.py`, `test_feasibility.py` — kiểm tra khả thi paper
 - `live_positions.json`, `live_state.json`, `live_trades.jsonl`,
   `live_trader.log` — runtime state (tự tạo, không commit)
+
+## Doi chieu P&L voi vi (reconcile_wallet.py)
+
+Dashboard hien `realized_usd` bot ghi = (SOL nhan khi ban − SOL chi khi mua) × gia
+SOL, **da tru phi mang** (base + priority) cua ca tx mua va ban; rent token account
+tach rieng. App vi (Phantom/GMGN/...) thuong tinh **truoc phi mang** va co the
+tinh rent/gia SOL khac -> lech vai cent moi lenh la binh thuong.
+
+Doi chieu tung lenh voi tx that (chi doc, khong can private key):
+
+```bash
+.venv/bin/python meme-radar/reconcile_wallet.py              # 24h
+.venv/bin/python meme-radar/reconcile_wallet.py --hours 48 --scan --detail
+```
+
+- `Bot` = dashboard, `Chain` = tinh lai tu tx that (cung cach bot), `TruocPhi` =
+  Chain + phi mang (gan voi so app vi). `Bot` ≠ `Chain` -> co `BOT_LECH_CHAIN`.
+- `--scan`: tx cua vi ma bot khong ghi (tx loi van mat phi, thu hoi rent, mua/ban
+  tay...).
