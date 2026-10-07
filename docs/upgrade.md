@@ -639,3 +639,28 @@ sẽ dùng) cho ra ít hơn `grid.range_min_levels` tầng mỗi phía.
   không cần đoán độ rộng biên.
 - Chỉ áp dụng cho `grid.engine = range`. Grid classic không đổi; việc chỉnh
   `step_mult` và `range_steps` của classic chờ kết quả backtest.
+
+### 10.8 Sửa lỗi vận hành: halt "partial", nút Xóa halt, config version, phiên dashboard
+
+- **Lệnh MARKET khớp qua nhiều mức giá** (`f854aaa`, `7dd49cb`): event
+  `PARTIALLY_FILLED` trước `FILLED` không còn bị coi là khớp một phần. Bot chờ
+  trạng thái cuối (WS, hoặc poll REST tối đa `order_poll_attempts` = 4 lần).
+  Chỉ trạng thái cuối với 0 < filled < qty mới là partial thật: khi đó bot
+  nhận lot với qty thật, có SL/TP. Halt `partial market order ...` /
+  `ambiguous ...` / `order fill reconciliation ...` tự gỡ khi đủ 3 điều kiện:
+  không còn `ambiguous_orders`, sàn khớp state, mọi lot đủ SL/TP.
+- **Nút "✅ Xóa halt"** (`5723e76`): dashboard không sửa `state.json` nữa mà tạo
+  file `binance-bot/CLEAR_HALT`. Bot kiểm tra an toàn (lệnh chờ đối chiếu, sàn
+  khớp, đủ SL/TP, startup hold, daily stop trong ngày) rồi gỡ halt trong RAM.
+  Kết quả ghi vào `clear_halt_result.json`, dashboard hiển thị. Dùng tay:
+  `touch binance-bot/CLEAR_HALT`. Dashboard tìm thư mục bot qua `BINANCE_DIR`
+  (mặc định là thư mục chứa `BINANCE_STATE`).
+- **Config version None (nguồn cache)** (`d3e7243`): bot áp cache/file trước,
+  rồi seed version đầu tiên từ config đang chạy. DB lỗi lúc start thì
+  `poll()` thử seed lại mỗi 60s. Seed không hợp lệ thì dashboard (tab Cấu
+  hình) hiện lý do; sửa trên dashboard rồi Lưu là có version.
+- **Giữ phiên đăng nhập qua F5** (`c6d97d5`): bảng `dashboard_sessions`
+  (chỉ lưu SHA-256 token), cookie `mb_session`, hạn 7 ngày
+  (`DASHBOARD_SESSION_DAYS`). Cần `streamlit>=1.42`. Khoá tài khoản / đổi mật
+  khẩu / "Đăng xuất mọi thiết bị" thì thu hồi phiên. Cookie ghi bằng JS nên
+  không HttpOnly; chưa có HTTPS nên không có Secure (tự bật khi chạy HTTPS).
