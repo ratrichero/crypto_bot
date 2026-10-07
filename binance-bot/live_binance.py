@@ -96,6 +96,19 @@ class DataOnlyEngine:
 
 
 # ------------------------------------------------------------------- engine
+class GuardAlreadyFilled(Exception):
+    """close() found that Binance's own TP/SL already closed the lot."""
+
+    def __init__(self, label, outcome):
+        super().__init__("guard %s already filled" % label)
+        self.label = label
+        self.outcome = outcome
+
+
+class GuardInFlight(Exception):
+    """A guard is triggering right now; its result is not known yet."""
+
+
 class BinanceEngine:
     """Engine backed by real Binance USDT-M orders (or dry-run logging)."""
 
@@ -124,6 +137,7 @@ class BinanceEngine:
         self._algo_events = {}
         self._protection_sync_due = True
         self._last_protection_sync = 0.0
+        self._trigger_seen = {}
         self._order_condition = threading.Condition()
         self._last_account_event = 0.0
         self._account_position_snapshot = {}
@@ -776,6 +790,7 @@ class BinanceEngine:
                 and not pos.get("sl_algo_id") and not pos.get("tp_algo_id")):
             return
         absent_ids = []
+        absent_labels = []
         for key in ("sl_algo_id", "tp_algo_id"):
             label = key[:-8]  # sl_algo_id -> sl; tp_algo_id -> tp
             algo_id = pos.get(key)
@@ -806,6 +821,7 @@ class BinanceEngine:
                     self.log("INFO protection guard=%s already absent"
                              % (algo_id or client_algo_id))
                     absent_ids.append(algo_id or client_algo_id)
+                    absent_labels.append(label)
                     continue
                 # Never send a market close while an exchange-side guard may
                 # still be live: a later trigger could open a new Hedge leg.
@@ -817,6 +833,21 @@ class BinanceEngine:
                     % (algo_id or client_algo_id)
                 ) from exc
 
+        for label in absent_labels:
+            # "Not found" usually means Binance already triggered the guard
+            # (the race with our own local TP/SL check). Ask what happened:
+            # a fill is a normal exchange close, not a reconciliation fault.
+            outcome = self._algo_outcome(pos, label)
+            if outcome is None:
+                continue
+            if outcome["status"] in self._ALGO_IN_FLIGHT or (
+                    outcome["status"] == "FINISHED"
+                    and outcome.get("qty") is None):
+                self._protection_sync_soon(1.0)
+                raise GuardInFlight("guard %s of #%s is executing"
+                                    % (label, pos.get("id")))
+            if outcome["status"] == "FINISHED" and outcome["qty"] > 0:
+                raise GuardAlreadyFilled(label, outcome)
         if absent_ids:
             # "Algo not found" is also the response when a STOP/TP has
             # already triggered. Verify the Hedge leg still exists before
@@ -1361,8 +1392,13 @@ class BinanceEngine:
         client_algo_id = pos.get("%s_client_algo_id" % label)
         if not algo_id and not client_algo_id:
             return None
-        with self._order_condition:
-            event = self._algo_events.get("%s:%s" % (symbol, algo_id))
+        condition = getattr(self, "_order_condition", None)
+        events = getattr(self, "_algo_events", None) or {}
+        if condition is not None:
+            with condition:
+                event = events.get("%s:%s" % (symbol, algo_id))
+        else:
+            event = events.get("%s:%s" % (symbol, algo_id))
         outcome = None
         if event is not None:
             outcome = {
@@ -1505,11 +1541,42 @@ class BinanceEngine:
                     " [gia uoc tinh]" if estimated else ""))
         return rec
 
+    def defer_local_exit(self, pos, label):
+        """True while Binance's own armed guard should execute this exit.
+
+        The bot and the exchange watch the same mark price. Closing locally
+        at the same moment races the exchange trigger (cancel says "not
+        found", the lot is half-handled). With an armed guard the bot waits
+        ``protection_grace_seconds`` for Binance, then falls back to its own
+        market close if the guard still has not fired.
+        """
+        if self.dry_run or not self.cfg.get("exchange_protection", False):
+            return False
+        if (pos.get("protection_status") != "armed"
+                or not pos.get("%s_algo_id" % label)):
+            return False
+        now = time.time()
+        key = (pos.get("id"), label)
+        first = self._trigger_seen.setdefault(key, now)
+        grace = float(self.cfg.get("protection_grace_seconds", 15))
+        if now - first < grace:
+            self._protection_sync_soon(1.0)
+            return True
+        self.log("WARNING PROTECTION #%s guard %s chua khop sau %.0fs -> "
+                 "bot tu dong lenh" % (pos.get("id"), label.upper(),
+                                       now - first))
+        return False
+
+    def clear_local_trigger(self, pos):
+        for label in ("sl", "tp"):
+            self._trigger_seen.pop((pos.get("id"), label), None)
+
     def _protection_sync_soon(self, seconds=2.0):
         """Re-check an in-flight guard shortly, without a 0.5s REST loop."""
         interval = float(self.cfg.get("protection_sync_seconds", 10))
-        self._last_protection_sync = min(self._last_protection_sync,
-                                         time.time() - interval + seconds)
+        self._last_protection_sync = min(
+            getattr(self, "_last_protection_sync", 0.0),
+            time.time() - interval + seconds)
 
     def sync_exchange_protection(self, force=False):
         """Resolve every lot guard against Binance; return closed records.
@@ -1782,6 +1849,15 @@ class BinanceEngine:
                                        order_direction, order_type))
 
         missing = sorted(set(expected) - seen)
+        if missing:
+            # A guard that is no longer open has finished (TP/SL filled while
+            # the bot was down) or was cancelled. sync_exchange_protection
+            # resolves each one by algoId: book the fill or re-arm.
+            self.log("INFO %d guard khong con open khi khoi dong: %s -> "
+                     "sync_exchange_protection se doi chieu" %
+                     (len(missing), missing))
+            self._protection_sync_due = True
+            missing = []  # resolved by sync, not a startup halt
         if missing or unknown or missing_required or guard_mismatch:
             self.state["halted"] = True
             self.state["halt_reason"] = (
@@ -1856,18 +1932,21 @@ class BinanceEngine:
             self.state["halt_reason"] = "exchange position reconciliation unavailable"
             self.log("CRITICAL khong doc duoc vi the san de doi chieu: %s" % e)
             return
-        kept = [p for p in self.state["positions"] if p.get("live")]
+        still = [p for p in self.state["positions"] if p.get("live")]
         pruned = [p for p in self.state["positions"] if not p.get("live")]
-        still = []
         exchange_keys = set(exchange)
-        for p in kept:
-            if (p["symbol"], p["side"]) in exchange_keys:
-                still.append(p)
-            else:
-                pruned.append(p)
         if pruned:
-            self.log("WARNING loai bo %d vi the khong ton tai tren san: ids=%s"
-                     % (len(pruned), [p["id"] for p in pruned]))
+            self.log("WARNING loai bo %d vi the paper/dry khong phai lenh "
+                     "that: ids=%s" % (len(pruned), [p["id"] for p in pruned]))
+        gone = [p for p in still if (p["symbol"], p["side"]) not in exchange_keys]
+        if gone:
+            # Do NOT silently drop them: they were most likely closed by
+            # their exchange TP/SL while the bot was down. Protection sync /
+            # detect_exchange_closed book the real fill (PnL -> DB); until
+            # then reconciliation holds new entries and auto-recovers.
+            self.log("WARNING %d lot khong con tren san khi khoi dong: ids=%s "
+                     "-> doi chieu qua sync/detect de ghi PnL"
+                     % (len(gone), [p["id"] for p in gone]))
         self.state["positions"] = still
         local_keys = {(p["symbol"], p["side"]) for p in still}
         for key in sorted(exchange_keys - local_keys):
@@ -2268,6 +2347,20 @@ class BinanceEngine:
             return rec
         except binance_safety.BinanceSafetyStop:
             raise
+        except GuardAlreadyFilled as filled:
+            rec = self._finalize_exchange_close(pos, filled.label,
+                                                filled.outcome)
+            if rec:
+                self._mark_action_success(key)
+                self.log("CLOSE #%s %s: guard %s da khop tren san truoc "
+                         "(yeu cau %s) -> ghi nhan fill san"
+                         % (pos["id"], symbol, filled.label.upper(), reason))
+            return rec
+        except GuardInFlight as busy:
+            # Do not halt: the guard is closing the lot right now and the
+            # protection sync books it within seconds.
+            self._mark_action_failure(key, busy)
+            return None
         except Exception as e:
             # A failed close can leave exchange exposure while local state
             # still says the position is open. Do not merely cooldown and let

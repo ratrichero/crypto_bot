@@ -17,7 +17,21 @@ sys.path.insert(0, BASE)
 for _k in ("BINANCE_API_KEY", "BINANCE_API_SECRET"):
     os.environ.pop(_k, None)
 
+_CFG_P = os.path.join(BASE, "config.json")
+_UNI_P = os.path.join(BASE, "universe.json")
+_MADE_CFG = not os.path.exists(_CFG_P)
+_MADE_UNI = not os.path.exists(_UNI_P)
+if _MADE_CFG:
+    shutil.copy(os.path.join(BASE, "config.example.json"), _CFG_P)
+if _MADE_UNI:
+    json.dump([{"symbol": "BTCUSDT", "quoteVolume": 1e9}], open(_UNI_P, "w"))
+
 import live_binance  # noqa: E402
+import binance_bot  # noqa: E402
+
+BOT_TRADES, BOT_LOGS = [], []
+binance_bot.record_trade = BOT_TRADES.append
+binance_bot.log = BOT_LOGS.append
 
 CFG = json.load(open(os.path.join(BASE, "config.example.json")))
 PASS, FAIL = [], []
@@ -134,6 +148,11 @@ class FakeBinance:
 
     def create_market_sell_order(self, symbol, qty, params=None):
         return self._fill(symbol, "sell", (params or {})["positionSide"], qty)
+
+    def fetch_open_orders(self, symbol=None, since=None, limit=None,
+                          params=None):
+        self.calls.append("fetch_open_orders")
+        return []
 
     def fetch_order(self, order_id, symbol=None, params=None):
         self.calls.append("fetch_order")
@@ -519,6 +538,99 @@ def test_sync_unknown_status_changes_nothing():
           and st["positions"][0]["protection_status"] == "armed")
 
 
+# ===================================================================
+# 7. No race between the bot's local exit and the exchange guard
+# ===================================================================
+def bot_state(st):
+    st.setdefault("grids", {})
+    st.setdefault("cooldown_until", 0)
+    return st
+
+
+def market_orders(fake):
+    return [o for o in fake.orders.values()]
+
+
+def test_local_exit_defers_to_armed_guard():
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    bot_state(st)
+    lot = open_lot(eng, "long", 60000, level="b1")
+    n_orders = len(market_orders(fake))
+    fake.fire(lot["tp_algo_id"], price=60301)        # Binance fires first
+    changed = binance_bot.update_positions(eng, st, "BTCUSDT", 60310)
+    check("race: bot khong tu dong khi guard armed", not changed
+          and len(market_orders(fake)) == n_orders + 1)   # only the TP fill
+    recs = eng.sync_exchange_protection()            # due soon after defer
+    if not recs:
+        recs = sync(eng, advance=2)
+    check("race: sync ghi TP tu fill san", len(recs) == 1
+          and recs[0]["exit"] == 60301, recs)
+    check("race: khong halt", not st.get("halted"), st.get("halt_reason"))
+
+
+def test_local_exit_fallback_after_grace():
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    bot_state(st)
+    lot = open_lot(eng, "long", 60000, level="b1")
+    binance_bot.update_positions(eng, st, "BTCUSDT", 60310)
+    CLOCK.sleep(16)                                  # guard never fired
+    changed = binance_bot.update_positions(eng, st, "BTCUSDT", 60310)
+    check("grace het: bot tu dong lenh", changed and st["positions"] == [],
+          eng.logs[-4:])
+    check("grace het: guard cua lot da duoc huy truoc khi dong",
+          all(fake.algos[lot[k]]["algoStatus"] == "CANCELED"
+              for k in ("sl_algo_id", "tp_algo_id")))
+
+
+def test_close_after_guard_filled_books_exchange_fill():
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    bot_state(st)
+    lot = open_lot(eng, "long", 60000, level="b1")
+    open_lot(eng, "long", 59700, level="b2")
+    fake.fire(lot["tp_algo_id"], price=60302)
+    n_orders = len(market_orders(fake))
+    rec = eng.close(lot, 60310, "GRID_BASKET_STOP")
+    check("close sau khi TP da khop: ghi nhan fill san",
+          rec is not None and rec["reason"] == "TP" and rec["exit"] == 60302,
+          (rec, st.get("halt_reason")))
+    check("close sau khi TP da khop: khong gui them lenh market",
+          len(market_orders(fake)) == n_orders)
+    check("close sau khi TP da khop: khong halt", not st.get("halted"),
+          st.get("halt_reason"))
+
+
+def test_close_while_guard_in_flight_does_not_halt():
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    lot = open_lot(eng, "long", 60000, level="b1")
+    fake.algos[lot["tp_algo_id"]]["algoStatus"] = "TRIGGERED"
+    rec = eng.close(lot, 60310, "TP")
+    check("guard dang khop: close tam hoan, khong halt",
+          rec is None and not st.get("halted"), st.get("halt_reason"))
+
+
+def test_restart_after_offline_tp_books_pnl():
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    lot = open_lot(eng, "long", 60000, level="b1")
+    fake.fire(lot["tp_algo_id"], price=60300)        # bot was down
+    eng2, st2 = make_engine(fake)
+    st2["positions"] = copy.deepcopy(st["positions"])
+    eng2._fetch_open_algo_orders = lambda symbol=None: fake.open_algos(symbol)
+    eng2._reconcile_startup()
+    check("restart: lot khong bi xoa am tham", len(st2["positions"]) == 1)
+    recs = eng2.sync_exchange_protection()
+    check("restart: sync ghi PnL TP da khop luc offline",
+          len(recs) == 1 and recs[0]["reason"] == "TP"
+          and eng2.db_rows, recs)
+    ok = eng2.reconcile_positions(force=True)
+    check("restart: reconcile tu het halt sau khi ghi nhan",
+          ok and not st2.get("halted"), st2.get("halt_reason"))
+
+
 TESTS = [
     test_close_one_of_many_grid_lots,
     test_close_detects_real_partial,
@@ -536,11 +648,15 @@ TESTS = [
     test_sync_uses_ws_algo_event,
     test_sync_guard_cancelled_keeps_lot_and_rearms,
     test_sync_unknown_status_changes_nothing,
+    test_local_exit_defers_to_armed_guard,
+    test_local_exit_fallback_after_grace,
+    test_close_after_guard_filled_books_exchange_fill,
+    test_close_while_guard_in_flight_does_not_halt,
+    test_restart_after_offline_tp_books_pnl,
 ]
 
 
 def main():
-    made_cfg = not os.path.exists(os.path.join(BASE, "config.json"))
     for test in TESTS:
         try:
             test()
@@ -548,8 +664,10 @@ def main():
             import traceback
             traceback.print_exc()
             check(test.__name__ + " (exception)", False, exc)
-    if made_cfg and os.path.exists(os.path.join(BASE, "config.json")):
-        os.remove(os.path.join(BASE, "config.json"))
+    if _MADE_CFG and os.path.exists(_CFG_P):
+        os.remove(_CFG_P)
+    if _MADE_UNI and os.path.exists(_UNI_P):
+        os.remove(_UNI_P)
     print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
     return 1 if FAIL else 0
 

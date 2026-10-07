@@ -199,27 +199,38 @@ def _record_close(st, rec):
 
 
 def update_positions(engine, st, symbol, price):
-    """Tick-driven SL/TP check using the mark price."""
+    """Tick-driven SL/TP check using the mark price.
+
+    With an armed exchange guard Binance executes the exit itself; the bot
+    only falls back to its own market close after a grace period
+    (engine.defer_local_exit), so both sides never race the same trigger.
+    """
     closed = []
+    defer = getattr(engine, "defer_local_exit", None)
+    clear = getattr(engine, "clear_local_trigger", None)
     for pos in [p for p in st["positions"] if p["symbol"] == symbol]:
+        label = None
         if pos["side"] == "long":
             if pos["sl"] and price <= pos["sl"]:
-                rec = engine.close(pos, pos["sl"], "SL")
-                if rec:
-                    closed.append(rec)
+                label = "sl"
             elif pos["tp"] and price >= pos["tp"]:
-                rec = engine.close(pos, pos["tp"], "TP")
-                if rec:
-                    closed.append(rec)
+                label = "tp"
         else:
             if pos["sl"] and price >= pos["sl"]:
-                rec = engine.close(pos, pos["sl"], "SL")
-                if rec:
-                    closed.append(rec)
+                label = "sl"
             elif pos["tp"] and price <= pos["tp"]:
-                rec = engine.close(pos, pos["tp"], "TP")
-                if rec:
-                    closed.append(rec)
+                label = "tp"
+        if label is None:
+            if clear:
+                clear(pos)
+            continue
+        if defer and defer(pos, label):
+            continue
+        rec = engine.close(pos, pos[label], label.upper())
+        if rec:
+            if clear:
+                clear(pos)
+            closed.append(rec)
     for rec in closed:
         _record_close(st, rec)
     return bool(closed)
