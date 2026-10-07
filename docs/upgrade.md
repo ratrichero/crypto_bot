@@ -664,3 +664,11 @@ sẽ dùng) cho ra ít hơn `grid.range_min_levels` tầng mỗi phía.
   (`DASHBOARD_SESSION_DAYS`). Cần `streamlit>=1.42`. Khoá tài khoản / đổi mật
   khẩu / "Đăng xuất mọi thiết bị" thì thu hồi phiên. Cookie ghi bằng JS nên
   không HttpOnly; chưa có HTTPS nên không có Secure (tự bật khi chạy HTTPS).
+- **Guard TP/SL khớp khi leg còn lot khác** (`b2dcd8d`, sự cố NEAR): trước
+  đây `detect_exchange_closed` nhường hẳn cho `sync_exchange_protection`. Nếu
+  sync không ghi được (query algo lỗi, `fetch_order` lỗi, đọc trúng lúc lệnh
+  guard còn PARTIALLY_FILLED) thì lot kẹt trong state, SL không bị huỷ, DB
+  không có trade, halt mismatch. Nay: lệnh guard đang khớp được coi là "chưa
+  biết"; `fetch_order` lỗi thì lấy fill từ userTrades; quá
+  `exchange_close_defer_seconds` (90s) thì ghi đúng các lot mất guard nếu
+  tổng qty của chúng bằng phần leg giảm.
