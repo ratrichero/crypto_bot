@@ -103,6 +103,23 @@ PARAMS: Tuple[Param, ...] = (
           "Cắt lot đang lỗ khi biên vỡ"),
     Param("grid.derisk_loss_pct", "float", 0.01, "Grid v2",
           "Ngưỡng lỗ để cắt khi biên vỡ (%)", 0.001, 0.10, pct=True),
+    Param("grid.entry_mode", "enum", "market", "Grid v2", "Kiểu vào lệnh",
+          choices=("market", "limit"),
+          help="limit = đặt trước LIMIT post-only (GTX, phí maker) tại các "
+               "tầng gần giá nhất, lệnh chờ chiếm slot; chỉ dùng với kiểu "
+               "grid range. market = vào khi giá cắt tầng (phí taker)."),
+    Param("grid.entry_ttl_minutes", "int", 60, "Grid v2",
+          "Huỷ lệnh chờ sau (phút)", 5, 1440,
+          help="Bot đặt lại nếu tầng vẫn hợp lệ."),
+    Param("grid.partial_fill_timeout_seconds", "int", 60, "Grid v2",
+          "Khớp một phần: huỷ phần còn lại sau (giây)", 10, 3600,
+          help="Phần đã khớp thành 1 lot riêng có SL/TP."),
+    Param("grid.max_new_orders_per_cycle", "int", 2, "Grid v2",
+          "Số lệnh chờ đặt mới tối đa mỗi vòng", 1, 10),
+    Param("grid.limit_min_gap_pct", "float", 0.0005, "Grid v2",
+          "Khoảng cách tối thiểu tầng ↔ giá để đặt LIMIT (%)", 0.0, 0.01,
+          pct=True, help="Tránh lệnh post-only bị sàn từ chối vì sẽ khớp "
+                         "ngay."),
     # ---- Rui ro
     Param("risk.daily_max_loss_pct", "float", 0.10, "Rủi ro",
           "Daily stop (% equity)", 0.01, 0.50, pct=True),
@@ -260,6 +277,8 @@ def validate(flat: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
         errors.append("Biên giá tối thiểu phải ≤ tối đa")
     if clean["grid.max_positions"] > clean["max_total_positions"]:
         errors.append("Số lot grid tối đa phải ≤ tổng số lot tối đa")
+    if clean["grid.entry_mode"] == "limit" and clean["grid.engine"] != "range":
+        errors.append("Vào lệnh LIMIT chỉ hỗ trợ kiểu grid range")
     if clean["grid.engine"] == "range":
         if not clean["scanner.enabled"]:
             errors.append("Range grid cần bật scanner (biên lấy từ scanner)")

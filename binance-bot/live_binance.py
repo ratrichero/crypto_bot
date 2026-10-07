@@ -36,6 +36,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 
 import binance_safety
+from entry_orders import EntryOrdersMixin
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 KEY_ENV = "BINANCE_API_KEY"
@@ -150,7 +151,7 @@ class GuardInFlight(Exception):
     """A guard is triggering right now; its result is not known yet."""
 
 
-class BinanceEngine:
+class BinanceEngine(EntryOrdersMixin):
     """Engine backed by real Binance USDT-M orders (or dry-run logging)."""
 
     def __init__(self, cfg, state, dry_run=False, log=None, symbols=None):
@@ -626,6 +627,7 @@ class BinanceEngine:
                         for _ in range(1024):
                             self._order_events.pop(next(iter(self._order_events)))
                     self._order_condition.notify_all()
+            self.on_entry_event(order)
             self.log("USER ORDER event symbol=%s order=%s status=%s exec=%s "
                      "positionSide=%s"
                      % (order.get("s"), order.get("i"), order.get("X"),
@@ -1257,11 +1259,15 @@ class BinanceEngine:
         return result
 
     def _local_qty(self, symbol, side, exclude_id=None):
-        """Sum of local lots for one Hedge leg (Binance only sees the sum)."""
+        """Sum of local lots for one Hedge leg (Binance only sees the sum).
+
+        Cong ca phan DA KHOP cua lenh entry LIMIT chua ket thuc (G5): no da
+        nam trong vi the san nhung chua thanh lot."""
         return sum(float(p.get("qty", 0) or 0)
                    for p in self.state.get("positions", [])
                    if p.get("symbol") == symbol and p.get("side") == side
-                   and (exclude_id is None or p.get("id") != exclude_id))
+                   and (exclude_id is None or p.get("id") != exclude_id)
+                   ) + self._pending_filled_qty(symbol, side)
 
     def _qty_tolerance(self, symbol, qty):
         step = 0.0
@@ -1302,6 +1308,11 @@ class BinanceEngine:
         for position in self.state["positions"]:
             key = (position["symbol"], position["side"])
             local[key] = local.get(key, 0.0) + float(position.get("qty", 0) or 0)
+        for order in self.entry_orders():
+            filled = float(order.get("filled", 0) or 0)
+            if filled > 0:
+                key = (order["symbol"], order["side"])
+                local[key] = local.get(key, 0.0) + filled
         keys = set(local) | set(exchange)
         mismatches = []
         for key in sorted(keys):
@@ -1387,7 +1398,8 @@ class BinanceEngine:
             self.log("WARNING detect_exchange_closed: khong lay duoc "
                      "positions: %s" % binance_safety.redact_body(exc))
             return []
-        exchange = self._aggregate_positions(rows)
+        # Phan da khop cua lenh entry LIMIT chua ket thuc khong phai lot.
+        exchange = self._minus_pending_fills(self._aggregate_positions(rows))
         live_ids = {p.get("id") for p in self.state.get("positions", [])}
         for stale in [i for i in pending if i not in live_ids]:
             pending.pop(stale, None)
@@ -2056,6 +2068,7 @@ class BinanceEngine:
             return False
 
         bot_symbols = set(getattr(self, "_bot_symbols", set()))
+        known_entries = {o.get("cid") for o in self.entry_orders()}
         working = []
         for order in orders:
             if not isinstance(order, dict):
@@ -2069,6 +2082,25 @@ class BinanceEngine:
                 symbol = str(raw_symbol).upper()
             if "/" in symbol:
                 symbol = symbol.split("/")[0]
+            client = (order.get("clientOrderId")
+                      or (order.get("info") or {}).get("clientOrderId"))
+            if client and client in known_entries:
+                continue            # lenh entry LIMIT bot dang quan ly
+            if client and self._is_bot_entry(symbol, client):
+                # Lenh entry cua bot nhung state khong con (mat state): huy,
+                # khong halt. Phan da khop (neu co) -> reconcile xu ly.
+                try:
+                    self._private_call(
+                        "private:trade", self.ex.fapiPrivateDeleteOrder,
+                        {"symbol": symbol, "origClientOrderId": client})
+                    self.log("STARTUP: huy lenh entry LIMIT mo coi %s cid=%s"
+                             % (symbol, client))
+                    continue
+                except binance_safety.BinanceSafetyStop:
+                    raise
+                except Exception as exc:
+                    self.log("WARNING huy lenh entry mo coi %s that bai: %s"
+                             % (client, binance_safety.redact_body(exc)))
             if not bot_symbols or symbol in bot_symbols:
                 working.append({
                     "symbol": symbol,
@@ -2462,7 +2494,19 @@ class BinanceEngine:
                      "-> doi chieu qua sync/detect de ghi PnL"
                      % (len(gone), [p["id"] for p in gone]))
         self.state["positions"] = still
+        # Lenh entry LIMIT con dang (G5): tra lai tu san truoc khi doi chieu
+        # (lenh da khop luc bot tat -> thanh lot ngay, co SL/TP).
+        try:
+            self._startup_entry_orders()
+        except binance_safety.BinanceSafetyStop:
+            raise
+        except Exception as exc:
+            self.log("WARNING startup entry orders: %s" %
+                     binance_safety.redact_body(exc))
+        still = self.state["positions"]
         local_keys = {(p["symbol"], p["side"]) for p in still}
+        local_keys |= {(o["symbol"], o["side"]) for o in self.entry_orders()
+                       if float(o.get("filled", 0) or 0) > 0}
         for key in sorted(exchange_keys - local_keys):
             self.log("CRITICAL san co vi the %s qty=%s ma state khong quan ly "
                      "-> halt de doi chieu/close tay" % (key, exchange[key]))
@@ -2650,7 +2694,9 @@ class BinanceEngine:
             return None, cooldown
         if self.state.get("halted"):
             return None, "halted: %s" % self.state.get("halt_reason", "")
-        if len(self.state["positions"]) >= self.cfg.get("max_total_positions", 999):
+        # Lenh entry LIMIT dang cho chiem slot nhu lot (G5).
+        if (len(self.state["positions"]) + len(self.entry_orders())
+                >= self.cfg.get("max_total_positions", 999)):
             return None, "max_positions"
         try:
             margin_need = notional / self.cfg["leverage"]
@@ -2658,8 +2704,9 @@ class BinanceEngine:
             if free < margin_need:
                 self._mark_action_failure(key, "insufficient_margin")
                 return None, "insufficient_margin"
-            total_notional = sum(p["notional"]
-                                 for p in self.state["positions"])
+            total_notional = (sum(p["notional"]
+                                  for p in self.state["positions"])
+                              + self.pending_entry_notional())
             risk_equity = float(
                 self.state.get("mark_equity", self.state.get("equity", 0.0))
                 or self.state.get("equity", 0.0)

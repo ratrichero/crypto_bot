@@ -62,6 +62,8 @@ def make_engine(st):
         from live_binance import BinanceEngine
         eng = BinanceEngine(CFG, st, dry_run=(MODE == "dry_run"),
                             log=log, symbols=SYMBOLS)
+        # Lenh entry LIMIT duoc ghi state TRUOC khi gui (G5).
+        eng.persist_cb = lambda: save_state(st)
         # Khoi tao ket noi Postgres de ghi trade truc tiep
         # (khong fail neu DB khong dung duoc; JSONL van la backup)
         try:
@@ -695,7 +697,7 @@ def manage_range_grid(engine, st, symbol, price, allowed):
             grid["taken"].setdefault(pos["level"], pos["id"])
     grid["taken"] = {k: v for k, v in grid["taken"].items() if v in ids}
     changed = False
-    flat = not active
+    flat = not active and not _pending_entries(st, symbol)
     if flat and grid.get("rebuild_pending"):
         # basket / tran tong / daily stop: bo bien cu, cho scan moi
         grid["rebuild_pending"] = False
@@ -725,6 +727,8 @@ def manage_range_grid(engine, st, symbol, price, allowed):
             or any(not str(p.get("level") or "").startswith("r")
                    for p in active)):
         return changed
+    if limit_mode():
+        return changed          # vao lenh bang LIMIT: manage_range_limits
     notional = CFG["order_margin_usdt"] * CFG["leverage"]
     entries = 0
     max_entries = int(g.get("max_entries_per_cycle", 1))
@@ -745,6 +749,101 @@ def manage_range_grid(engine, st, symbol, price, allowed):
         log("OPEN #%s %s range %s %s @ %.6g (bien %.6g-%.6g)" % (
             pos["id"], symbol, lv["key"], lv["side"].upper(), pos["entry"],
             rng["low"], rng["high"]))
+    return changed
+
+
+ENTRY_TERMINAL = ("FILLED", "CANCELED", "EXPIRED", "EXPIRED_IN_MATCH",
+                  "REJECTED")
+
+
+def limit_mode():
+    """Entry LIMIT post-only chi khi grid.engine=range + entry_mode=limit."""
+    g = CFG["grid"]
+    return (grid_engine() == "range"
+            and str(g.get("entry_mode") or "market") == "limit")
+
+
+def _pending_entries(st, symbol=None):
+    return [o for o in st.get("entry_orders", [])
+            if symbol is None or o.get("symbol") == symbol]
+
+
+def cancel_all_entries(engine, st, reason):
+    """Huy moi lenh entry LIMIT dang cho (halt / pause / doi che do)."""
+    if not _pending_entries(st) or not hasattr(engine, "cancel_entries"):
+        return False
+    n = engine.cancel_entries(reason)
+    if n:
+        log("ENTRY: huy %d lenh cho (%s)" % (n, reason))
+    return True
+
+
+def manage_range_limits(engine, st, prices, allowed):
+    """Entry LIMIT post-only cho range grid (G5).
+
+    Moi vong: lap danh sach tang dat duoc (long duoi gia, short tren gia,
+    cach >= limit_min_gap_pct) cua moi symbol hop le, phan slot bang
+    range_grid.plan_slots (lot + lenh cho <= grid.max_positions,
+    max_lots_per_symbol, max_symbols; uu tien giu lenh cu, roi tang gan
+    gia). Lenh khong con trong ke hoach -> huy; tang moi -> dat toi da
+    grid.max_new_orders_per_cycle lenh/vong."""
+    g = CFG["grid"]
+    pend = [o for o in _pending_entries(st)
+            if o.get("status") not in ENTRY_TERMINAL]
+    rows, eligible = [], set()
+    gap = float(g.get("limit_min_gap_pct", 0.0005))
+    for symbol in SYMBOLS:
+        grid = st["grids"].get(symbol) or {}
+        rng = grid.get("range")
+        px = prices.get(symbol)
+        if (not rng or grid.get("broken") or grid.get("risk_halted")
+                or symbol not in allowed or px is None
+                or is_disabled(symbol) or symbol in MANAGE_ONLY):
+            continue
+        lots = _grid_lots(st, symbol)
+        if any(not str(p.get("level") or "").startswith("r") for p in lots):
+            continue
+        taken = {p.get("level") for p in lots}
+        cands = range_grid.limit_candidates(rng, px, taken, gap)
+        have = {c["key"] for c in cands}
+        mine = [o for o in pend if o["symbol"] == symbol]
+        for o in mine:
+            if o.get("level") not in have and o.get("level") not in taken:
+                cands.append({"key": o["level"], "side": o["side"],
+                              "price": o["price"],
+                              "dist": abs(o["price"] / px - 1)})
+        rows.append({"symbol": symbol,
+                     "score": (range_scan(symbol) or {}).get("score", 0),
+                     "lots": len(lots), "candidates": cands,
+                     "pending": {o.get("level") for o in mine}})
+        eligible.add(symbol)
+    others = sum(1 for o in pend if o["symbol"] not in eligible)
+    chosen = set(range_grid.plan_slots(rows, g, len(_grid_lots(st)) + others))
+    changed = False
+    for o in pend:
+        if o["symbol"] not in eligible:
+            why = "symbol bị chặn / biên vỡ / rời top K"
+        elif (o["symbol"], o.get("level")) not in chosen:
+            why = "hết slot / ưu tiên tầng gần giá hơn"
+        else:
+            continue
+        engine.cancel_entry(o, why)
+        changed = True
+    have_keys = {(o["symbol"], o.get("level")) for o in _pending_entries(st)}
+    todo = sorted(
+        ((c["dist"], r["symbol"], c) for r in rows for c in r["candidates"]
+         if (r["symbol"], c["key"]) in chosen
+         and (r["symbol"], c["key"]) not in have_keys),
+        key=lambda x: (x[0], x[1]))
+    notional = CFG["order_margin_usdt"] * CFG["leverage"]
+    for _dist, symbol, c in todo[:int(g.get("max_new_orders_per_cycle", 2))]:
+        rng = st["grids"][symbol]["range"]
+        sl, tp = range_grid.lot_exits(rng, c["side"], c["price"], g)
+        rec, _why = engine.place_entry_limit(
+            symbol, c["side"], notional, c["price"], abs(sl / c["price"] - 1),
+            abs(tp / c["price"] - 1), "grid", level=c["key"])
+        if rec:
+            changed = True
     return changed
 
 
@@ -1049,6 +1148,17 @@ def main():
                     st["halt_reason"] = "position reconciliation unavailable"
                 dirty = True
 
+            # ---- lenh entry LIMIT (G5): cap nhat khop / het han MOI vong,
+            # ke ca khi halt (lenh da khop phai thanh lot co SL/TP ngay).
+            if not DATA_ONLY and hasattr(engine, "sync_entry_orders"):
+                try:
+                    if engine.sync_entry_orders(prices):
+                        dirty = True
+                except binance_safety.BinanceSafetyStop:
+                    raise
+                except Exception:
+                    log("sync_entry_orders loi:\n" + traceback.format_exc())
+
             # ---- daily stop before every entry path
             # The mark-to-market loss guard must run before FAST and SLOW
             # strategy evaluation. Otherwise an iteration can open a new
@@ -1099,6 +1209,19 @@ def main():
                         log(f"orphan cleanup loi: {e}")
                 # Kiem tra PAUSE file - neu co thi khong mo lenh moi
                 paused = os.path.exists(os.path.join(BASE, "PAUSE"))
+                if st.get("entry_orders") and (
+                        st["halted"] or paused or not limit_mode()):
+                    # Halt / PAUSE / tat che do LIMIT -> khong de lenh cho
+                    # khop them (huy la giam rui ro, luon an toan).
+                    try:
+                        cancel_all_entries(
+                            engine, st, "halt" if st["halted"] else
+                            ("pause" if paused else "entry_mode doi"))
+                        dirty = True
+                    except binance_safety.BinanceSafetyStop:
+                        raise
+                    except Exception:
+                        log("cancel entries loi:\n" + traceback.format_exc())
                 if not st["halted"] and not paused:
                     use_range = grid_engine() == "range"
                     allowed = range_allowed_symbols() if use_range else None
@@ -1120,6 +1243,16 @@ def main():
                         if regime == "ranging":
                             if manage_grid(engine, st, symbol, px):
                                 dirty = True
+                    if use_range and limit_mode():
+                        try:
+                            if manage_range_limits(engine, st, prices,
+                                                   allowed):
+                                dirty = True
+                        except binance_safety.BinanceSafetyStop:
+                            raise
+                        except Exception:
+                            log("manage_range_limits loi:\n"
+                                + traceback.format_exc())
 
             # ---- SLOW PATH: candles + regime + optional scalp entries ----
             if loop % SLOW_EVERY == 0:
