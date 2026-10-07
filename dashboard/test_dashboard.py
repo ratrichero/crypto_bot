@@ -524,9 +524,42 @@ def test_live_fee():
           (n, fe, net, gr))
 
 
+def test_live_radar_charts():
+    print("== Live radar: P&L theo lenh + snapshot equity vi ==")
+    import pandas as pd
+    from datetime import timedelta
+    tz = timezone(timedelta(hours=7))
+    ns = load("trade_cum_df", "snapshot_summary",
+              extra={"pd": pd, "TZINFO": tz})
+    f = ns["trade_cum_df"]
+    df = f([{"closed_at": 300, "realized_usd": 7.25, "symbol": "ART"},
+            {"closed_at": 100, "realized_usd": -0.5, "symbol": "ABU"},
+            {"closed_at": 0, "realized_usd": 9},
+            {"closed_at": "x", "realized_usd": 1},
+            {"closed_at": 200, "realized_usd": "0.14"}])
+    check("moi lenh 1 diem, sap theo gio, bo lenh khong co gio",
+          list(df["symbol"]) == ["ABU", "?", "ART"], list(df["symbol"]))
+    check("cong don dung", [round(x, 2) for x in df["cum"]]
+          == [-0.5, -0.36, 6.89], list(df["cum"]))
+    check("khong co lenh -> df rong co cot cum",
+          f([]).empty and "cum" in f([]).columns)
+    sm = ns["snapshot_summary"]
+    now = datetime(2026, 10, 7, 20, 0, 0, tzinfo=tz)
+    rows = [{"ts": datetime(2026, 10, 7, 14, 0, 0), "equity": 100.0},
+            {"ts": datetime(2026, 10, 7, 19, 59, 30), "equity": 111.6}]
+    eq, ch, age = sm(rows, now=now)
+    check("snapshot moi: equity + thay doi 6h + tuoi (ts naive = gio VN)",
+          eq == 111.6 and abs(ch - 11.6) < 1e-9 and age == 30, (eq, ch, age))
+    eq, ch, age = sm(rows, now=now + timedelta(minutes=10))
+    check("snapshot cu > 2 phut -> equity None (dung so du SOL)",
+          eq is None and age == 630, (eq, age))
+    check("khong co snapshot", sm([]) == (None, None, None))
+
+
 TESTS = [test_session_cookie, test_helius_key, test_sol_wallet, test_live_radar_halt_status, test_config_helpers,
          test_scanner_tab_levels, test_trend_section, test_bot_runtime_note,
-         test_monitor_pm2, test_live_fee]
+         test_monitor_pm2, test_live_fee,
+         test_live_radar_charts]
 
 
 if __name__ == "__main__":

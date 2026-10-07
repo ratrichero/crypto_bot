@@ -655,37 +655,121 @@ def filter_live_trades(trades, days, live_only=False):
     return out
 
 
+def trade_cum_df(trades):
+    """P&L cong don THEO TUNG LENH (moi lenh dong = 1 diem) -> do thi nhich
+    ngay khi co lenh dong, khong phai doi sang ngay moi nhu ban theo ngay."""
+    rows = []
+    for t in trades:
+        try:
+            ca = float(t.get("closed_at") or 0)
+            if ca <= 0:
+                continue
+            rows.append({"ts": datetime.fromtimestamp(ca, tz=TZINFO),
+                         "net": float(t.get("realized_usd") or 0),
+                         "symbol": t.get("symbol") or "?",
+                         "reason": t.get("reason") or ""})
+        except (TypeError, ValueError):
+            continue
+    if not rows:
+        return pd.DataFrame(columns=["ts", "net", "symbol", "reason", "cum"])
+    df = pd.DataFrame(rows).sort_values("ts").reset_index(drop=True)
+    df["cum"] = df["net"].cumsum()
+    return df
+
+
+def snapshot_summary(rows, now=None, fresh_s=120):
+    """rows [{'ts','equity'}] tang dan -> (equity_moi_nhat|None neu cu,
+    thay_doi_trong_cua_so, tuoi_giay)."""
+    if not rows:
+        return None, None, None
+    now = now or datetime.now(TZINFO)
+    last = rows[-1]
+    ts = last["ts"]
+    if getattr(ts, "tzinfo", None) is None:
+        ts = ts.replace(tzinfo=TZINFO)
+    age = (now - ts).total_seconds()
+    eq = float(last["equity"])
+    change = eq - float(rows[0]["equity"])
+    return (eq if age <= fresh_s else None), change, age
+
+
 @frag15
 def live_radar_equity_realtime():
-    st.markdown('<div class="sub2">⚡ Equity live realtime</div>',
+    st.markdown('<div class="sub2">⚡ Equity realtime — ví Solana LIVE</div>',
                 unsafe_allow_html=True)
-    bal = sol_balance()
-    sol_px = jupiter_marks(SOL_MINT).get(SOL_MINT)
-    if bal is None or not sol_px:
-        st.warning("Khong doc duoc so du SOL hoac gia SOL/USD.")
-        return
-    eq = bal * sol_px
+    rows = q("""SELECT ts AT TIME ZONE 'Asia/Ho_Chi_Minh' AS ts, equity
+                FROM equity_snapshots WHERE system='radar_live'
+                  AND ts >= now() - interval '6 hours'
+                ORDER BY ts""")
+    eq, change, age = snapshot_summary(rows)
+    sub = None
+    if eq is not None:
+        sub = (f"SOL + token đang giữ · {change:+.2f} U trong 6h · "
+               f"snapshot {age:.0f}s trước")
+    else:
+        bal = sol_balance()
+        sol_px = jupiter_marks(SOL_MINT).get(SOL_MINT)
+        if bal is not None and sol_px:
+            eq = bal * sol_px
+            sub = (f"chỉ SOL: {bal:.4f} SOL @ ${sol_px:,.2f} "
+                   f"(chưa có snapshot mới)")
     c1, c2 = st.columns([1, 3])
     with c1:
-        st.markdown(f'<div class="kpi-card" style="border-left-color:#16a34a">'
-                    f'<div class="kpi-label">Equity live (USD)</div>'
-                    f'<div class="kpi-value pos">{eq:,.2f} U</div>'
-                    f'<div class="kpi-sub">{bal:.4f} SOL @ ${sol_px:,.2f} · live</div>'
-                    f'<div class="addr">{SOL_WALLET}</div></div>',
-                    unsafe_allow_html=True)
+        if eq is None:
+            st.warning("Không đọc được số dư SOL / giá SOL.")
+        else:
+            st.markdown(f'<div class="kpi-card" style="border-left-color:'
+                        f'#16a34a"><div class="kpi-label">Equity ví live '
+                        f'(USD)</div><div class="kpi-value pos">{eq:,.2f} U'
+                        f'</div><div class="kpi-sub">{sub}</div>'
+                        f'<div class="addr">{SOL_WALLET}</div></div>',
+                        unsafe_allow_html=True)
     with c2:
-        df = daily_df(live_trade_kpi_rows(
-            filter_live_trades(load_live_trades(), None, live_only=True)))
-        if not df.empty:
-            fig = px.line(df, x="day", y="cum",
-                          title="Live Radar — P&L cong don, lenh tien that (U)")
+        if rows:
+            df = pd.DataFrame(rows)
+            df["ts"] = pd.to_datetime(df["ts"])
+            fig = px.line(df, x="ts", y="equity",
+                          title="Equity ví 6h qua (snapshot 15s)")
             fig.update_layout(paper_bgcolor="rgba(0,0,0,0)",
                               plot_bgcolor="rgba(0,0,0,0)",
                               xaxis_title=None, yaxis_title="U")
             st.plotly_chart(fig, width="stretch")
         else:
-            st.info("Chua co lenh live nao da dong.")
-    st.caption("Tự refresh 15s · Equity = số dư SOL ví × giá SOL/USD (Jupiter).")
+            st.info("Chưa có snapshot equity ví — khởi động app "
+                    "muse-live-equity: `git up setup --only "
+                    "muse-live-equity`.")
+    st.caption("Tự refresh 15s · Equity = SOL trong ví × giá SOL + token vị "
+               "thế đang mở theo giá Jupiter (app muse-live-equity).")
+
+
+def live_radar_pnl_charts(trades):
+    """Giong tab Binance: P&L cong don + P&L tung ngay; cong don ve THEO
+    LENH de cap nhat ngay khi co lenh dong."""
+    cum = trade_cum_df(trades)
+    if cum.empty:
+        st.info("Live Radar: chua co lenh dong trong khoang da chon.")
+        return
+    c1, c2 = st.columns(2)
+    with c1:
+        fig = px.line(cum, x="ts", y="cum", markers=True,
+                      hover_data={"symbol": True, "net": ":+.2f",
+                                  "reason": True},
+                      title="Live Radar — P&L cong don theo lenh (U)")
+        fig.update_layout(paper_bgcolor="rgba(0,0,0,0)",
+                          plot_bgcolor="rgba(0,0,0,0)",
+                          xaxis_title=None, yaxis_title="U")
+        fig.add_hline(y=0, line_dash="dot", opacity=0.4)
+        st.plotly_chart(fig, width="stretch")
+    with c2:
+        d2 = daily_df(live_trade_kpi_rows(trades))
+        d2["mau"] = d2["net"].apply(lambda x: "lai" if x >= 0 else "lo")
+        fig = px.bar(d2, x="day", y="net", color="mau",
+                     color_discrete_map={"lai": "#16a34a", "lo": "#dc2626"},
+                     title="Live Radar — P&L tung ngay (U)")
+        fig.update_layout(paper_bgcolor="rgba(0,0,0,0)",
+                          plot_bgcolor="rgba(0,0,0,0)", showlegend=False,
+                          xaxis_title=None, yaxis_title="U")
+        st.plotly_chart(fig, width="stretch")
 
 
 @frag
@@ -693,6 +777,7 @@ def live_radar_kpi_frag(days):
     # Chi tinh lenh tien that (mode=live), khong tron dry-run
     trades = filter_live_trades(load_live_trades(), days, live_only=True)
     kpi_cards("Hieu suat live (tien that)", live_trade_kpi_rows(trades))
+    live_radar_pnl_charts(trades)
     n_fee, fee, net_f, gross_f = live_fee_summary(trades)
     if n_fee:
         st.caption(
@@ -705,9 +790,6 @@ def live_radar_kpi_frag(days):
         st.caption("P&L rong = SOL that nhan/chi, DA tru phi mang (app vi "
                    "thuong hien so truoc phi -> lech vai cent/lenh). Doi "
                    "chieu tung tx: meme-radar/reconcile_wallet.py")
-    df = daily_df(live_trade_kpi_rows(trades))
-    pnl_charts(df, "Live Radar")
-
     st.markdown('<div class="sub2">Thong ke ly do thoat lenh — live</div>',
                 unsafe_allow_html=True)
     agg = {}
@@ -990,6 +1072,7 @@ def tab_monitor():
         "muse-radar": "🦅 Radar paper (Solana)",
         "muse-live-trader": "☀️ Live Trader (Solana tiền thật)",
         "muse-dashboard": "📊 Dashboard",
+        "muse-live-equity": "📈 Equity ví live",
     }
 
     # Status services
