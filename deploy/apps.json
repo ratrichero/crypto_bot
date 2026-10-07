@@ -5,8 +5,8 @@
     "cwd/entry/search_path tinh tu goc repo. search_path = thu muc ma app import",
     "module (sys.path) -> deploy.py tinh tap file Python app phu thuoc de biet",
     "commit moi co dong toi app hay khong. {VAR} lay tu deploy.env.",
-    "confirm=true: app giao dich tien that, restart phai duoc xac nhan (luat repo:",
-    "len live Binance can Cuong duyet) - git up hoi y/N, hoac git up --yes.",
+    "live=true: app giao dich tien that - git up gan nhan [tien that] va in tom",
+    "tat state truoc khi restart (khong hoi y/N, tu restart nhu app khac).",
     "kill_timeout (ms): thoi gian cho bot dung sach (lam xong vong/swap dang chay)."
   ],
   "apps": {
@@ -21,7 +21,7 @@
       "extra_args_var": "DASHBOARD_ARGS",
       "search_path": ["dashboard", "db", "binance-bot"],
       "requirements": ["dashboard/requirements.txt"],
-      "confirm": false,
+      "live": false,
       "kill_timeout": 10000,
       "health_seconds": 15
     },
@@ -31,7 +31,7 @@
       "entry": "radar.py",
       "search_path": ["meme-radar"],
       "requirements": ["meme-radar/requirements.txt"],
-      "confirm": false,
+      "live": false,
       "kill_timeout": 30000,
       "health_seconds": 20
     },
@@ -41,7 +41,7 @@
       "entry": "live_trader.py",
       "search_path": ["meme-radar"],
       "requirements": ["meme-radar/requirements.txt"],
-      "confirm": true,
+      "live": true,
       "kill_timeout": 180000,
       "health_seconds": 30
     },
@@ -51,7 +51,7 @@
       "entry": "binance_bot.py",
       "search_path": ["binance-bot", "db"],
       "requirements": ["binance-bot/requirements.txt"],
-      "confirm": true,
+      "live": true,
       "kill_timeout": 60000,
       "health_seconds": 45,
       "state_file": "binance-bot/state.json"

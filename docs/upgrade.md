@@ -681,7 +681,7 @@ Chi tiết xem [`deploy/README.md`](../deploy/README.md).
   build web khi có `package.json` đổi (hiện không có), rồi **chỉ restart app có
   file Python import bị đổi**. Commit app đang chạy được xác định bằng giờ start
   của pm2 đối chiếu `git reflog`, nên trường hợp pull tay mà quên restart (như
-  dashboard chạy code cũ) cũng được phát hiện. App tiền thật cần y/N hoặc `--yes`.
+  dashboard chạy code cũ) cũng được phát hiện. Không hỏi y/N, kể cả app tiền thật.
 - Bot dừng sạch khi nhận SIGINT/SIGTERM: Binance thoát như khi có file `STOP`
   (lưu state, đóng WS), live_trader/radar thoát giữa 2 vòng lặp, swap đang chạy
   được làm xong.
@@ -698,8 +698,10 @@ Chi tiết xem [`deploy/README.md`](../deploy/README.md).
   nằm trong `deploy/deploy.env`. Không dùng DB thì đặt `MIGRATE_SQL=` rỗng.
 - **Nhớ restart sau khi thư viện đổi**: mốc ghi ở `.deploy/changed_at.json`. App start
   trước mốc vẫn được đánh dấu cần restart ở các lần `git up` sau, kể cả khi lần trước
-  trả lời N.
-- `git up --force`: làm lại pip/migrate/build và restart mọi app đang chạy (app
-  tiền thật vẫn hỏi). Dòng cuối tóm tắt `code / thu-vien / migrate / build / restart`.
-- `git up --branch X`: đổi nhánh deploy, có xác nhận và ghi nhớ `DEPLOY_BRANCH` vào
+  restart bị bỏ qua.
+- `git up --force`: làm lại pip/migrate/build và restart mọi app đang chạy. Dòng cuối tóm tắt `code / thu-vien / migrate / build / restart`.
+- `git up --branch X`: đổi nhánh deploy và ghi nhớ `DEPLOY_BRANCH` vào
   `deploy.local.env`. Chỉ đổi sang nhánh đã có `deploy/` (`main` hiện chưa có).
+- **Bỏ mọi câu hỏi y/N** (deploy, đổi nhánh, setup): mặc định là đồng ý. Khoá
+  `confirm` trong `apps.json` đổi tên thành `live` (chỉ dùng để gắn nhãn). `--yes`
+  còn được chấp nhận nhưng không có tác dụng.

@@ -9,8 +9,7 @@ Lenh:
   setup              cai alias git up, pm2-logrotate, chuyen app tu systemd
                      sang pm2, pm2 save + pm2 startup
 
-Tuy chon: --branch X (doi nhanh deploy, ghi nho), --yes (dong y doi nhanh /
-          restart app tien that), --dry-run, --only a,b,
+Tuy chon: --branch X (doi nhanh deploy, ghi nho), --dry-run, --only a,b,
           --no-restart, --restart (ep restart app chon), --force-deps,
           --force (lam lai moi buoc + restart moi app)
 
@@ -21,7 +20,9 @@ Nguyen tac an toan:
     git reflog -> chi restart khi file Python app import (tinh theo AST),
     requirements, cau hinh pm2 cua app, hoac thu vien da cai thay doi. Nho
     vay ca truong hop pull tay ma quen restart cung duoc phat hien.
-  * App tien that (confirm=true trong apps.json) phai xac nhan y/N hoac --yes.
+  * Khong hoi y/N: moi buoc (ke ca restart app tien that, doi nhanh, setup)
+    tu chay. App tien that (live=true trong apps.json) duoc gan nhan
+    [tien that] va in tom tat state truoc khi restart.
   * Kiem tra cu phap Python truoc khi restart; health check sau restart.
 """
 from __future__ import print_function
@@ -491,18 +492,6 @@ def acquire_lock():
     return fh
 
 
-def confirm(question, assume_yes):
-    if assume_yes:
-        return True
-    if not sys.stdin.isatty():
-        return False
-    try:
-        ans = input("  " + _c("1;33", "?? " + question + " [y/N] "))
-    except EOFError:
-        return False
-    return ans.strip().lower() in ("y", "yes", "c", "co")
-
-
 # ================================================================ steps
 def check_branch(cfg):
     branch = git("symbolic-ref", "--short", "-q", "HEAD", check=False)
@@ -526,7 +515,7 @@ def ensure_clean():
                           "truoc):\n" + dirty)
 
 
-def step_switch_branch(cfg, target, dry_run, assume_yes):
+def step_switch_branch(cfg, target, dry_run):
     """git up --branch X: chuyen sang nhanh X cua remote (chi checkout +
     fast-forward), ghi DEPLOY_BRANCH. -> (old_head, new_head, switched)."""
     remote = cfg.get("DEPLOY_REMOTE") or "origin"
@@ -579,10 +568,8 @@ def step_switch_branch(cfg, target, dry_run, assume_yes):
         if dry_run:
             skip("--dry-run: khong doi nhanh")
             return old, tip, False
-        if not confirm("Doi nhanh deploy sang '%s'? (code dang chay se doi "
-                       "theo)" % target, assume_yes):
-            raise DeployError("da huy doi nhanh (chay lai voi --yes hoac tra "
-                              "loi y)")
+        info("  doi nhanh deploy sang '%s' (code dang chay se doi theo)"
+             % target)
         if local_exists:
             git("checkout", "--quiet", target)
         else:
@@ -859,7 +846,7 @@ def plan_restarts(cfg, apps, head, force_names=()):
 def describe(item, head):
     a, p = item["app"], item["info"]
     act = item["action"]
-    tag = "[tien that] " if a.get("confirm") else ""
+    tag = "[tien that] " if a.get("live") else ""
     if act == "missing":
         return "%s: %schua chay duoi pm2 (git up setup)" % (a["name"], tag)
     if act == "restart":
@@ -959,7 +946,7 @@ def cmd_deploy(args, cfg):
     switched = False
     if getattr(args, "branch", None) and not args.resume_from:
         old, new, switched = step_switch_branch(cfg, args.branch,
-                                                args.dry_run, args.yes)
+                                                args.dry_run)
     branch = (args.branch if args.dry_run and getattr(args, "branch", None)
               else check_branch(cfg))
     only = args.only.split(",") if args.only else None
@@ -1032,16 +1019,10 @@ def cmd_deploy(args, cfg):
             results[name] = "syntax-error"
             failed = True
             continue
-        if a.get("confirm"):
+        if a.get("live"):
             summary = binance_state_summary(a)
             if summary:
                 info("  %s %s" % (name, summary))
-            if not confirm("Restart %s (%s, giao dich tien that)?"
-                           % (name, a.get("label", "")), args.yes):
-                warn("bo qua restart %s - chay lai: git up --yes --only %s"
-                     % (name, name))
-                results[name] = "skipped"
-                continue
         info("  restart %s ..." % name)
         try:
             base = start_or_restart(cfg, a, item["recreate"], True)
@@ -1335,7 +1316,7 @@ def cmd_setup(args, cfg):
     ok("pm2 %s" % pm2(cfg, "-v").stdout.strip().splitlines()[-1])
     if "pm2-logrotate" in (procs.get("_modules") or set()):
         skip("pm2-logrotate da cai")
-    elif confirm("Cai pm2-logrotate (xoay vong log pm2)?", args.yes):
+    else:
         pm2(cfg, "install", "pm2-logrotate", timeout=600, capture=False)
         for k, v in (("max_size", cfg.get("LOGROTATE_MAX_SIZE", "20M")),
                      ("retain", cfg.get("LOGROTATE_RETAIN", "10")),
@@ -1365,10 +1346,6 @@ def cmd_setup(args, cfg):
                      or unit.get("UnitFileState") == "enabled"):
             info("  systemd: %s (%s)" % (unit_exec(unit),
                                          unit.get("ActiveState")))
-            if not confirm("Dung + disable systemd %s.service roi chay bang "
-                           "pm2?" % name, args.yes):
-                warn("bo qua %s" % name)
-                continue
             run(["sudo", "systemctl", "disable", "--now", name + ".service"],
                 timeout=300, capture=False)
             ok("da dung + disable %s.service" % name)
@@ -1380,11 +1357,6 @@ def cmd_setup(args, cfg):
             bad("dung cac process tren (va watchdog cron neu co) roi chay lai "
                 "git up setup - KHONG chay trung 2 ban")
             failed = True
-            continue
-        if a.get("confirm") and not unit and not confirm(
-                "Start %s (%s, giao dich tien that) bang pm2?"
-                % (name, a.get("label", "")), args.yes):
-            warn("bo qua %s" % name)
             continue
         base = start_or_restart(cfg, a, False, False)
         if not health_check(cfg, a, base):
@@ -1405,7 +1377,7 @@ def cmd_setup(args, cfg):
         warn("may nay khong chay systemd - tu cau hinh pm2 resurrect khi boot")
     elif systemd_unit("pm2-%s" % user):
         skip("da bat (pm2-%s.service)" % user)
-    elif confirm("Bat pm2 startup bang systemd (can sudo)?", args.yes):
+    else:
         node_dir = os.path.dirname(shutil.which("node") or "/usr/bin/node")
         cmd = ["sudo", "env", "PATH=%s:%s" % (os.environ.get("PATH", ""),
                                               node_dir),
@@ -1429,13 +1401,13 @@ def main(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("command", nargs="?", default="deploy",
                     choices=["deploy", "status", "doctor", "setup"])
-    ap.add_argument("-y", "--yes", action="store_true",
-                    help="dong y restart/start app tien that khong hoi")
+    # --yes: giu de lenh cu khong loi; khong con hoi y/N nen khong tac dung
+    ap.add_argument("-y", "--yes", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("-n", "--dry-run", action="store_true",
                     help="chi xem se lam gi (fetch nhung khong pull/cai/restart)")
     ap.add_argument("-b", "--branch",
-                    help="deploy nhanh nay cua remote (checkout + fast-forward, "
-                         "hoi y/N), ghi nho vao DEPLOY_BRANCH cho lan sau")
+                    help="deploy nhanh nay cua remote (checkout + fast-forward), "
+                         "ghi nho vao DEPLOY_BRANCH cho lan sau")
     ap.add_argument("--only", help="chi xu ly cac app nay (phay ngan cach)")
     ap.add_argument("--no-restart", action="store_true",
                     help="pull + cai thu vien, khong restart")
@@ -1445,8 +1417,7 @@ def main(argv=None):
                     help="chay pip install du requirements khong doi")
     ap.add_argument("--force", action="store_true",
                     help="bo qua moi dau 'da lam': cai thu vien, migrate, build "
-                         "lai va restart moi app dang chay (app tien that van "
-                         "hoi y/N tru khi --yes)")
+                         "lai va restart moi app dang chay")
     ap.add_argument("--resume-from", help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
     if args.restart and not args.only:

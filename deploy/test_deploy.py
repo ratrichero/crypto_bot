@@ -232,7 +232,7 @@ def test_plan_restarts():
     try:
         c1 = commit(tmp, "c1")
         apps = [{"name": "bot", "cwd": "bot", "entry": "bot.py",
-                 "search_path": ["bot"], "confirm": True},
+                 "search_path": ["bot"], "live": True},
                 {"name": "web", "cwd": "web", "entry": "app.py",
                  "search_path": ["web"]}]
         procs = {}
@@ -494,9 +494,11 @@ def test_load_apps():
     check("--only", [a["name"] for a in only] == ["muse-binance"])
     with open(os.path.join(HERE, "apps.json")) as f:
         spec = json.load(f)["apps"]
-    check("app tien that phai confirm",
-          spec["muse-binance"]["confirm"] and spec["muse-live-trader"]["confirm"]
-          and not spec["muse-dashboard"]["confirm"])
+    check("app tien that duoc danh dau live",
+          spec["muse-binance"]["live"] and spec["muse-live-trader"]["live"]
+          and not spec["muse-dashboard"]["live"])
+    check("apps.json khong con khoa confirm",
+          not any("confirm" in v for v in spec.values()))
     repo = os.path.dirname(HERE)
     check("entry cua moi app ton tai",
           all(os.path.exists(os.path.join(repo, s["cwd"], s["entry"]))
@@ -688,7 +690,7 @@ def test_migrate_error_blocks_restart():
     restarted = []
     try:
         head = sh(["git", "rev-parse", "HEAD"], tmp)
-        app = {"name": "muse-dashboard", "confirm": False}
+        app = {"name": "muse-dashboard", "live": False}
         d.check_branch = lambda cfg: "main"
         d.step_pull = lambda cfg, b, dry: (head, head, False)
         d.step_deps = lambda *a: set()
@@ -742,19 +744,37 @@ def test_migrate_error_blocks_restart():
               seen == {"deps": True, "mig": True, "build": True}
               and plan_args["force"] == {"muse-dashboard"}, (seen, plan_args))
 
+        # app tien that: khong hoi y/N, khong can --yes (stdin khong phai tty)
+        live = {"name": "muse-binance", "live": True, "label": "Binance"}
+        d.plan_restarts = lambda *a, **k: [
+            {"app": live, "info": {}, "reasons": ["code doi"],
+             "recreate": False, "action": "restart", "running": head}]
+        d.step_deps = lambda *a: set()
+        d.step_migrate = lambda cfg, dry, force=False: "skip"
+        d.step_build = lambda *a, **k: set()
+        del restarted[:]
+        with use_root(tmp):
+            rc = d.cmd_deploy(A(), {"APPS": "muse-binance"})
+        check("app tien that tu restart, khong hoi y/N",
+              restarted == ["muse-binance"] and rc == 0, (restarted, rc))
+        src = open(os.path.join(os.path.dirname(os.path.abspath(d.__file__)),
+                                "deploy.py")).read()
+        check("deploy.py khong con cho nao hoi y/N",
+              "input(" not in src and "def confirm" not in src
+              and "[y/N]" not in src)
+
         # --branch: doi nhanh thay cho pull; resume (sau re-exec) khong doi lai
         calls = []
-        d.step_switch_branch = lambda cfg, b, dry, yes: calls.append(
-            ("switch", b, yes)) or (head, head, True)
+        d.step_switch_branch = lambda cfg, b, dry: calls.append(
+            ("switch", b)) or (head, head, True)
         d.step_pull = lambda cfg, b, dry: calls.append(("pull",)) or \
             (head, head, False)
         a = A()
         a.branch = "feature"
-        a.yes = True
         with use_root(tmp):
             rc = d.cmd_deploy(a, cfg)
         check("--branch: goi step_switch_branch, khong pull lai",
-              calls == [("switch", "feature", True)] and rc == 0, (calls, rc))
+              calls == [("switch", "feature")] and rc == 0, (calls, rc))
         del calls[:]
         a.resume_from = head
         with use_root(tmp):
@@ -798,40 +818,34 @@ def test_switch_branch():
         with use_root(vps):
             cfg = d.load_config()
             try:
-                d.step_switch_branch(cfg, "khong-co", False, True)
+                d.step_switch_branch(cfg, "khong-co", False)
                 check("nhanh khong ton tai -> loi", False)
             except d.DeployError as e:
                 check("nhanh khong ton tai -> loi", "khong co nhanh" in str(e))
             try:
-                d.step_switch_branch(cfg, "old", False, True)
+                d.step_switch_branch(cfg, "old", False)
                 check("nhanh chua co deploy/ -> tu choi", False)
             except d.DeployError as e:
                 check("nhanh chua co deploy/ -> tu choi",
                       "chua co bo deploy" in str(e) and cur() == "main")
             try:
-                d.step_switch_branch(cfg, "--force", False, True)
+                d.step_switch_branch(cfg, "--force", False)
                 check("ten nhanh dang tuy chon -> tu choi", False)
             except d.DeployError:
                 check("ten nhanh dang tuy chon -> tu choi", True)
-            try:
-                d.step_switch_branch(cfg, "feature", False, False)
-                check("khong xac nhan (khong tty, khong --yes) -> huy", False)
-            except d.DeployError as e:
-                check("khong xac nhan (khong tty, khong --yes) -> huy",
-                      "huy" in str(e) and cur() == "main")
-            old, new, sw = d.step_switch_branch(cfg, "feature", True, True)
+            old, new, sw = d.step_switch_branch(cfg, "feature", True)
             check("--dry-run: bao commit moi, khong doi nhanh",
                   new == f1 and not sw and cur() == "main"
                   and "DEPLOY_BRANCH" not in open(d.local_env_path()).read())
             write(vps, "app.txt", "sua tay\n")
             try:
-                d.step_switch_branch(cfg, "feature", False, True)
+                d.step_switch_branch(cfg, "feature", False)
                 check("working tree co sua doi -> tu choi", False)
             except d.DeployError:
                 check("working tree co sua doi -> tu choi", cur() == "main")
             sh(["git", "checkout", "-q", "app.txt"], vps)
 
-            old, new, sw = d.step_switch_branch(cfg, "feature", False, True)
+            old, new, sw = d.step_switch_branch(cfg, "feature", False)
             text = open(d.local_env_path()).read()
             check("doi sang feature: checkout tracking + HEAD moi",
                   sw and old == m1 and new == f1 and cur() == "feature")
@@ -846,7 +860,7 @@ def test_switch_branch():
             write(dev, "app.txt", "main v2\n")
             m2 = commit(dev, "main c2")
             sh(["git", "push", "-q", "origin", "main"], dev)
-            old, new, sw = d.step_switch_branch(cfg, "main", False, True)
+            old, new, sw = d.step_switch_branch(cfg, "main", False)
             check("quay ve main (nhanh local cu) -> fast-forward toi c2",
                   sw and new == m2 and cur() == "main"
                   and d.load_config()["DEPLOY_BRANCH"] == "main")

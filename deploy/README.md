@@ -4,13 +4,16 @@
 git up              # kéo code mới → cài thư viện nếu cần → build nếu cần → restart app có thay đổi
 git up status       # app nào đang chạy commit nào, có cần restart không
 git up --dry-run    # chỉ xem sẽ làm gì (fetch nhưng không pull/cài/restart)
-git up --yes        # đồng ý luôn restart app tiền thật (Binance, Live Trader)
-git up --branch X   # đổi sang deploy nhánh X (hỏi y/N), lần sau git up tự theo X
+git up --branch X   # đổi sang deploy nhánh X, lần sau git up tự theo X
 git up --force      # làm lại mọi bước (pip, migrate, build) + restart mọi app
 git up doctor       # kiểm tra môi trường, chỉ đọc
 git up setup        # lần đầu: alias, pm2-logrotate, chuyển app từ systemd sang pm2
 ./deploy.sh ...     # tương đương git up ...
 ```
+
+**Không hỏi y/N**: mọi bước tự chạy, kể cả restart app tiền thật (Binance, Live
+Trader), đổi nhánh và `setup`. Chạy từ cron cũng vậy. `--yes` vẫn được chấp nhận
+(cho lệnh cũ) nhưng không còn tác dụng. Muốn xem trước thì dùng `--dry-run`.
 
 Tuỳ chọn khác: `--only muse-dashboard,muse-radar`, `--no-restart`,
 `--restart --only <app>` (ép restart), `--force-deps` (chỉ chạy lại pip install).
@@ -34,7 +37,8 @@ lần `git up` sau thấy app chạy commit cũ hơn HEAD nên restart nó.
 Tương tự với thư viện: mỗi lần `pip freeze` đổi, mốc thời gian được ghi vào
 `.deploy/changed_at.json`. App nào start **trước** mốc đó thì vẫn bị đánh dấu cần
 restart (`thu vien Python doi luc 07/10 14:05, sau khi app start`), kể cả khi
-lần trước bạn trả lời N cho app tiền thật. Lần `git up` sau sẽ hỏi lại.
+lần trước restart bị bỏ (`--no-restart`, `--only`, lỗi cú pháp). Lần `git up`
+sau sẽ restart nó.
 
 Dòng cuối luôn tóm tắt kết quả:
 
@@ -60,7 +64,7 @@ có chứa URL thì URL được thay bằng `***`.
 ### Đổi nhánh deploy: `git up --branch X`
 
 ```bash
-git up --branch main            # hỏi y/N; --yes để đồng ý luôn
+git up --branch main            # đổi luôn, không hỏi
 git up --branch main --dry-run  # chỉ xem chênh bao nhiêu commit
 ```
 
@@ -83,16 +87,16 @@ git up --branch main --dry-run  # chỉ xem chênh bao nhiêu commit
 ### `--force`
 
 Bỏ qua mọi dấu "đã làm": chạy lại `pip install`, migrate, build, và restart
-**mọi** app đang chạy (lý do `--force/--restart`). App tiền thật vẫn hỏi y/N
-(hoặc `--yes`), app đang `stopped` vẫn không tự start. Dùng khi nghi ngờ trạng thái
+**mọi** app đang chạy (lý do `--force/--restart`), kể cả app tiền thật. App
+đang `stopped` vẫn không tự start. Dùng khi nghi ngờ trạng thái
 `.deploy/` sai, hoặc sau khi sửa tay môi trường.
 
 **An toàn:**
 - Working tree có file đã sửa → dừng. Nếu local có commit chưa push hoặc lệch
   nhánh → dừng, không bao giờ merge/rebase/reset.
-- App tiền thật (`confirm: true` trong `apps.json`) phải trả lời y/N, hoặc
-  chạy `git up --yes`. Lý do: luật repo yêu cầu lên live Binance cần Cường duyệt.
-  Chạy không có terminal (cron) và không có `--yes` thì bỏ qua và in lệnh để chạy lại.
+- App tiền thật (`live: true` trong `apps.json`) được restart tự động như app khác,
+  không hỏi y/N. Trước khi restart, log có nhãn `[tien that]` và tóm tắt state
+  của bot (số lot đang mở, có đang halt không, nếu đọc được).
 - Có lỗi cú pháp Python → không restart, bot cũ vẫn chạy.
 - App đang `stopped` (do bị `pm2 stop`, do file `STOP`, hoặc do safety
   circuit) → **không tự start**.
@@ -137,7 +141,7 @@ DASHBOARD_ARGS=--server.baseUrlPath x    # nếu unit systemd cũ có thêm tham
 APPS=muse-dashboard muse-radar muse-live-trader muse-binance
 ```
 
-Định nghĩa app (thư mục, entry, thư mục import, `kill_timeout`, có cần xác nhận
+Định nghĩa app (thư mục, entry, thư mục import, `kill_timeout`, có phải app tiền thật
 không) nằm trong `deploy/apps.json`. `deploy.py` và `ecosystem.config.js` cùng đọc file này.
 
 ## Chuyển từ systemd sang pm2 (làm 1 lần trên VPS)
@@ -161,8 +165,8 @@ python3 deploy/deploy.py doctor
 python3 deploy/deploy.py setup
 ```
 
-Lần lượt cho từng app (dashboard → radar → live trader → binance), sau khi bạn
-trả lời y: `sudo systemctl disable --now muse-x`, kiểm tra không còn process cũ,
+Lần lượt cho từng app (dashboard → radar → live trader → binance), **không hỏi**:
+`sudo systemctl disable --now muse-x`, kiểm tra không còn process cũ,
 `pm2 start`, rồi health check. Mỗi app ngừng vài giây. Cuối cùng chạy `pm2 save`,
 `pm2 startup` (tự chạy lại sau reboot) và cài alias `git up`.
 
