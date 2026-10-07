@@ -641,11 +641,11 @@ def main():
                             dirty = True
                     except Exception as e:
                         log(f"retry_protection loi: {e}")
-                    # Quet don lenh mo coi moi 5 phut
+                    # Quet don lenh mo coi moi 30 giay
                     try:
                         now_ts = time.time()
                         last_cleanup = st.get("_last_orphan_cleanup", 0)
-                        if now_ts - last_cleanup >= 300:
+                        if now_ts - last_cleanup >= 30:
                             cleaned = engine.cleanup_orphan_orders()
                             st["_last_orphan_cleanup"] = now_ts
                             if cleaned:
