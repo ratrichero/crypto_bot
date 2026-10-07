@@ -692,3 +692,14 @@ Chi tiết xem [`deploy/README.md`](../deploy/README.md).
   `systemctl restart`. Nếu vẫn gọi, sau khi chuyển sang pm2 lệnh đó sẽ bật lại
   service systemd và tạo bot chạy trùng.
 - Chuyển từ systemd: `python3 deploy/deploy.py doctor`, rồi `python3 deploy/deploy.py setup`.
+- **Migrate DB tự động**: `db/schema.sql` đổi (hoặc DB đổi) → áp dụng trong 1
+  transaction trước khi restart. Lỗi → rollback, không restart app nào, mã thoát 1.
+  Biến `MIGRATE_SQL`, `MIGRATE_DB_ENV`, `MIGRATE_ENV_FILE`, `MIGRATE_PYTHON`
+  nằm trong `deploy/deploy.env`. Không dùng DB thì đặt `MIGRATE_SQL=` rỗng.
+- **Nhớ restart sau khi thư viện đổi**: mốc ghi ở `.deploy/changed_at.json`. App start
+  trước mốc vẫn được đánh dấu cần restart ở các lần `git up` sau, kể cả khi lần trước
+  trả lời N.
+- `git up --force`: làm lại pip/migrate/build và restart mọi app đang chạy (app
+  tiền thật vẫn hỏi). Dòng cuối tóm tắt `code / thu-vien / migrate / build / restart`.
+- `git up --branch X`: đổi nhánh deploy, có xác nhận và ghi nhớ `DEPLOY_BRANCH` vào
+  `deploy.local.env`. Chỉ đổi sang nhánh đã có `deploy/` (`main` hiện chưa có).

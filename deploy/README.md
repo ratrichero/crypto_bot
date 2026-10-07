@@ -5,13 +5,15 @@ git up              # kéo code mới → cài thư viện nếu cần → build
 git up status       # app nào đang chạy commit nào, có cần restart không
 git up --dry-run    # chỉ xem sẽ làm gì (fetch nhưng không pull/cài/restart)
 git up --yes        # đồng ý luôn restart app tiền thật (Binance, Live Trader)
+git up --branch X   # đổi sang deploy nhánh X (hỏi y/N), lần sau git up tự theo X
+git up --force      # làm lại mọi bước (pip, migrate, build) + restart mọi app
 git up doctor       # kiểm tra môi trường, chỉ đọc
 git up setup        # lần đầu: alias, pm2-logrotate, chuyển app từ systemd sang pm2
 ./deploy.sh ...     # tương đương git up ...
 ```
 
 Tuỳ chọn khác: `--only muse-dashboard,muse-radar`, `--no-restart`,
-`--restart --only <app>` (ép restart), `--force-deps` (chạy lại pip install).
+`--restart --only <app>` (ép restart), `--force-deps` (chỉ chạy lại pip install).
 
 ## `git up` làm gì
 
@@ -19,14 +21,71 @@ Tuỳ chọn khác: `--only muse-dashboard,muse-radar`, `--no-restart`,
 |---|---|---|
 | 1. Kéo code | `git fetch` rồi chỉ **fast-forward** nhánh đang checkout (`DEPLOY_BRANCH`) | không có commit mới |
 | 2. Thư viện | băm file requirements của từng python/venv, so với lần cài trước; `pip install -r` rồi so `pip freeze` trước/sau | requirements không đổi |
-| 3. Build web | thư mục có `package.json` đổi → `npm ci` + `npm run build` | không có (dashboard Streamlit chạy thẳng `app.py`) |
-| 4. Restart | app đang chạy commit nào (giờ start trong pm2 đối chiếu `git reflog`) → diff tới HEAD ∩ các file Python app import (tính bằng AST) | các thay đổi không đụng tới app |
-| 5. Kiểm tra | cú pháp Python trước khi restart; sau restart theo dõi 15–45s: online, không crash | — |
-| 6. Lưu | `pm2 save`, ghi `.deploy/history.log` | — |
+| 3. Migrate DB | `db/schema.sql` (idempotent) đổi, hoặc DB đổi → chạy trong **1 transaction** (lock_timeout 15s, statement_timeout 300s) | file và DB không đổi |
+| 4. Build web | thư mục có `package.json` đổi → `npm ci` + `npm run build` | không có (dashboard Streamlit chạy thẳng `app.py`) |
+| 5. Restart | app đang chạy commit nào (giờ start trong pm2 đối chiếu `git reflog`) → diff tới HEAD ∩ các file Python app import (tính bằng AST); **hoặc** thư viện/build của app đổi **sau** giờ app start | các thay đổi không đụng tới app |
+| 6. Kiểm tra | cú pháp Python trước khi restart; sau restart theo dõi 15–45s: online, không crash | — |
+| 7. Lưu | `pm2 save`, ghi `.deploy/history.log`, in dòng tổng kết | — |
 
 Lý do restart in ra cụ thể, ví dụ `CAN RESTART - code doi: binance-bot/live_binance.py`.
 Lỗi "dashboard đang chạy code cũ" do pull tay mà quên restart cũng được phát hiện:
 lần `git up` sau thấy app chạy commit cũ hơn HEAD nên restart nó.
+
+Tương tự với thư viện: mỗi lần `pip freeze` đổi, mốc thời gian được ghi vào
+`.deploy/changed_at.json`. App nào start **trước** mốc đó thì vẫn bị đánh dấu cần
+restart (`thu vien Python doi luc 07/10 14:05, sau khi app start`), kể cả khi
+lần trước bạn trả lời N cho app tiền thật. Lần `git up` sau sẽ hỏi lại.
+
+Dòng cuối luôn tóm tắt kết quả:
+
+```
+OK xong trong 12s - code:6a25585 thu-vien:1 migrate:applied build:0 restart:2/2
+XX xong trong 4s - code:- thu-vien:0 migrate:error build:0 restart:0/0 (CO LOI)
+```
+
+### Migrate DB
+
+Cấu hình trong `deploy.env`: `MIGRATE_SQL=db/schema.sql`, `MIGRATE_DB_ENV=DATABASE_URL`
+(tên biến chứa URL), `MIGRATE_ENV_FILE` (để trống = `ENV_FILE`), `MIGRATE_PYTHON`
+(để trống = `PYTHON`, cần có `psycopg`). URL lấy từ môi trường hoặc file env,
+được truyền qua biến môi trường chứ không qua tham số dòng lệnh. Nếu thông báo lỗi
+có chứa URL thì URL được thay bằng `***`.
+
+- Lỗi → rollback toàn bộ, **không restart app nào** (code mới có thể cần bảng
+  mới), mã thoát 1. Sửa SQL rồi chạy lại `git up`; migrate chạy lại vì dấu chưa ghi.
+- Không dùng DB: đặt `MIGRATE_SQL=` (rỗng) trong `deploy.local.env`.
+- Thêm bảng mới: viết vào `db/schema.sql` theo kiểu idempotent (`CREATE TABLE IF
+  NOT EXISTS`, `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`).
+
+### Đổi nhánh deploy: `git up --branch X`
+
+```bash
+git up --branch main            # hỏi y/N; --yes để đồng ý luôn
+git up --branch main --dry-run  # chỉ xem chênh bao nhiêu commit
+```
+
+- Nhánh phải có trên remote và **đã có `deploy/deploy.py`**. Nếu không có,
+  lệnh từ chối, vì chuyển sang sẽ mất `git up` và cấu hình pm2. Hiện `main`
+  chưa có `deploy/`, phải merge trước.
+- Working tree phải sạch. Lệnh chỉ `checkout` + fast-forward. Nhánh local lệch
+  với remote (diverged) thì dừng. Commit chưa push của nhánh cũ vẫn nằm trên nhánh cũ.
+- Cho xem `A (sha) -> B (sha): +N commit chỉ có ở nhánh mới, -M commit chỉ có ở
+  nhánh cũ`. -M > 0 nghĩa là code sẽ **mất** các commit đó (có thể là lùi bản).
+- Sau khi đổi, ghi `DEPLOY_BRANCH=X` vào `deploy/deploy.local.env` (giữ các dòng
+  khác). Các lần `git up` sau tự theo X, rồi chạy bình thường: cài thư viện,
+  migrate, chỉ restart app có file khác nhau giữa hai nhánh. Script deploy khác
+  nhau thì tự chạy lại bằng bản của nhánh mới.
+- Đang đứng sai nhánh so với `DEPLOY_BRANCH` (do checkout tay) → `git up` dừng và
+  gợi ý `git up --branch <nhánh>`.
+- Lần đầu: VPS đang chạy `deploy.py` cũ chưa có `--branch` → chạy `git up` một lần
+  để lấy bản mới.
+
+### `--force`
+
+Bỏ qua mọi dấu "đã làm": chạy lại `pip install`, migrate, build, và restart
+**mọi** app đang chạy (lý do `--force/--restart`). App tiền thật vẫn hỏi y/N
+(hoặc `--yes`), app đang `stopped` vẫn không tự start. Dùng khi nghi ngờ trạng thái
+`.deploy/` sai, hoặc sau khi sửa tay môi trường.
 
 **An toàn:**
 - Working tree có file đã sửa → dừng. Nếu local có commit chưa push hoặc lệch
@@ -119,5 +178,5 @@ Quay lại systemd: `pm2 delete muse-x && pm2 save && sudo systemctl enable --no
   và các file runtime khác. Riêng `python3 deploy/test_deploy.py` chạy được,
   vì chỉ dùng repo tạm.
 - Alias `git up` lưu trong `.git/config` của repo này (`!exec python3 deploy/deploy.py`).
-- Trạng thái deploy nằm ở `.deploy/` (có trong .gitignore): lock, mốc cài pip, hash
-  cấu hình pm2 của từng app, `history.log`.
+- Trạng thái deploy nằm ở `.deploy/` (có trong .gitignore): lock, dấu pip/migrate/build,
+  `changed_at.json` (mốc đổi thư viện/build), hash cấu hình pm2 của từng app, `history.log`.
