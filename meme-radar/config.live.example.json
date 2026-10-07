@@ -3,7 +3,7 @@
  "_daily_note": "Dung MO VI THE MOI khi lo thuc te trong ngay (UTC) < -20% portfolio dau ngay. Vi the cu van duoc quan ly exit.",
  "_exit_note": "Exit ladder mirror y het paper (radar.py plan scalp): TP1 +50% ban 1/3, TP2 +100% ban them 1/3, con lai trailing -30% tu dinh; SL -25% cat het; smart exit khi >=2 vi tracked xa cung token/30p; time stop 480p (lai >=20% -> chot 1/2 giu 1/2 trailing, khong thi cat het).",
  "_fee_buffer_note": "Giu lai toi thieu 0.02 SOL trong vi cho phi tx + rent, khong dung de swap.",
- "_impact_note": "Bo qua lenh neu price impact vuot nguong (bao ve khoi coin kem thanh khoan).",
+ "_impact_note": "Bo qua lenh neu price impact vuot nguong, don vi PHAN TRAM (5.0 = 5%). Jupiter tra priceImpactPct dang phan so (0.05 = 5%), code tu quy doi.",
  "_jupiter_note": "Jupiter Swap API v1 (keyless). Neu co Jupiter API key rieng: doi thanh https://api.jup.ag (can them header x-api-key - tu sua code).",
  "_key_note": "Private key base58: dat trong env SOLANA_PRIVATE_KEY (nap tu file .env chmod 600, uu tien) hoac file .solana_key chmod 600. KHONG commit, KHONG paste vao chat.",
  "_mode_note": "dry_run = chi log y dinh swap, KHONG gui transaction, khong can key. live = swap THAT bang tien that, bat buoc co key (env/file) va pubkey khop wallet_address (thieu -> tu dung).",

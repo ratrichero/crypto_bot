@@ -167,13 +167,13 @@ class FakeJup(lt.JupiterClient):
             tokens = (amount_base / 1e9) * self._sol / px_t
             return {"outAmount": str(int(tokens * 10 ** self.DEC)),
                     "otherAmountThreshold": str(int(tokens * 10 ** self.DEC)),
-                    "priceImpactPct": "0.1"}
+                    "priceImpactPct": "0.001"}
         # token -> USDC: dung de dinh gia
         px = self.price_map.get(in_mint, 0.001)
         tokens = amount_base / (10 ** self.DEC)
         return {"outAmount": str(int(tokens * px * 1e6)),
                 "otherAmountThreshold": str(int(tokens * px * 1e6 * 0.99)),
-                "priceImpactPct": "0.1"}
+                "priceImpactPct": "0.001"}
 
     def swap_tx(self, quote, user_pubkey, priority_fee):
         self.swaps += 1
@@ -568,6 +568,55 @@ def test_failed_tp1_then_tp2_same_poll():
               str((pos["remaining"], sw.balance / init)))
 
 
+
+# ---- price impact: Jupiter tra phan so ----
+
+def test_price_impact_fraction():
+    print("== priceImpactPct la phan so (0.0042 = 0.42%) ==")
+    check("0.0042 -> 0.42%", abs(lt.price_impact_pct({"priceImpactPct": "0.0042"}) - 0.42) < 1e-9)
+    check("0.06 -> 6%", abs(lt.price_impact_pct({"priceImpactPct": "0.06"}) - 6.0) < 1e-9)
+    check("am -> 0", lt.price_impact_pct({"priceImpactPct": "-0.01"}) == 0.0)
+    check("thieu -> inf (fail closed)", lt.price_impact_pct({}) == float("inf"))
+    check("rac -> inf", lt.price_impact_pct({"priceImpactPct": "abc"}) == float("inf"))
+
+
+class ImpactJup(FakeJup):
+    def __init__(self, impact):
+        super().__init__()
+        self.impact = impact
+
+    def quote(self, in_mint, out_mint, amount_base, slippage_bps):
+        q = super().quote(in_mint, out_mint, amount_base, slippage_bps)
+        q["priceImpactPct"] = self.impact
+        return q
+
+    def swap_tx(self, quote, user_pubkey, priority_fee):
+        self.swaps += 1
+        return "TX"
+
+
+def test_price_impact_guard_blocks():
+    print("== guard impact: 6% > 5% bi chan, 0.42% qua ==")
+    cfg = dict(lt.DEFAULTS, mode="live", max_swap_retries=1)
+    sw = lt.Swapper(FakeRpc(), ImpactJup("0.06"), None, cfg, dry_run=False)
+    try:
+        sw._quote_swap(lt.SOL_MINT, "MINT", 1000)
+        check("6% phai bi chan", False)
+    except lt.SwapError as e:
+        check("6% bi chan", "price impact" in str(e), str(e))
+    sw = lt.Swapper(FakeRpc(), ImpactJup("0.0042"), None, cfg, dry_run=False)
+    q, tx = sw._quote_swap(lt.SOL_MINT, "MINT", 1000)
+    check("0.42% qua guard", tx == "TX")
+    # dry-run cung ap guard
+    cfgd = dict(lt.DEFAULTS, mode="dry_run")
+    swd = lt.Swapper(FakeRpc(), ImpactJup("0.06"), None, cfgd, dry_run=True)
+    try:
+        swd.execute_buy("MINT", 10.0, "TST")
+        check("dry-run 6% phai bi chan", False)
+    except lt.SwapError:
+        check("dry-run 6% bi chan", True)
+
+
 if __name__ == "__main__":
     test_exit_tp_ladder()
     test_exit_sl()
@@ -591,5 +640,7 @@ if __name__ == "__main__":
     test_tp1_tp2_same_poll()
     test_time_keep_after_tp1()
     test_failed_tp1_then_tp2_same_poll()
+    test_price_impact_fraction()
+    test_price_impact_guard_blocks()
     print(f"\n{PASS} pass, {FAIL} fail")
     sys.exit(1 if FAIL else 0)

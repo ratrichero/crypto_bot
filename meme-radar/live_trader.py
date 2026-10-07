@@ -156,6 +156,23 @@ def usd_to_lamports(usd, sol_usd):
     return int(usd / sol_usd * 1_000_000_000)
 
 
+def price_impact_pct(quote):
+    """Price impact theo PHAN TRAM (5.0 = 5%) tu Jupiter quote.
+
+    Jupiter /swap/v1/quote tra `priceImpactPct` dang PHAN SO (0.0042 =
+    0.42%), khong phai phan tram -> nhan 100 de so voi max_price_impact_pct
+    (cau hinh theo %). Am (gia co loi) -> 0. Khong doc duoc -> inf (fail
+    closed: bo qua lenh thay vi bo qua guard).
+    """
+    try:
+        frac = float(quote.get("priceImpactPct"))
+    except (TypeError, ValueError, AttributeError):
+        return float("inf")
+    if frac != frac:  # NaN
+        return float("inf")
+    return max(0.0, frac * 100.0)
+
+
 
 
 # ---------------------------------------------------------------- key
@@ -498,12 +515,9 @@ class Swapper:
                 last = e
                 time.sleep(1)
                 continue
-            try:
-                pi = float(q.get("priceImpactPct") or 0)
-            except (TypeError, ValueError):
-                pi = 0
+            pi = price_impact_pct(q)
             if pi > max_price_impact_pct:
-                raise SwapError(f"price impact {pi}% > max "
+                raise SwapError(f"price impact {pi:.2f}% > max "
                                 f"{max_price_impact_pct}% -> skip")
             try:
                 txb64 = self.jup.swap_tx(q, self.pubkey, self._priority_fee())
@@ -528,6 +542,10 @@ class Swapper:
         if self.dry:
             q = self.jup.quote(SOL_MINT, mint, lamports,
                                self.cfg["slippage_bps"])
+            pi = price_impact_pct(q)
+            if pi > self.cfg["max_price_impact_pct"]:
+                raise SwapError(f"price impact {pi:.2f}% > max "
+                                f"{self.cfg['max_price_impact_pct']}% -> skip")
             dec = self.rpc.get_mint_decimals(mint)
             tokens = int(q["outAmount"]) / (10 ** dec)
             price = size_usd / tokens if tokens > 0 else 0
