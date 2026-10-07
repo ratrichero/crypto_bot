@@ -313,10 +313,26 @@ def manage_grid_risk(engine, st, mark_prices):
         grid = st["grids"].setdefault(
             symbol, {"anchor": None, "taken": {}}
         )
-        if grid.get("risk_halted"):
-            continue
         positions = [p for p in st["positions"]
                      if p.get("tag") == "grid" and p.get("symbol") == symbol]
+        if grid.get("basket_stopping"):
+            # Basket stop da kich hoat: thu lai dong lot con lai moi vong
+            # (truoc day lot close() tra None khong bao gio duoc thu lai).
+            price = mark_prices.get(symbol)
+            if positions and price is not None:
+                for pos in list(positions):
+                    rec = engine.close(pos, price, "GRID_BASKET_STOP")
+                    if rec:
+                        _record_close(st, rec)
+                        changed = True
+            if not [p for p in st["positions"] if p.get("tag") == "grid"
+                    and p.get("symbol") == symbol]:
+                grid.pop("basket_stopping", None)
+                log("GRID BASKET STOP %s: da dong het lot" % symbol)
+                changed = True
+            continue
+        if grid.get("risk_halted"):
+            continue
         if not positions:
             continue
         price = mark_prices.get(symbol)
@@ -339,7 +355,12 @@ def manage_grid_risk(engine, st, mark_prices):
             rec = engine.close(pos, price, "GRID_BASKET_STOP")
             if rec:
                 _record_close(st, rec)
-                changed = True
+        changed = True
+        if [p for p in st["positions"] if p.get("tag") == "grid"
+                and p.get("symbol") == symbol]:
+            grid["basket_stopping"] = True
+            log("GRID BASKET STOP %s: con lot chua dong -> thu lai moi vong"
+                % symbol)
         grid["taken"] = {}
     return changed
 

@@ -1263,6 +1263,35 @@ def test_daily_stop_no_stale_or_manual_resume_closes():
           len(st["positions"]) == 1 and not st.get("halted"))
 
 
+def test_basket_stop_retries_unclosed_lots():
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    bot_state(st)
+    st["mark_equity"] = 1000.0
+    a = open_lot(eng, "long", 60000, level="b1")
+    b = open_lot(eng, "long", 59700, level="b2")
+    real_close = eng.close
+    blocked = {b["id"]}
+
+    def flaky_close(pos, price, reason):
+        if pos["id"] in blocked:
+            blocked.discard(pos["id"])
+            return None                     # cooldown 1 lan
+        return real_close(pos, price, reason)
+    eng.close = flaky_close
+    marks = {"BTCUSDT": 57000}              # lo basket > 2% equity
+    binance_bot.manage_grid_risk(eng, st, marks)
+    grid = st["grids"]["BTCUSDT"]
+    check("basket: lan 1 con 1 lot, danh dau dang stop",
+          [p["id"] for p in st["positions"]] == [b["id"]]
+          and grid.get("basket_stopping") and grid.get("risk_halted"),
+          (st["positions"], grid))
+    binance_bot.manage_grid_risk(eng, st, marks)
+    check("basket: vong sau thu lai, dong het, bo co",
+          st["positions"] == [] and not grid.get("basket_stopping")
+          and grid.get("risk_halted"), (st["positions"], grid))
+
+
 TESTS = [
     test_close_one_of_many_grid_lots,
     test_close_detects_real_partial,
@@ -1314,6 +1343,7 @@ TESTS = [
     test_daily_stop_runs_while_halted_other_reason,
     test_daily_stop_retries_unclosed_lots,
     test_daily_stop_no_stale_or_manual_resume_closes,
+    test_basket_stop_retries_unclosed_lots,
 ]
 
 
