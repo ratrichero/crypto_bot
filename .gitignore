@@ -32,6 +32,11 @@ binance-bot/clear_halt_result.json
 # Config runtime cache + ket qua scanner (sinh khi chay)
 binance-bot/runtime_config.cache.json
 binance-bot/runtime_config.cache.json.tmp
+# state/config runtime cua bot Binance tren VPS (config.example.json moi la mau)
+binance-bot/state.json
+binance-bot/state.json.tmp
+binance-bot/config.json
+binance-bot/universe.json
 binance-bot/scanner_latest.json
 binance-bot/scanner_latest.json.tmp
 # Deploy (pm2): trang thai cuc bo + cau hinh rieng VPS
