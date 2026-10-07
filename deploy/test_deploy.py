@@ -441,13 +441,14 @@ def test_systemd_env_check():
         with open(app_env, "w") as f:
             f.write("DATABASE_URL=postgres://x\n")
         os.chmod(app_env, 0o644)
+        py = sys.executable
         unit = {"Environment": 'PYTHONUNBUFFERED=1 BINANCE_API_KEY=k '
                                '"NOTE=co dau cach"',
-                "EnvironmentFiles": "%s (ignore_errors=no) "
-                                    "-/root/secret.env (ignore_errors=yes)"
-                                    % unit_env,
-                "ExecStart": "{ path=/x/python ; argv[]=/x/python bot.py ; "
-                             "ignore_errors=no }",
+                "EnvironmentFiles": "%s (ignore_errors=no) %s (ignore_errors="
+                                    "no) -/root/secret.env (ignore_errors=yes)"
+                                    % (app_env, unit_env),
+                "ExecStart": "{ path=%s ; argv[]=%s bot.py ; "
+                             "ignore_errors=no }" % (py, py),
                 "User": os.environ.get("USER", "")}
         names, unreadable = d.unit_env_names(unit)
         check("doc ten bien tu Environment + EnvironmentFiles",
@@ -455,7 +456,7 @@ def test_systemd_env_check():
                "FROM_FILE"} <= names, names)
         check("bao file khong doc duoc", unreadable == ["/root/secret.env"],
               unreadable)
-        check("ExecStart -> lenh", d.unit_exec(unit) == "/x/python bot.py")
+        check("ExecStart -> lenh", d.unit_exec(unit) == py + " bot.py")
         app = {"python": sys.executable, "env_file": app_env}
         errors, warns = d.check_app_env(app, unit)
         check("thieu bien systemd cap -> loi, liet ke ten (khong gia tri)",
@@ -472,6 +473,47 @@ def test_systemd_env_check():
         errors, _ = d.check_app_env({"python": "/khong/co", "env_file": ""},
                                     None)
         check("thieu python -> loi", errors and "python" in errors[0])
+
+        # python systemd khac deploy.env -> loi, chi ro bien can sua
+        u2 = dict(unit, ExecStart="{ path=/srv/venv/bin/python ; argv[]="
+                  "/srv/venv/bin/python radar.py ; }")
+        errors, _ = d.check_app_env(dict(app, name="muse-radar"), u2)
+        check("python systemd khac cau hinh -> loi PYTHON_MUSE_RADAR",
+              any("PYTHON_MUSE_RADAR" in e and "/srv/venv/bin/python" in e
+                  for e in errors), errors)
+        # python mat ma systemd cung dung -> goi y venv hong
+        u3 = dict(unit, ExecStart="{ path=/khong/co/python ; argv[]="
+                  "/khong/co/python bot.py ; }")
+        errors, _ = d.check_app_env(dict(app, python="/khong/co/python",
+                                         name="muse-binance"), u3)
+        check("python mat, systemd cung dung -> goi y venv hong + journalctl",
+              any("venv" in e and "journalctl -u muse-binance" in e
+                  for e in errors) and not any("PYTHON_" in e for e in errors),
+              errors)
+        # EnvironmentFile systemd khac ENV_FILE
+        u4 = dict(unit, EnvironmentFiles="%s (ignore_errors=no)" % unit_env,
+                  Environment="")
+        errors, _ = d.check_app_env(dict(app, name="muse-live-trader"), u4)
+        check("EnvironmentFile khac ENV_FILE -> loi ENV_FILE_MUSE_LIVE_TRADER",
+              any("ENV_FILE_MUSE_LIVE_TRADER" in e for e in errors), errors)
+        errors, _ = d.check_app_env(dict(app, name="muse-live-trader",
+                                         env_file=unit_env), u4)
+        check("EnvironmentFile trung ENV_FILE -> khong loi", errors == [],
+              errors)
+        # systemd khong cap env, pm2 se nap ENV_FILE
+        u5 = dict(unit, EnvironmentFiles="", Environment="")
+        errors, warns = d.check_app_env(dict(app, name="muse-live-trader",
+                                             live=True), u5)
+        check("app tien that: systemd khong env, pm2 nap file -> loi",
+              any("KHONG cap bien" in e for e in errors), errors)
+        errors, warns = d.check_app_env(dict(app, name="muse-radar"), u5)
+        check("app thuong: cung tinh huong -> chi canh bao",
+              errors == [] and any("KHONG cap bien" in w for w in warns),
+              (errors, warns))
+        errors, _ = d.check_app_env(dict(app, name="muse-live-trader",
+                                         live=True, env_file=""), u5)
+        check("ENV_FILE=- va systemd khong env -> khong loi", errors == [],
+              errors)
     finally:
         shutil.rmtree(tmp)
 
@@ -487,6 +529,11 @@ def test_load_apps():
           and apps["muse-dashboard"]["python"].endswith(".venv/bin/python"))
     check("ENV_FILE rieng rong -> dung ENV_FILE chung",
           apps["muse-dashboard"]["env_file"].endswith(".env"))
+    a2 = {a["name"]: a for a in d.load_apps(dict(cfg,
+                                                  ENV_FILE_MUSE_BINANCE="-"))}
+    check("ENV_FILE rieng '-' -> khong nap file nao",
+          a2["muse-binance"]["env_file"] == ""
+          and a2["muse-dashboard"]["env_file"].endswith(".env"))
     try:
         d.load_apps(dict(cfg, APPS="muse-khong-co"))
         check("app la -> loi", False)

@@ -52,7 +52,7 @@ module.exports = {
       cwd: ROOT,
       script: path.join(DEPLOY, 'run-app.sh'),
       interpreter: '/bin/bash',
-      args: [envFile ? abs(envFile) : '-', abs(s.cwd), abs(pick('PYTHON', name))]
+      args: [envFile && envFile !== '-' ? abs(envFile) : '-', abs(s.cwd), abs(pick('PYTHON', name))]
         .concat(pyArgs),
       autorestart: true,
       // 0 = bot tu dung (file STOP, safety circuit 429/418, start loi):

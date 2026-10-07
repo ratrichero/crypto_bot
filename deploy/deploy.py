@@ -181,7 +181,7 @@ def load_apps(cfg, only=None):
         s["name"] = n
         s["python"] = abspath(cfg_for(cfg, "PYTHON", n))
         env_file = cfg_for(cfg, "ENV_FILE", n)
-        s["env_file"] = abspath(env_file) if env_file else ""
+        s["env_file"] = abspath(env_file) if env_file not in ("", "-") else ""
         apps.append(s)
     return apps
 
@@ -1063,9 +1063,9 @@ def systemd_unit(name):
     if not shutil.which("systemctl") or \
             not os.path.isdir("/run/systemd/system"):
         return None
-    props = ["LoadState", "ActiveState", "UnitFileState", "ExecStart",
-             "WorkingDirectory", "Environment", "EnvironmentFiles", "User",
-             "FragmentPath"]
+    props = ["LoadState", "ActiveState", "SubState", "NRestarts",
+             "UnitFileState", "ExecStart", "WorkingDirectory", "Environment",
+             "EnvironmentFiles", "User", "FragmentPath"]
     res = run(["systemctl", "show", name + ".service", "-p", ",".join(props)],
               check=False, timeout=20)
     if res.returncode != 0:
@@ -1078,6 +1078,35 @@ def systemd_unit(name):
     if out.get("LoadState") != "loaded":
         return None
     return out
+
+
+def unit_env_files(unit):
+    """Duong dan EnvironmentFile= cua unit (bo dau '-')."""
+    out = []
+    for part in (unit.get("EnvironmentFiles") or "").split(") "):
+        path = part.split(" (")[0].strip().lstrip("-")
+        if path:
+            out.append(os.path.normpath(path))
+    return out
+
+
+def unit_python(unit):
+    """Python ma unit systemd dang chay (tu ExecStart), hoac None."""
+    try:
+        argv = shlex.split(unit_exec(unit))
+    except ValueError:
+        return None
+    if argv and "python" in os.path.basename(argv[0]):
+        return os.path.normpath(argv[0])
+    return None
+
+
+def same_file(a, b):
+    a, b = os.path.normpath(a), os.path.normpath(b)
+    if a == b:
+        return True
+    return (os.path.exists(a) and os.path.exists(b)
+            and os.path.realpath(a) == os.path.realpath(b))
 
 
 def unit_env_names(unit):
@@ -1169,8 +1198,38 @@ def cron_lines(apps):
 def check_app_env(app, unit):
     """-> (loi, canh bao) truoc khi chuyen tu systemd sang pm2."""
     errors, warns = [], []
+    key = app_key(app.get("name", ""))
+    upy = unit_python(unit) if unit else None
+    if upy and not same_file(upy, app["python"]):
+        errors.append("systemd chay bang python %s nhung deploy.env cau hinh %s "
+                      "-> sua PYTHON_%s trong deploy/deploy.env"
+                      % (upy, app["python"], key))
     if not os.path.exists(app["python"]):
-        errors.append("khong thay python %s" % app["python"])
+        if upy and same_file(upy, app["python"]):
+            errors.append("khong thay python %s - ban systemd cung dung duong "
+                          "dan nay -> venv bi xoa/hong? (ls -la %s; journalctl "
+                          "-u %s -n 50)" % (app["python"], app["python"],
+                                             app["name"]))
+        else:
+            errors.append("khong thay python %s" % app["python"])
+    if unit:
+        files = unit_env_files(unit)
+        if files and app["env_file"] and not any(
+                same_file(f, app["env_file"]) for f in files):
+            errors.append("systemd nap EnvironmentFile %s nhung pm2 se nap %s "
+                          "-> sua ENV_FILE_%s trong deploy/deploy.env"
+                          % (", ".join(files), app["env_file"], key))
+        elif files and not app["env_file"]:
+            errors.append("systemd nap EnvironmentFile %s nhung pm2 khong nap "
+                          "file nao -> dat ENV_FILE_%s" % (", ".join(files), key))
+        elif not files and not (unit.get("Environment") or "").strip() \
+                and app["env_file"]:
+            msg = ("systemd KHONG cap bien moi truong nao, nhung pm2 se nap %s "
+                   "- bien trong file nay se de len gia tri bot tu doc tu .env "
+                   "rieng (vd SOLANA_PRIVATE_KEY). Neu dung y thi bo qua, neu "
+                   "khong: dat ENV_FILE_%s=- (khong nap) hoac file .env rieng cua bot"
+                   % (app["env_file"], key))
+            (errors if app.get("live") else warns).append(msg)
     have = set()
     if app["env_file"]:
         if not os.access(app["env_file"], os.R_OK):
@@ -1229,9 +1288,15 @@ def cmd_doctor(args, cfg):
         p = procs.get(a["name"])
         info("  pm2      %s" % (p["status"] if p else "chua co"))
         if unit:
-            info("  systemd  %s / %s  (%s)" % (unit.get("ActiveState"),
-                                              unit.get("UnitFileState"),
-                                              unit.get("FragmentPath")))
+            info("  systemd  %s (%s) / %s  (%s)" % (
+                unit.get("ActiveState"), unit.get("SubState"),
+                unit.get("UnitFileState"), unit.get("FragmentPath")))
+            if unit.get("SubState") == "auto-restart" or (
+                    unit.get("ActiveState") in ("activating", "failed")):
+                bad("ban systemd DANG LOI (%s/%s, da restart %s lan) - bot "
+                    "khong chay! Xem: journalctl -u %s -n 50 --no-pager"
+                    % (unit.get("ActiveState"), unit.get("SubState"),
+                       unit.get("NRestarts") or "?", a["name"]))
             info("    ExecStart  %s" % unit_exec(unit))
             info("    WorkingDir %s" % unit.get("WorkingDirectory"))
             names, unreadable = unit_env_names(unit)

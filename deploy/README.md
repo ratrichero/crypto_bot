@@ -154,6 +154,14 @@ python3 deploy/deploy.py doctor
 Đọc kết quả `doctor`:
 - **ExecStart** của từng unit: python, tham số và port dashboard phải khớp với
   cấu hình trong `deploy/deploy.env`. Nếu khác, sửa `deploy.env` trong repo rồi push.
+  Python khác nhau → `XX ... sua PYTHON_<APP>` (chặn `setup`). Hiện tại `meme-radar`
+  dùng `.venv` riêng (`PYTHON_MUSE_RADAR`, `PYTHON_MUSE_LIVE_TRADER`).
+- **EnvironmentFile** của unit phải trùng với `ENV_FILE` mà pm2 sẽ nạp. Nếu khác
+  → `XX ... sua ENV_FILE_<APP>`. Unit không cấp biến nào mà pm2 lại nạp file →
+  app tiền thật bị chặn, vì biến trong file sẽ đè lên `.env` riêng mà bot tự đọc
+  (ví dụ `SOLANA_PRIVATE_KEY`). Đặt `ENV_FILE_<APP>=-` nếu muốn không nạp file nào.
+- **systemd DANG LOI** (activating/auto-restart): bot hiện không chạy. Xem
+  `journalctl -u <app> -n 50` trước khi chuyển.
 - **Env (tên)**: các biến unit systemd đang cấp. Biến nào chưa có trong
   `ENV_FILE` thì `doctor`/`setup` báo `XX` và **không chuyển** app đó. Thêm biến
   vào `.env` (chmod 600) trước khi chuyển.
