@@ -631,6 +631,102 @@ def test_restart_after_offline_tp_books_pnl():
           ok and not st2.get("halted"), st2.get("halt_reason"))
 
 
+# ===================================================================
+# 8. Opening: every lot ends up with exactly one SL and one TP
+# ===================================================================
+def guards_of(fake, lot_id_pos):
+    cids = {lot_id_pos.get("sl_client_algo_id"),
+            lot_id_pos.get("tp_client_algo_id")}
+    return [a for a in fake.open_algos() if a["clientAlgoId"] in cids]
+
+
+def retry(eng, advance):
+    CLOCK.sleep(advance)
+    return eng.retry_protection()
+
+
+def test_tp_failure_keeps_sl_and_rearms_only_tp():
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    fake.post_failures = [None, BinanceError("binance -1001 internal error")]
+    lot = open_lot(eng, "long", 60000, level="b1")
+    check("TP loi: SL da dat van duoc giu tren san",
+          lot["sl_algo_id"] and fake.algos[lot["sl_algo_id"]]["algoStatus"]
+          == "NEW", fake.algos)
+    check("TP loi: lot o trang thai retrying, khong co deadline dong",
+          lot["protection_status"] == "retrying"
+          and "protection_deadline" not in lot)
+    sl_before = lot["sl_algo_id"]
+    retry(eng, 31)
+    check("TP loi: retry chi dat TP, giu nguyen SL",
+          lot["protection_status"] == "armed" and lot["sl_algo_id"] == sl_before
+          and lot["tp_algo_id"])
+    check("TP loi: tren san dung 1 SL + 1 TP", len(fake.open_algos()) == 2,
+          fake.open_algos())
+
+
+def test_sl_failure_closes_after_deadline():
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    fake.post_failures = [BinanceError("binance -1001 internal error")] * 50
+    lot = open_lot(eng, "long", 60000, level="b1")
+    fake.post_failures = [BinanceError("binance -1001 internal error")] * 50
+    check("SL loi: co deadline", "protection_deadline" in lot)
+    for _ in range(13):
+        retry(eng, 10)
+    recs = eng.drain_close_records()
+    check("SL loi qua deadline: dong lot va tra record de ghi JSONL/DB",
+          st["positions"] == [] and len(recs) == 1
+          and recs[0]["reason"] == "PROTECTION_FAILED", (recs, eng.logs[-3:]))
+
+
+def test_only_tp_missing_never_force_closes():
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    lot = open_lot(eng, "long", 60000, level="b1")
+    fake.fapiPrivateDeleteAlgoOrder({"algoId": lot["tp_algo_id"]})
+    sync(eng)                                    # guard reported lost
+    fake.post_failures = [BinanceError("-2021 would immediately trigger")] * 50
+    for _ in range(10):
+        retry(eng, 31)
+    check("chi thieu TP: khong ep dong lot", len(st["positions"]) == 1)
+    check("chi thieu TP: SL van tren san",
+          fake.algos[lot["sl_algo_id"]]["algoStatus"] == "NEW")
+
+
+def test_lost_guard_rearmed_without_duplicates():
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    lot = open_lot(eng, "long", 60000, level="b1")
+    fake.algos[lot["sl_algo_id"]]["algoStatus"] = "EXPIRED"   # system cancel
+    sync(eng)
+    eng.retry_protection()
+    check("guard het han: dat lai dung chan SL",
+          lot["protection_status"] == "armed" and lot["sl_algo_id"]
+          and fake.algos[lot["sl_algo_id"]]["algoStatus"] == "NEW")
+    check("guard het han: tren san dung 2 guard cho lot",
+          len(fake.open_algos()) == 2, fake.open_algos())
+
+
+def test_ambiguous_post_is_adopted_not_duplicated():
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    real_post = fake.fapiPrivatePostAlgoOrder
+    state = {"n": 0}
+
+    def landed_then_timeout(params):
+        state["n"] += 1
+        result = real_post(params)
+        if state["n"] == 2:
+            raise BinanceError("RequestTimeout: timed out")
+        return result
+    fake.fapiPrivatePostAlgoOrder = landed_then_timeout
+    lot = open_lot(eng, "long", 60000, level="b1")
+    check("POST mo ho: nhan lai guard theo clientAlgoId",
+          lot["protection_status"] == "armed" and lot["tp_algo_id"]
+          and len(fake.open_algos()) == 2, (lot, fake.open_algos()))
+
+
 TESTS = [
     test_close_one_of_many_grid_lots,
     test_close_detects_real_partial,
@@ -653,6 +749,11 @@ TESTS = [
     test_close_after_guard_filled_books_exchange_fill,
     test_close_while_guard_in_flight_does_not_halt,
     test_restart_after_offline_tp_books_pnl,
+    test_tp_failure_keeps_sl_and_rearms_only_tp,
+    test_sl_failure_closes_after_deadline,
+    test_only_tp_missing_never_force_closes,
+    test_lost_guard_rearmed_without_duplicates,
+    test_ambiguous_post_is_adopted_not_duplicated,
 ]
 
 

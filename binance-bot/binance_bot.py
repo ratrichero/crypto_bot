@@ -673,8 +673,15 @@ def main():
                     try:
                         if engine.retry_protection():
                             dirty = True
+                    except binance_safety.BinanceSafetyStop:
+                        raise
                     except Exception as e:
                         log(f"retry_protection loi: {e}")
+                    # Lot bi dong vi khong dat duoc SL -> van ghi JSONL/DB
+                    for rec in getattr(engine, "drain_close_records",
+                                       lambda: [])():
+                        _record_close(st, rec)
+                        dirty = True
                     # Quet don lenh mo coi moi 30 giay
                     try:
                         now_ts = time.time()

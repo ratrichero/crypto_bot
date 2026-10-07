@@ -138,6 +138,7 @@ class BinanceEngine:
         self._protection_sync_due = True
         self._last_protection_sync = 0.0
         self._trigger_seen = {}
+        self._pending_close_recs = []
         self._order_condition = threading.Condition()
         self._last_account_event = 0.0
         self._account_position_snapshot = {}
@@ -637,63 +638,92 @@ class BinanceEngine:
         ) * step
         return format(value, "f")
 
+    def _missing_guards(self, pos):
+        """Labels whose exchange guard is required but has no algo id."""
+        if self.dry_run or not self.cfg.get("exchange_protection", False):
+            return []
+        return [label for label in ("sl", "tp")
+                if pos.get(label) is not None
+                and not pos.get("%s_algo_id" % label)]
+
     def _create_exchange_protection(self, pos):
-        """Create optional Binance conditional orders for a live position."""
+        """Arm the MISSING Binance conditional guards of a live lot.
+
+        Each leg is independent: an existing leg is never re-created (that
+        produced duplicates/orphans) and a successful leg is never cancelled
+        because the other one failed (a lone SL is far better than nothing).
+        Raises after trying every missing leg if any of them failed; the
+        caller keeps the lot in 'retrying' until all legs are armed.
+        """
         if self.dry_run or not self.cfg.get("exchange_protection", False):
             return {}
-        orders = {}
         order_side = "SELL" if pos["side"] == "long" else "BUY"
         position_side = "LONG" if pos["side"] == "long" else "SHORT"
-        triggers = (
-            ("sl", pos.get("sl"), "STOP_MARKET"),
-            ("tp", pos.get("tp"), "TAKE_PROFIT_MARKET"),
-        )
-        try:
-            for label, trigger, order_type in triggers:
-                if trigger is None:
+        order_types = {"sl": "STOP_MARKET", "tp": "TAKE_PROFIT_MARKET"}
+        errors = []
+        for label in self._missing_guards(pos):
+            client_key = "%s_client_algo_id" % label
+            # A previous POST may have landed although its response was
+            # lost: adopt it by clientAlgoId instead of placing a duplicate.
+            previous = pos.get(client_key)
+            if previous:
+                try:
+                    found = self._find_open_algo_by_client_id(previous,
+                                                              pos["symbol"])
+                except binance_safety.BinanceSafetyStop:
+                    raise
+                except Exception as exc:
+                    errors.append((label, exc))
                     continue
-                client_algo_id = self._new_client_order_id(
-                    pos["symbol"], pos["side"]
-                )[:36]
-                pos["%s_client_algo_id" % label] = client_algo_id
-                params = {
-                    "algoType": "CONDITIONAL",
-                    "symbol": pos["symbol"],
-                    "side": order_side,
-                    "positionSide": position_side,
-                    "type": order_type,
-                    "quantity": pos["qty"],
-                    "triggerPrice": self._rounded_trigger_price(
-                        pos["symbol"], trigger
-                    ),
-                    "workingType": self.cfg.get(
-                        "protection_working_type", "MARK_PRICE"
-                    ),
-                    "clientAlgoId": client_algo_id,
-                    # Current USD-M Algo Order docs specify lowercase string
-                    # values "true"/"false" for this parameter.
-                    "priceProtect": (
-                        "true" if self.cfg.get("protection_price_protect", False)
-                        else "false"
-                    ),
-                }
+                if found:
+                    pos["%s_algo_id" % label] = found
+                    self.log("PROTECTION #%s nhan lai guard %s algo=%s"
+                             % (pos.get("id"), label.upper(), found))
+                    continue
+            client_algo_id = self._new_client_order_id(
+                pos["symbol"], pos["side"]
+            )[:36]
+            pos[client_key] = client_algo_id
+            params = {
+                "algoType": "CONDITIONAL",
+                "symbol": pos["symbol"],
+                "side": order_side,
+                "positionSide": position_side,
+                "type": order_types[label],
+                "quantity": pos["qty"],
+                "triggerPrice": self._rounded_trigger_price(
+                    pos["symbol"], pos[label]
+                ),
+                "workingType": self.cfg.get(
+                    "protection_working_type", "MARK_PRICE"
+                ),
+                "clientAlgoId": client_algo_id,
+                # Current USD-M Algo Order docs specify lowercase string
+                # values "true"/"false" for this parameter.
+                "priceProtect": (
+                    "true" if self.cfg.get("protection_price_protect", False)
+                    else "false"
+                ),
+            }
+            try:
+                algo_id = None
                 try:
                     response = self._private_call(
                         "private:trade",
                         self.ex.fapiPrivatePostAlgoOrder,
                         params,
                     )
-                    algo_id = response.get("algoId")
+                    algo_id = (response or {}).get("algoId")
                 except binance_safety.BinanceSafetyStop:
                     raise
-                except Exception:
+                except Exception as post_error:
                     # The POST may have reached Binance before the transport
-                    # failed. Reconcile by clientAlgoId before cleanup; an
-                    # unknown Algo id must never become an invisible orphan.
+                    # failed. Reconcile by clientAlgoId; an unknown Algo id
+                    # must never become an invisible orphan.
                     algo_id = self._find_open_algo_by_client_id(
                         client_algo_id, pos["symbol"])
                     if not algo_id:
-                        raise
+                        raise post_error
                 if not algo_id:
                     # A successful HTTP response without an id is also
                     # ambiguous; query the idempotency key once.
@@ -701,42 +731,24 @@ class BinanceEngine:
                         client_algo_id, pos["symbol"])
                 if not algo_id:
                     raise RuntimeError("Binance algo order missing algoId")
-                orders[label] = algo_id
-                # Persist each id on the position immediately. If creating a
-                # later guard fails, cleanup can be incomplete; retaining the
-                # id prevents an orphaned Algo Order from becoming invisible
-                # to the subsequent fail-closed close path.
+                # Persist each id on the position immediately so a later
+                # failure can never make this guard invisible.
                 pos["%s_algo_id" % label] = algo_id
-            return orders
-        except binance_safety.BinanceSafetyStop:
-            raise
-        except Exception:
-            # If the second protection order fails, remove the first one so
-            # the position is not left with only half of its intended guard.
-            # Use clientAlgoId too when a POST response was ambiguous.
-            for label in ("sl", "tp"):
-                algo_id = orders.get(label)
-                client_algo_id = pos.get("%s_client_algo_id" % label)
-                if not algo_id and not client_algo_id:
-                    continue
-                identifier = {"symbol": pos["symbol"]}
-                if algo_id:
-                    identifier["algoId"] = algo_id
-                else:
-                    identifier["clientAlgoId"] = client_algo_id
-                try:
-                    self._private_call(
-                        "private:trade",
-                        self.ex.fapiPrivateDeleteAlgoOrder,
-                        identifier,
-                    )
-                except binance_safety.BinanceSafetyStop:
-                    raise
-                except Exception as cancel_error:
-                    self.log("CRITICAL protection cleanup failed guard=%s: %s"
-                             % (algo_id or client_algo_id,
-                                binance_safety.redact_body(cancel_error)))
-            raise
+            except binance_safety.BinanceSafetyStop:
+                raise
+            except Exception as exc:
+                errors.append((label, exc))
+                text = str(exc)
+                if "-4045" in text or "max stop order" in text.lower():
+                    self.log("CRITICAL PROTECTION #%s: cham gioi han so lenh "
+                             "dieu kien Binance (-4045) - kiem tra lenh mo coi"
+                             % pos.get("id"))
+        if errors:
+            raise RuntimeError("; ".join(
+                "%s: %s" % (label.upper(), binance_safety.redact_body(exc))
+                for label, exc in errors))
+        return {label: pos.get("%s_algo_id" % label) for label in ("sl", "tp")
+                if pos.get("%s_algo_id" % label)}
 
     @staticmethod
     def _is_absent_error(exc):
@@ -2167,23 +2179,14 @@ class BinanceEngine:
             self.state["positions"].append(pos)
             if not self.dry_run and self.cfg.get("exchange_protection", False):
                 try:
-                    protection = self._create_exchange_protection(pos)
-                    pos["sl_algo_id"] = protection.get("sl")
-                    pos["tp_algo_id"] = protection.get("tp")
+                    self._create_exchange_protection(pos)
                     pos["protection_status"] = "armed"
                 except binance_safety.BinanceSafetyStop:
                     raise
                 except Exception as protection_error:
-                    # Retry dat protection: moi 10s, toi da 2 phut (12 lan).
-                    # Neu van that bai -> dong vi the de tranh mat kiem soat.
-                    pos["protection_status"] = "retrying"
-                    pos["protection_error"] = binance_safety.redact_body(
-                        protection_error
-                    )
-                    pos["protection_retry_at"] = time.time() + 10
-                    pos["protection_deadline"] = time.time() + 120
-                    self.log("WARNING protection that bai, se retry sau 10s: %s" %
-                             binance_safety.redact_body(protection_error))
+                    # Chan da dat thanh cong duoc GIU; chi chan thieu duoc
+                    # retry (retry_protection). Thieu SL qua deadline -> dong.
+                    self._schedule_protection_retry(pos, protection_error)
             self._mark_action_success(key)
             self.log("%s OPEN #%d %s %s entry=%s sl=%s tp=%s ord=%s "
                      "protection=%s"
@@ -2197,64 +2200,102 @@ class BinanceEngine:
             self._mark_action_failure(key, e)
             return None, "action_failed: %s" % e
 
+    def _schedule_protection_retry(self, pos, error=None, delay=10.0):
+        now = time.time()
+        pos["protection_status"] = "retrying"
+        pos["protection_retry_at"] = now + delay
+        if "sl" in self._missing_guards(pos):
+            pos.setdefault("protection_deadline", now + float(
+                self.cfg.get("protection_sl_deadline_seconds", 120)))
+        else:
+            pos.pop("protection_deadline", None)
+        if error is not None:
+            pos["protection_error"] = binance_safety.redact_body(error)
+            self.log("WARNING PROTECTION #%s %s thieu %s: %s -> thu lai sau %.0fs"
+                     % (pos.get("id"), pos.get("symbol"),
+                        "/".join(l.upper() for l in self._missing_guards(pos)),
+                        pos["protection_error"], delay))
+
     def retry_protection(self):
-        """Retry dat SL/TP cho cac vi the dang 'retrying' hoac chua co protection.
-        Tra ve True neu co thay doi."""
+        """Arm every missing guard; returns True when state changed.
+
+        Covers new lots whose first attempt failed, guards reported lost by
+        sync_exchange_protection (cancelled/expired/rejected on Binance),
+        lots restored without ids and old lots (backfill).  Only missing legs
+        are placed.  A lot WITHOUT a stop-loss past the deadline is closed;
+        a lot missing only its TP keeps retrying (the bot's own TP check
+        still covers it).
+        """
+        if self.dry_run or not self.cfg.get("exchange_protection", False):
+            return False
         now = time.time()
         changed = False
-        for pos in self.state.get("positions", []):
-            status = pos.get("protection_status")
-            # Backfill: vi the cu chua co protection -> dat ngay
-            if status is None and self.cfg.get("exchange_protection", False):
-                if pos.get("sl") or pos.get("tp"):
-                    log_msg = f"Backfill protection cho #{pos['id']} {pos['symbol']}"
-                    self.log(log_msg)
-                    try:
-                        protection = self._create_exchange_protection(pos)
-                        pos["sl_algo_id"] = protection.get("sl")
-                        pos["tp_algo_id"] = protection.get("tp")
-                        pos["protection_status"] = "armed"
-                        changed = True
-                        self.log(f"Backfill thanh cong #{pos['id']}")
-                    except Exception as e:
-                        pos["protection_status"] = "retrying"
-                        pos["protection_retry_at"] = now + 10
-                        pos["protection_deadline"] = now + 120
-                        changed = True
+        for pos in list(self.state.get("positions", [])):
+            if not pos.get("live"):
                 continue
-            if status != "retrying":
+            missing = self._missing_guards(pos)
+            if not missing:
+                if pos.get("protection_status") != "armed":
+                    pos["protection_status"] = "armed"
+                    pos.pop("protection_retry_at", None)
+                    pos.pop("protection_deadline", None)
+                    pos.pop("protection_error", None)
+                    changed = True
+                continue
+            if pos.get("protection_status") == "armed":
+                # Lost a leg after being armed (or restored without ids).
+                self._schedule_protection_retry(pos, delay=0)
+                changed = True
+            if pos.get("protection_status") is None:
+                self.log("Backfill protection cho #%s %s" %
+                         (pos["id"], pos["symbol"]))
+                self._schedule_protection_retry(pos, delay=0)
+                changed = True
+            deadline = pos.get("protection_deadline")
+            if "sl" in missing and deadline and now >= deadline:
+                self.log("CRITICAL PROTECTION #%s %s khong dat duoc SL sau "
+                         "deadline -> dong vi the" % (pos["id"], pos["symbol"]))
+                rec = None
+                try:
+                    rec = self.close(pos, pos["entry"], "PROTECTION_FAILED")
+                except binance_safety.BinanceSafetyStop:
+                    raise
+                except Exception as e:
+                    self.log("CRITICAL khong dong duoc vi the khong SL: %s" % e)
+                if rec:
+                    if getattr(self, "_pending_close_recs", None) is None:
+                        self._pending_close_recs = []
+                    self._pending_close_recs.append(rec)
+                else:
+                    self.state["halted"] = True
+                    self.state["halt_reason"] = "unprotected position cannot close"
+                changed = True
                 continue
             if now < pos.get("protection_retry_at", 0):
                 continue
-            if now >= pos.get("protection_deadline", 0):
-                # Het 2 phut van that bai -> dong vi the
-                self.log("CRITICAL protection retry het 2 phut, dong vi the #%s %s" %
-                         (pos["id"], pos["symbol"]))
-                try:
-                    self.close(pos, pos["entry"], "PROTECTION_FAILED")
-                    changed = True
-                except Exception as e:
-                    self.log("CRITICAL khong dong duoc vi the khong protection: %s" % e)
-                    self.state["halted"] = True
-                    self.state["halt_reason"] = "unprotected position cannot close"
-                continue
-            # Thu dat lai protection
             try:
-                protection = self._create_exchange_protection(pos)
-                pos["sl_algo_id"] = protection.get("sl")
-                pos["tp_algo_id"] = protection.get("tp")
+                self._create_exchange_protection(pos)
                 pos["protection_status"] = "armed"
                 pos.pop("protection_retry_at", None)
                 pos.pop("protection_deadline", None)
-                self.log("Protection retry thanh cong cho #%s %s" %
-                         (pos["id"], pos["symbol"]))
-                changed = True
+                pos.pop("protection_error", None)
+                self.log("PROTECTION #%s %s du SL/TP tren san (sl=%s tp=%s)"
+                         % (pos["id"], pos["symbol"], pos.get("sl_algo_id"),
+                            pos.get("tp_algo_id")))
+            except binance_safety.BinanceSafetyStop:
+                raise
             except Exception as e:
-                pos["protection_retry_at"] = now + 10
-                self.log("Protection retry that bai, thu lai sau 10s: %s" %
-                         binance_safety.redact_body(e))
-                changed = True
+                self._schedule_protection_retry(
+                    pos, e, delay=10.0 if "sl" in self._missing_guards(pos)
+                    else 30.0)
+            changed = True
         return changed
+
+    def drain_close_records(self):
+        """Close records produced outside the caller's own close() calls."""
+        recs = getattr(self, "_pending_close_recs", None) or []
+        self._pending_close_recs = []
+        return recs
 
     # ---------------------------------------------------------------- close
     def close(self, pos, price, reason):
