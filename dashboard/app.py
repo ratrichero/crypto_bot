@@ -20,6 +20,9 @@ st.set_page_config(page_title="Crypto Bots Dashboard", layout="wide")
 DB = os.environ.get("DATABASE_URL")
 BINANCE_STATE = os.environ.get("BINANCE_STATE",
                                "/home/ubuntu/muse_bot/binance-bot/state.json")
+# File .env chua API key Binance (chi doc, khong commit secret vao code)
+BINANCE_ENV_P = os.environ.get("BINANCE_ENV_P",
+                               "/home/ubuntu/muse_bot/.env")
 OKX_STATE = os.environ.get("OKX_STATE",
                            os.path.expanduser("~/workspace/trading-bot/state.json"))
 RADAR_STATE = os.environ.get("RADAR_STATE",
@@ -258,40 +261,138 @@ def binance_all_prices():
         return {}
 
 
+@st.cache_data(ttl=5)
+def binance_exchange_positions():
+    """Vi the Futures TRUC TIEP tu san Binance (read-only).
+
+    Chi goi cac API doc (fetch_positions, getOpenAlgoOrders) — khong bao gio
+    dat/huy lenh. Cache 5 giay. Raise Exception neu khong lay duoc de caller
+    fallback ve state.json.
+    Tra ve (positions, guards): positions la list dict
+    {symbol, side, qty, entry, mark, upnl}, guards la dict
+    {symbol: {"tp": float|None, "sl": float|None}} tu algo orders.
+    """
+    try:
+        import ccxt
+    except ImportError as e:
+        raise RuntimeError("thieu thu vien ccxt: %s" % e)
+
+    key = secret = None
+    try:
+        with open(BINANCE_ENV_P) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("BINANCE_API_KEY="):
+                    key = line.split("=", 1)[1].strip().strip("\"'")
+                elif line.startswith("BINANCE_API_SECRET="):
+                    secret = line.split("=", 1)[1].strip().strip("\"'")
+    except OSError as e:
+        raise RuntimeError("khong doc duoc %s: %s" % (BINANCE_ENV_P, e))
+    if not key or not secret:
+        raise RuntimeError("thieu BINANCE_API_KEY/SECRET trong %s" % BINANCE_ENV_P)
+
+    ex = ccxt.binanceusdm({"apiKey": key, "secret": secret,
+                           "options": {"defaultType": "future"}})
+    # Chi doc — khong dat lenh
+    raw = ex.fetch_positions()
+    positions = []
+    for p in raw:
+        try:
+            qty = float(p.get("contracts") or 0)
+        except (TypeError, ValueError):
+            qty = 0.0
+        if qty == 0:
+            continue
+        entry = float(p.get("entryPrice") or 0)
+        mark = float(p.get("markPrice") or p.get("lastPrice") or 0)
+        upnl = p.get("unrealizedPnl")
+        upnl = float(upnl) if upnl is not None else 0.0
+        side = (p.get("side") or "").lower()
+        sym = (p.get("symbol") or "").replace("/", "").replace(":USDT", "")
+        positions.append({"symbol": sym, "side": side, "qty": abs(qty),
+                          "entry": entry, "mark": mark, "upnl": upnl})
+
+    # TP/SL tu algo orders mo (CONDITIONAL: TAKE_PROFIT_MARKET / STOP_MARKET)
+    guards = {}
+    try:
+        algos = ex.fapiPrivateGetOpenAlgoOrders()
+        if isinstance(algos, dict):
+            algos = algos.get("orders") or algos.get("data") or []
+        for o in algos or []:
+            if not isinstance(o, dict):
+                continue
+            sym = str(o.get("symbol") or "")
+            otype = str(o.get("type") or o.get("algoType") or "")
+            try:
+                trig = float(o.get("triggerPrice") or 0)
+            except (TypeError, ValueError):
+                trig = 0.0
+            if not sym or trig <= 0:
+                continue
+            g = guards.setdefault(sym, {"tp": None, "sl": None})
+            if "TAKE_PROFIT" in otype and g["tp"] is None:
+                g["tp"] = trig
+            elif "STOP" in otype and "TAKE_PROFIT" not in otype and g["sl"] is None:
+                g["sl"] = trig
+    except Exception:
+        pass  # khong co algo orders thi bo qua, vi the van hien
+    return positions, guards
+
+
 @frag5
 def binance_live_positions_block():
-    """Bang vi the Binance mo — cot Lãi/lỗ live theo gia thuc, refresh 5s."""
-    st.markdown('<div class="sub2">Vi the dang mo (live 5s)</div>',
+    """Bang vi the Binance mo — doc TRUC TIEP tu san, refresh 5s.
+
+    Neu API loi thi fallback ve state.json va hien canh bao du lieu co the cu.
+    """
+    st.markdown('<div class="sub2">Vi the dang mo (truc tiep tu san, live 5s)</div>',
                 unsafe_allow_html=True)
-    b_st = load_state(BINANCE_STATE)
-    if not b_st:
-        st.warning("Khong doc duoc file trang thai bot Binance.")
+    rows, tot, source_note = [], 0.0, None
+    try:
+        ex_pos, guards = binance_exchange_positions()
+        for p in ex_pos:
+            g = guards.get(p["symbol"], {})
+            tot += p["upnl"]
+            rows.append({
+                "Symbol": p["symbol"], "Chieu": p["side"],
+                "Qty": p["qty"], "Entry": p["entry"],
+                "Gia live": round(p["mark"], 6) if p["mark"] else None,
+                "Lãi/lỗ live (U)": round(p["upnl"], 2),
+                "SL": g.get("sl"), "TP": g.get("tp"),
+            })
+    except Exception as e:
+        # Fallback: doc tu state.json cua bot, canh bao du lieu co the cu
+        source_note = ("⚠️ Không lấy được vị thế từ sàn (%s) — "
+                       "dữ liệu có thể cũ (đọc từ state.json)." % e)
+        b_st = load_state(BINANCE_STATE)
+        if not b_st:
+            st.warning("Khong doc duoc file trang thai bot Binance.")
+            return
+        marks = binance_all_prices()
+        for p in b_st.get("positions", []):
+            try:
+                e0 = float(p.get("entry", 0) or 0)
+                n = float(p.get("notional", 0) or 0)
+                mk = marks.get((p.get("symbol") or "").upper(), 0) or 0
+                sgn = 1 if (p.get("side") or "").lower() == "long" else -1
+                upnl = (mk - e0) / e0 * n * sgn if e0 > 0 and n > 0 and mk > 0 else 0.0
+            except Exception:
+                upnl, mk = 0.0, 0.0
+            tot += upnl
+            rows.append({
+                "ID": p.get("id"), "Symbol": p.get("symbol"),
+                "Chieu": p.get("side"), "Loai": p.get("tag"),
+                "Entry": p.get("entry"),
+                "Gia live": round(mk, 6) if mk else None,
+                "Lãi/lỗ live (U)": round(upnl, 2),
+                "SL": p.get("sl"), "TP": p.get("tp"),
+                "Notional": p.get("notional"),
+            })
+    if source_note:
+        st.warning(source_note)
+    if not rows:
+        st.caption("0 vi the dang mo (theo san).")
         return
-    bpos = b_st.get("positions", [])
-    if not bpos:
-        st.caption("0 vi the dang mo.")
-        return
-    marks = binance_all_prices()
-    rows, tot = [], 0.0
-    for p in bpos:
-        try:
-            e = float(p.get("entry", 0) or 0)
-            n = float(p.get("notional", 0) or 0)
-            mk = marks.get((p.get("symbol") or "").upper(), 0) or 0
-            sgn = 1 if (p.get("side") or "").lower() == "long" else -1
-            upnl = (mk - e) / e * n * sgn if e > 0 and n > 0 and mk > 0 else 0.0
-        except Exception:
-            upnl, mk = 0.0, 0.0
-        tot += upnl
-        rows.append({
-            "ID": p.get("id"), "Symbol": p.get("symbol"),
-            "Chieu": p.get("side"), "Loai": p.get("tag"),
-            "Entry": p.get("entry"),
-            "Gia live": round(mk, 6) if mk else None,
-            "Lãi/lỗ live (U)": round(upnl, 2),
-            "SL": p.get("sl"), "TP": p.get("tp"),
-            "Notional": p.get("notional"),
-        })
     df = pd.DataFrame(rows)
 
     def _color(v):
