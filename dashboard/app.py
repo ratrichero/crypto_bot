@@ -31,6 +31,11 @@ if not _HK:
            else os.path.expanduser("~/workspace/meme-radar/.helius_key"))
 HELIUS_KEY_FILE = _HK
 SOL_WALLET = "7jUg6PKSj5xgsTM7dLMGnFFS45yohVfgvhbXPTUKfC8q"
+LIVE_POS_P = os.environ.get("LIVE_POS_P",
+                            "/home/ubuntu/muse_bot/meme-radar/live_positions.json")
+LIVE_TRADES_P = os.environ.get("LIVE_TRADES_P",
+                               "/home/ubuntu/muse_bot/meme-radar/live_trades.jsonl")
+SOL_MINT = "So11111111111111111111111111111111111111112"
 
 TZ = "Asia/Ho_Chi_Minh"
 TZINFO = timezone(timedelta(hours=7))
@@ -345,7 +350,7 @@ def live_kpi_frag(where, params):
             return f"WHERE {cond}", params
         return f"{base} AND {cond}", params
 
-    for tag, title in (("scalp", "⚡ Scalp"), ("grid", "🔲 Grid")):
+    for tag, title in (("grid", "🔲 Grid"), ("scalp", "⚡ Scalp")):
         w, p = tag_where(tag)
         rows = q(f"SELECT {d} AS day, pnl AS net, tag, reason, live, dry "
                  f"FROM binance_trades {w} ORDER BY closed_at", p)
@@ -376,74 +381,197 @@ def live_kpi_frag(where, params):
         st.info("Binance LIVE chua co lenh dong.")
 
 
-@frag
-def solana_kpi_frag():
-    section("☀️ Solana meme — live")
-    bal = sol_balance()
-    if bal is None:
-        bal_txt, status, cls = "?", "khong doc duoc so du", ""
-    elif bal < 0.05:
-        bal_txt, status, cls = f"{bal:.3f} SOL", "🟡 Chua nap SOL — cho funding", "neg"
-    else:
-        bal_txt, status, cls = f"{bal:.3f} SOL", "🟢 Da san sang test", "pos"
-    c1, c2, c3 = st.columns(3)
-    c1.markdown(f'<div class="kpi-card"><div class="kpi-label">Vi bot</div>'
-                f'<div class="addr">{SOL_WALLET}</div></div>',
-                unsafe_allow_html=True)
-    c2.markdown(f'<div class="kpi-card"><div class="kpi-label">So du</div>'
-                f'<div class="kpi-value">{bal_txt}</div></div>',
-                unsafe_allow_html=True)
-    c3.markdown(f'<div class="kpi-card"><div class="kpi-label">Trang thai</div>'
-                f'<div class="kpi-value {cls}" style="font-size:17px">'
-                f'{status}</div></div>', unsafe_allow_html=True)
-
-
 def tab_live_binance(where, params):
     section("📈 Binance Futures — LIVE (tien that)")
     binance_equity_realtime()
-    live_kpi_frag(where, params)
     binance_live_positions_block()
+    live_kpi_frag(where, params)
 
 
-def tab_live_radar():
-    solana_kpi_frag()
-
-    # Vi the live dang mo
-    st.markdown("### 📊 Vị thế LIVE đang mở")
+def load_live_trades():
+    """Doc live_trades.jsonl, tra ve list dict (moi nhat cuoi)."""
+    rows = []
     try:
-        lp = "/home/ubuntu/muse_bot/meme-radar/live_positions.json"
-        with open(lp) as f:
-            spos = json.load(f)
-        if spos:
-            # Lay gia live cho tung token de tinh P&L
-            rows = []
-            for p in spos:
-                sym = p.get("symbol", "?")
-                entry = p.get("entry", 0)
-                size = p.get("size_usd", 0)
-                remaining = p.get("remaining", 1.0)
-                # Tinh P&L don gian tu peak hien tai (chua co gia live realtime)
-                peak = p.get("peak", entry)
-                pnl_pct = (peak - entry) / entry * 100 if entry else 0
-                rows.append({
-                    "Token": sym,
-                    "Vào": f"${entry:.2e}",
-                    "Size": f"${size:.0f}",
-                    "Còn": f"{remaining*100:.0f}%",
-                    "Lãi/lỗ": f"{pnl_pct:+.1f}%",
-                    "TP1": "✓" if p.get("tp1") else "",
-                    "TP2": "✓" if p.get("tp2") else "",
-                })
-            st.dataframe(pd.DataFrame(rows), use_container_width=True,
-                         hide_index=True)
-        else:
-            st.info("Không có vị thế live nào đang mở.")
-    except Exception as e:
-        st.error(f"Không đọc được vị thế: {e}")
+        with open(LIVE_TRADES_P) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    continue
+    except FileNotFoundError:
+        pass
+    return rows
 
-    # Lich su giao dich live gan nhat (tu log)
-    st.markdown("### 📝 Giao dịch LIVE gần nhất")
-    st.info("Xem tab 🖥️ Monitor để theo dõi log realtime của live trader.")
+
+def live_trade_kpi_rows(trades):
+    """Chuyen live trades thanh rows {'day','net'} cho kpi_cards/daily_df."""
+    rows = []
+    for t in trades:
+        try:
+            ca = t.get("closed_at")
+            if not ca:
+                continue
+            day = datetime.fromtimestamp(ca, tz=TZINFO).strftime("%Y-%m-%d")
+            rows.append({"day": day, "net": float(t.get("realized_usd") or 0)})
+        except Exception:
+            continue
+    return rows
+
+
+def filter_live_trades(trades, days, live_only=False):
+    if live_only:
+        trades = [t for t in trades if t.get("mode") == "live"]
+    if not days:
+        return trades
+    cutoff = datetime.now(TZINFO) - timedelta(days=days)
+    out = []
+    for t in trades:
+        try:
+            ca = datetime.fromtimestamp(t.get("closed_at") or 0, tz=TZINFO)
+        except Exception:
+            continue
+        if ca >= cutoff:
+            out.append(t)
+    return out
+
+
+@frag15
+def live_radar_equity_realtime():
+    st.markdown('<div class="sub2">⚡ Equity live realtime</div>',
+                unsafe_allow_html=True)
+    bal = sol_balance()
+    sol_px = jupiter_marks(SOL_MINT).get(SOL_MINT)
+    if bal is None or not sol_px:
+        st.warning("Khong doc duoc so du SOL hoac gia SOL/USD.")
+        return
+    eq = bal * sol_px
+    c1, c2 = st.columns([1, 3])
+    with c1:
+        st.markdown(f'<div class="kpi-card" style="border-left-color:#16a34a">'
+                    f'<div class="kpi-label">Equity live (USD)</div>'
+                    f'<div class="kpi-value pos">{eq:,.2f} U</div>'
+                    f'<div class="kpi-sub">{bal:.4f} SOL @ ${sol_px:,.2f} · live</div>'
+                    f'<div class="addr">{SOL_WALLET}</div></div>',
+                    unsafe_allow_html=True)
+    with c2:
+        df = daily_df(live_trade_kpi_rows(
+            filter_live_trades(load_live_trades(), None, live_only=True)))
+        if not df.empty:
+            fig = px.line(df, x="day", y="cum",
+                          title="Live Radar — P&L cong don, lenh tien that (U)")
+            fig.update_layout(paper_bgcolor="rgba(0,0,0,0)",
+                              plot_bgcolor="rgba(0,0,0,0)",
+                              xaxis_title=None, yaxis_title="U")
+            st.plotly_chart(fig, width="stretch")
+        else:
+            st.info("Chua co lenh live nao da dong.")
+    st.caption("Tự refresh 15s · Equity = số dư SOL ví × giá SOL/USD (Jupiter).")
+
+
+@frag
+def live_radar_kpi_frag(days):
+    # Chi tinh lenh tien that (mode=live), khong tron dry-run
+    trades = filter_live_trades(load_live_trades(), days, live_only=True)
+    kpi_cards("Hieu suat live (tien that)", live_trade_kpi_rows(trades))
+    df = daily_df(live_trade_kpi_rows(trades))
+    pnl_charts(df, "Live Radar")
+
+    st.markdown('<div class="sub2">Thong ke ly do thoat lenh — live</div>',
+                unsafe_allow_html=True)
+    agg = {}
+    for t in trades:
+        r = t.get("reason") or "?"
+        a = agg.setdefault(r, {"n": 0, "pnl": 0.0})
+        a["n"] += 1
+        try:
+            a["pnl"] += float(t.get("realized_usd") or 0)
+        except Exception:
+            pass
+    if agg:
+        st.dataframe(pd.DataFrame([{
+            "Ly do": k, "Lenh": v["n"], "P&L (U)": round(v["pnl"], 2),
+        } for k, v in sorted(agg.items(), key=lambda x: -x[1]["pnl"])]),
+            width="stretch")
+    else:
+        st.info("Chua co du lieu.")
+
+
+@frag15
+def live_radar_positions_block():
+    st.markdown('<div class="sub2">Vi the LIVE dang mo (live 15s)</div>',
+                unsafe_allow_html=True)
+    spos = load_state(LIVE_POS_P) or []
+    if not spos:
+        st.info("Khong co vi the live nao dang mo.")
+        return
+    mints = ",".join(dict.fromkeys(
+        [p.get("token") for p in spos if p.get("token")]))
+    marks = jupiter_marks(mints)
+    rows = []
+    for p in spos:
+        try:
+            e = float(p.get("entry", 0) or 0)
+            s = float(p.get("size_usd", 0) or 0)
+            rem = float(p.get("remaining", 1) or 0)
+            mk = marks.get(p.get("token", ""), 0) or 0
+            upnl = (mk - e) / e * s * rem if e > 0 and mk > 0 else 0.0
+        except Exception:
+            upnl, mk = 0.0, 0.0
+        rows.append({
+            "Symbol": p.get("symbol"),
+            "Entry": p.get("entry"),
+            "Gia live": round(mk, 8) if mk else None,
+            "Lãi/lỗ live (U)": round(upnl, 2),
+            "Size $": p.get("size_usd"),
+            "Con lai": f"{(p.get('remaining', 1) or 0):.0%}",
+            "TP1": "✓" if p.get("tp1") else "",
+            "TP2": "✓" if p.get("tp2") else "",
+        })
+    df = pd.DataFrame(rows)
+
+    def _c(v):
+        try:
+            return "color:#16a34a" if float(v) >= 0 else "color:#dc2626"
+        except Exception:
+            return ""
+    st.dataframe(df.style.map(_c, subset=["Lãi/lỗ live (U)"]),
+                 width="stretch")
+    st.caption(f"{len(spos)} vi the · gia live tu Jupiter.")
+
+
+@frag
+def live_radar_trades_frag(days):
+    trades = filter_live_trades(load_live_trades(), days)
+    rows = []
+    for t in sorted(trades, key=lambda x: x.get("closed_at") or 0,
+                    reverse=True)[:50]:
+        try:
+            ca = datetime.fromtimestamp(t.get("closed_at") or 0, tz=TZINFO)
+        except Exception:
+            ca = None
+        rows.append({
+            "closed_at": ca,
+            "symbol": t.get("symbol"),
+            "mode": t.get("mode"),
+            "net": round(float(t.get("realized_usd") or 0), 2),
+            "reason": t.get("reason"),
+        })
+    trades_table(rows,
+                 {"closed_at": "Dong luc", "symbol": "Symbol",
+                  "mode": "Che do", "net": "P&L rong (U)",
+                  "reason": "Ly do"},
+                 "50 lenh live gan nhat")
+
+
+def tab_live_radar(days):
+    section("☀️ Live Radar — Solana (tien that)")
+    live_radar_equity_realtime()
+    live_radar_kpi_frag(days)
+    live_radar_positions_block()
+    live_radar_trades_frag(days)
 
 
 def tab_monitor():
@@ -841,7 +969,7 @@ def main():
     with t1:
         tab_live_binance(where, params)
     with t2:
-        tab_live_radar()
+        tab_live_radar(days)
     with t3:
         tab_paper_okx(where, params)
     with t4:
