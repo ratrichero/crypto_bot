@@ -1510,6 +1510,28 @@ def apply_status(latest, applied, now=None):
                        "trong ~10 giây." % (ver, latest))
 
 
+def bot_runtime_note(state, now=None):
+    """state['runtime_config'] (bot ghi moi vong) -> (muc do, thong diep) de
+    chan doan khi DB chua co version / bot chua bao ap dung. None = khong
+    co thong tin (bot ban cu / chua chay)."""
+    rc = (state or {}).get("runtime_config")
+    if not isinstance(rc, dict):
+        return None
+    now = now if now is not None else time.time()
+    age = now - float(rc.get("ts") or 0)
+    db = rc.get("db") or "?"
+    ver = rc.get("version")
+    msg = ("Bot báo (state.json, %s): đang chạy config version %s (nguồn %s); "
+           "DB: %s" % ("%ds trước" % age if age < 3600 else "CŨ > 1 giờ",
+                       ver if ver is not None else "—",
+                       rc.get("source") or "?", db))
+    if rc.get("error"):
+        msg += "; lỗi config: %s" % rc["error"]
+    if age > 300:
+        return "warning", msg + " — bot có thể đã dừng."
+    return ("ok" if db == "ok" and not rc.get("error") else "error"), msg
+
+
 def usd(x):
     return ("-$%.2f" if x < 0 else "$%.2f") % abs(x)
 
@@ -1778,6 +1800,14 @@ def _tab_config():
     level, msg = apply_status(latest, applied)
     {"ok": st.success, "pending": st.info, "error": st.error,
      "unknown": st.warning}[level](msg)
+    if level != "ok":
+        note = bot_runtime_note(load_state(BINANCE_STATE))
+        if note:
+            {"ok": st.caption, "warning": st.warning,
+             "error": st.error}[note[0]](note[1])
+        else:
+            st.caption("Không có trạng thái config trong state.json của bot "
+                       "(bot chưa chạy bản mới hoặc chưa chạy).")
     if row:
         st.caption("Version %s · %s · %s%s" % (
             latest, row["author"], _ts_local(row["created_at"]),

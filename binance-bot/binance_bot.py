@@ -1201,6 +1201,9 @@ def main():
                 last_cfg_reload = now
             if RUNTIME is not None:
                 RUNTIME.poll()           # version moi tu dashboard (~10s)
+                # Dashboard doc state.json: biet bot dang o version nao / DB
+                # loi gi ke ca khi bot khong ket noi duoc DB.
+                st["runtime_config"] = dict(RUNTIME.status(), ts=now)
             if ws.healthy():
                 prices = ws.snapshot()
                 marks = ws.mark_snapshot()

@@ -326,6 +326,30 @@ def test_trend_section():
           and "bc.same_side_exposure(clean)" in SRC)
 
 
+def test_bot_runtime_note():
+    print("== Cau hinh: chan doan bot <-> DB tu state.json (task 35) ==")
+    ns = load("bot_runtime_note")
+    f = ns["bot_runtime_note"]
+    check("khong co runtime_config -> None", f({}) is None and f(None) is None)
+    lv, msg = f({"runtime_config": {"version": 3, "source": "cache",
+                                     "db": "lỗi: connection refused",
+                                     "error": None, "ts": 1000}}, now=1010)
+    check("DB loi -> error + hien loi DB + version cache",
+          lv == "error" and "connection refused" in msg and "version 3" in msg
+          and "cache" in msg, (lv, msg))
+    lv, msg = f({"runtime_config": {"version": 7, "source": "db", "db": "ok",
+                                     "ts": 1000}}, now=1005)
+    check("DB ok -> ok", lv == "ok" and "version 7" in msg, (lv, msg))
+    lv, msg = f({"runtime_config": {"version": None, "source": "file",
+                                     "db": "ok", "ts": 0,
+                                     "error": "seed DB loi: x"}}, now=5000)
+    check("state cu > 5 phut -> warning bot co the da dung, kem loi seed",
+          lv == "warning" and "đã dừng" in msg and "seed DB loi" in msg,
+          (lv, msg))
+    check("tab Cau hinh goi bot_runtime_note khi chua ok",
+          "bot_runtime_note(load_state(BINANCE_STATE))" in SRC)
+
+
 def test_session_cookie():
     print("== Phien dang nhap: cookie ==")
     import re as _re
@@ -479,7 +503,8 @@ def test_helius_key():
 
 
 TESTS = [test_session_cookie, test_helius_key, test_sol_wallet, test_live_radar_halt_status, test_config_helpers,
-         test_scanner_tab_levels, test_trend_section, test_monitor_pm2]
+         test_scanner_tab_levels, test_trend_section, test_bot_runtime_note,
+         test_monitor_pm2]
 
 
 if __name__ == "__main__":
