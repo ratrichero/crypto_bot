@@ -5,7 +5,8 @@ Thu tu uu tien khi khoi dong:
   1. Version moi nhat trong DB (bang bot_config_versions).
   2. File cache last-known-good (runtime_config.cache.json) neu DB loi.
   3. config.json (gia tri file + default schema).
-DB chua co version nao -> bot tu seed version 1 tu config hien hanh.
+DB chua co version nao -> bot tu seed version 1 tu config DANG chay (sau khi
+ap cache/file); seed loi/DB loi -> poll() thu lai moi 60s.
 
 Code bot luon doc tu CFG (cung 1 dict voi engine) nen ap dung = ghi tai cho.
 Config sai -> giu ban cu, ghi status=error vao bot_config_applied de
@@ -90,6 +91,9 @@ class RuntimeConfig:
         self.last_error: Optional[str] = None
         self._last_poll = 0.0
         self._rejected: Optional[int] = None
+        self.seed_retry_seconds = 60.0
+        self._last_seed_try = -1e18
+        self._seed_error: Optional[str] = None
 
     # ------------------------------------------------------------ apply
     def _apply(self, flat: Dict[str, Any], version: Optional[int],
@@ -113,7 +117,10 @@ class RuntimeConfig:
                         ", ".join("%s=%s" % (k, clean[k]) for k in changed)
                         or "khong co"))
         self._write_cache(clean, version)
-        self._record(version, "ok")
+        if version is None and self._seed_error:
+            self._record(None, "error", self._seed_error)
+        else:
+            self._record(version, "ok")
         return True
 
     def _record(self, version, status, error=None):
@@ -147,43 +154,75 @@ class RuntimeConfig:
             self.log("CONFIG warning: cache hong (%s) -> bo qua" % e)
             return None, None
 
+    # ------------------------------------------------------------- seed
+    def _seed_from_running(self) -> bool:
+        """DB chua co version nao -> tao version dau tien tu config bot DANG
+        chay (file + cache da ap). Truoc day seed tu config.json tho TRUOC
+        khi ap cache, chi thu 1 lan luc start: config.json cu vi pham rang
+        buoc moi hoac DB loi luc start -> bot chay mai 'version None (nguon
+        cache)'. Gio poll() thu lai moi seed_retry_seconds. True neu da seed
+        (hoac da co version -> poll se ap dung)."""
+        self._last_seed_try = self.clock()
+        conn = self.db.get()
+        if conn is None:
+            return False
+        try:
+            bot_config.ensure_tables(conn)
+            if bot_config.latest_version(conn, self.bot) is not None:
+                return True
+            seed = bot_config.extract(self.cfg)
+            try:
+                version = bot_config.save_version(
+                    conn, seed, author="bot-seed",
+                    note="seed tu config dang chay (nguon %s)" % self.source,
+                    bot=self.bot)
+            except ValueError as e:
+                msg = ("Khong tao duoc version dau tien - config dang chay "
+                       "khong hop le: %s. Sua tren dashboard roi Luu de tao "
+                       "version." % e)
+                if msg != self._seed_error:
+                    self.log("CONFIG warning: %s" % msg)
+                self._seed_error = msg
+                self._record(None, "error", msg)
+                return False
+            row = bot_config.load_version(conn, self.bot, version)
+        except Exception as e:
+            msg = "seed DB loi: %s" % str(e)[:200]
+            if msg != self._seed_error:
+                self.log("CONFIG warning: %s" % msg)
+            self._seed_error = msg
+            self.db.reset()
+            return False
+        self._seed_error = None
+        self.log("CONFIG DB chua co version -> seed version %s tu config dang "
+                 "chay (nguon %s)" % (version, self.source))
+        return row is not None and self._apply(row["config"], row["version"],
+                                               "db")
+
     # ------------------------------------------------------------ start
     def start(self) -> None:
         self._last_poll = self.clock()   # vua nap xong, poll sau poll_seconds
+        need_seed = False
         conn = self.db.get()
         if conn is not None:
             try:
                 bot_config.ensure_tables(conn)
                 row = bot_config.load_version(conn, self.bot)
                 if row is None:
-                    seed = bot_config.extract(self.cfg)
-                    try:
-                        version = bot_config.save_version(
-                            conn, seed, author="bot-seed",
-                            note="seed tu config.json + default schema",
-                            bot=self.bot)
-                    except ValueError as e:
-                        # config.json co gia tri ngoai bien schema: khong seed
-                        # (dashboard se tao version dau tien), chay theo file.
-                        self.log("CONFIG warning: khong seed duoc (%s)" % e)
-                        self._record(None, "error", "seed: %s" % e)
-                        version = None
-                    if version is not None:
-                        self.log("CONFIG DB chua co version -> seed version %s"
-                                 % version)
-                        row = bot_config.load_version(conn, self.bot, version)
-                if row is not None and self._apply(row["config"],
-                                                   row["version"], "db"):
+                    need_seed = True
+                elif self._apply(row["config"], row["version"], "db"):
                     return
             except Exception as e:
                 self.log("CONFIG warning: doc DB loi (%s) -> dung cache/file"
                          % str(e)[:200])
                 self.db.reset()
         version, flat = self._read_cache()
-        if flat and self._apply(flat, version, "cache"):
-            return
-        # Chi config.json: van validate de bat loi go tay.
-        self._apply(bot_config.extract(self.cfg), None, "file")
+        if not (flat and self._apply(flat, version, "cache")):
+            # Chi config.json: van validate de bat loi go tay.
+            self._apply(bot_config.extract(self.cfg), None, "file")
+        if need_seed:
+            self._seed_from_running()
+        # DB loi luc start -> poll() se thu seed lai khi DB song.
 
     # ------------------------------------------------------------- poll
     def poll(self, force: bool = False) -> bool:
@@ -197,7 +236,12 @@ class RuntimeConfig:
             return False
         try:
             latest = bot_config.latest_version(conn, self.bot)
-            if latest is None or latest == self.version:
+            if latest is None:
+                if (self.version is None and (force or now - self._last_seed_try
+                                              >= self.seed_retry_seconds)):
+                    return self._seed_from_running()
+                return False
+            if latest == self.version:
                 return False
             row = bot_config.load_version(conn, self.bot, latest)
         except Exception as e:

@@ -1346,7 +1346,11 @@ def apply_status(latest, applied, now=None):
 
     muc do: ok | pending | error | unknown."""
     if latest is None:
-        return "unknown", "Chưa có version config nào (bot sẽ tự tạo khi khởi động)."
+        if applied and applied.get("status") == "error":
+            return "error", ("Chưa có version config nào - bot không tự tạo "
+                             "được: %s" % (applied.get("error") or ""))
+        return "unknown", ("Chưa có version config nào (bot tự tạo từ config "
+                           "đang chạy khi kết nối được DB, thử lại mỗi 60s).")
     if not applied:
         return "unknown", ("Bot chưa báo cáo áp dụng config (bot chưa chạy "
                            "bản mới hoặc chưa kết nối DB).")

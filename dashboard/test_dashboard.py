@@ -161,6 +161,10 @@ def test_config_helpers():
     f = ns["apply_status"]
     now = datetime(2026, 10, 7, tzinfo=timezone.utc)
     check("chua co version", f(None, None, now)[0] == "unknown")
+    r = f(None, {"version": None, "status": "error", "applied_at": now,
+                 "error": "Khong tao duoc version dau tien: X"}, now)
+    check("chua co version + bot seed loi -> hien loi",
+          r[0] == "error" and "version dau tien" in r[1], r)
     check("bot chua bao cao", f(3, None, now)[0] == "unknown")
     check("bot dang chay version moi nhat",
           f(3, {"version": 3, "status": "ok", "applied_at": now}, now)[0]

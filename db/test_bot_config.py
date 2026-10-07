@@ -263,7 +263,58 @@ if pgserver is not None:
     with psycopg.connect(srv2.get_uri(), autocommit=True) as c4:
         check("config.json ngoai bien -> khong seed, ghi loi, giu file",
               bc.latest_version(c4) is None and CFG4["leverage"] == 50
-              and bc.applied(c4)["status"] == "error")
+              and bc.applied(c4)["status"] == "error"
+              and "version dau tien" in (bc.applied(c4)["error"] or ""))
+    n_logs = len(logs)
+    rt4.clock = lambda: 10 ** 7
+    rt4.poll(force=True)
+    with psycopg.connect(srv2.get_uri(), autocommit=True) as c4:
+        check("seed loi: poll thu lai, van giu loi, khong log lap",
+              bc.latest_version(c4) is None and len(logs) == n_logs
+              and bc.applied(c4)["status"] == "error", logs[n_logs:])
+
+    # Tinh huong VPS: config.json cu vi pham rang buoc cheo (daily 5% <
+    # tran lo grid 10%) nhung cache last-known-good (version None) hop le
+    # -> truoc day 'version None (nguon cache)' mai mai.
+    good = bc.extract(copy.deepcopy(file_cfg))
+    c5 = os.path.join(tmp2, "c5.json")
+    json.dump({"version": None, "config": good}, open(c5, "w"))
+    CFG5 = copy.deepcopy(file_cfg)
+    CFG5["risk"]["daily_max_loss_pct"] = 0.05
+    rt5 = rc.RuntimeConfig(CFG5, bot="binance_t5",
+                           db=rc.DBLink(url=srv2.get_uri(), log=logs.append),
+                           log=logs.append, cache_path=c5)
+    rt5.start()
+    with psycopg.connect(srv2.get_uri(), autocommit=True) as c:
+        row5 = bc.load_version(c, "binance_t5")
+        check("config.json sai + cache dung -> seed tu config DANG chay",
+              rt5.version == row5["version"] and rt5.source == "db"
+              and row5["config"]["risk.daily_max_loss_pct"] == 0.2
+              and bc.applied(c, "binance_t5")["status"] == "ok",
+              (rt5.status(), row5))
+
+    # DB chet luc start -> cache; DB song lai -> poll tu seed.
+    state = {"up": False}
+
+    def connect():
+        if not state["up"]:
+            raise OSError("db down")
+        return psycopg.connect(srv2.get_uri(), autocommit=True)
+    c6 = os.path.join(tmp2, "c6.json")
+    json.dump({"version": None, "config": good}, open(c6, "w"))
+    clock6 = [0.0]
+    link6 = rc.DBLink(connect=connect, log=logs.append)
+    rt6 = rc.RuntimeConfig(copy.deepcopy(file_cfg), bot="binance_t6",
+                           db=link6, log=logs.append, cache_path=c6,
+                           clock=lambda: clock6[0])
+    rt6.start()
+    check("DB chet luc start -> cache, version None",
+          rt6.source == "cache" and rt6.version is None)
+    state["up"] = True
+    link6._last_fail = 0.0
+    clock6[0] += 11
+    check("DB song lai -> poll seed + ap dung version", rt6.poll() is True
+          and rt6.source == "db" and rt6.version is not None, rt6.status())
 
     # ---- scanner DB
     bc.insert_scan(conn, {"symbol": "BTCUSDT", "ts": 1e9, "passed": False,
