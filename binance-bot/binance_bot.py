@@ -423,6 +423,56 @@ def manage_grid(engine, st, symbol, price):
     return changed
 
 
+def enforce_daily_stop(engine, st, mark_prices, today):
+    """Daily stop MTM: kich hoat 1 lan/ngay UTC, roi THU LAI dong moi lot
+    con lai o cac vong sau (close() tu cooldown khi loi).
+
+    Truoc: chi kich hoat khi chua halt (halt vi ly do khac -> lo vuot nguong
+    van khong dong vi the) va chi thu dong 1 lan (lot tra None do cooldown/
+    guard dang khop -> khong bao gio thu lai). Ly do halt persistent dang co
+    duoc giu nguyen (khong ghi de bang 'daily stop').
+    Tra ve True neu state thay doi.
+    """
+    if (not st.get("_risk_initialized") or st.get("day_start_equity", 0) <= 0
+            or st.get("day") != today):
+        # baseline chua reset sang ngay moi -> dp con la cua hom qua
+        return False
+    changed = False
+    dp = st.get("daily_drawdown_pct", 0.0)
+    if (st.get("daily_stop_day") != today
+            and dp <= -float(CFG["risk"]["daily_max_loss_pct"])):
+        st["daily_stop_day"] = today
+        reason = f"daily stop {dp*100:.2f}%"
+        if not st.get("halted"):
+            st["halt_reason"] = reason
+        st["halted"] = True
+        for grid in st.get("grids", {}).values():
+            grid["risk_halted"] = True
+            grid["rebuild_pending"] = True
+        changed = True
+        log("HALTED %s mark_equity=%.2f day_start=%.2f (halt_reason=%s)" %
+            (reason, st.get("mark_equity", 0.0), st["day_start_equity"],
+             st.get("halt_reason")))
+    if (st.get("daily_stop_day") == today and st.get("halted")
+            and st.get("positions")):
+        for pos in list(st["positions"]):
+            rec = engine.close(
+                pos, mark_prices.get(pos["symbol"], pos["entry"]),
+                "DAILY_STOP")
+            if rec:
+                _record_close(st, rec)
+                changed = True
+        if st.get("positions") and not st.get("_daily_stop_retry_logged"):
+            log("DAILY_STOP: con %d lot chua dong duoc -> thu lai moi vong"
+                % len(st["positions"]))
+            st["_daily_stop_retry_logged"] = True
+            changed = True
+    elif st.get("_daily_stop_retry_logged"):
+        st.pop("_daily_stop_retry_logged", None)
+        changed = True
+    return changed
+
+
 def protect_during_hold(engine):
     """Reconcile hold: chi dat lai SL/TP thieu (khong dong, khong don)."""
     try:
@@ -652,28 +702,9 @@ def main():
             # strategy evaluation. Otherwise an iteration can open a new
             # position and only then discover that the account crossed the
             # daily loss limit.
-            if (not DATA_ONLY and st.get("_risk_initialized")
-                    and st["day_start_equity"] > 0):
-                dp = st.get("daily_drawdown_pct", 0.0)
-                if (not st["halted"]
-                        and dp <= -float(CFG["risk"]["daily_max_loss_pct"])):
-                    st["halted"] = True
-                    st["halt_reason"] = f"daily stop {dp*100:.2f}%"
-                    for pos in list(st["positions"]):
-                        rec = engine.close(
-                            pos,
-                            mark_prices.get(pos["symbol"], pos["entry"]),
-                            "DAILY_STOP",
-                        )
-                        if rec:
-                            _record_close(st, rec)
-                    for grid in st.get("grids", {}).values():
-                        grid["risk_halted"] = True
-                        grid["rebuild_pending"] = True
-                    dirty = True
-                    log("HALTED %s mark_equity=%.2f day_start=%.2f" %
-                        (st["halt_reason"], st["mark_equity"],
-                         st["day_start_equity"]))
+            if not DATA_ONLY and enforce_daily_stop(engine, st, mark_prices,
+                                                    today):
+                dirty = True
 
             # ---- FAST PATH: only trading modes may mutate positions/orders
             reconcile_hold = str(st.get("halt_reason", "")).startswith(

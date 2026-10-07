@@ -1195,6 +1195,74 @@ def test_partial_unmatched_reduction_still_halts():
           and len(st["positions"]) == 3, (recs, st.get("halt_reason")))
 
 
+# ===================================================================
+# Daily stop: chay ca khi dang halt ly do khac, thu lai lot chua dong
+# ===================================================================
+def _risk_day(st, dp, day="2026-10-07"):
+    bot_state(st)
+    st.update({"_risk_initialized": True, "day": day,
+               "day_start_equity": 1000.0, "daily_drawdown_pct": dp,
+               "mark_equity": 1000.0 * (1 + dp)})
+
+
+def test_daily_stop_runs_while_halted_other_reason():
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    open_lot(eng, "long", 60000, level="b1")
+    open_lot(eng, "short", 60000, level="s1")
+    _risk_day(st, -0.12)
+    st["halted"], st["halt_reason"] = True, "unmanaged open exchange order"
+    changed = binance_bot.enforce_daily_stop(eng, st, {"BTCUSDT": 59000},
+                                             "2026-10-07")
+    check("daily: dang halt ly do khac van dong het vi the",
+          changed and st["positions"] == []
+          and not any(fake.positions.values()), (st["positions"],
+                                                 fake.positions))
+    check("daily: giu halt_reason persistent, danh dau daily_stop_day",
+          st["halt_reason"] == "unmanaged open exchange order"
+          and st["daily_stop_day"] == "2026-10-07", st.get("halt_reason"))
+
+
+def test_daily_stop_retries_unclosed_lots():
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    a = open_lot(eng, "long", 60000, level="b1")
+    _risk_day(st, -0.15)
+    real_close = eng.close
+    calls = []
+
+    def flaky_close(pos, price, reason):
+        calls.append(pos["id"])
+        if len(calls) == 1:
+            return None                     # cooldown / guard dang khop
+        return real_close(pos, price, reason)
+    eng.close = flaky_close
+    binance_bot.enforce_daily_stop(eng, st, {"BTCUSDT": 59000}, "2026-10-07")
+    check("daily: lan 1 dong khong duoc -> lot con, da halt",
+          len(st["positions"]) == 1 and st["halted"]
+          and st["halt_reason"].startswith("daily stop"))
+    binance_bot.enforce_daily_stop(eng, st, {"BTCUSDT": 59000}, "2026-10-07")
+    check("daily: vong sau thu lai va dong duoc",
+          st["positions"] == [] and calls == [a["id"], a["id"]], calls)
+
+
+def test_daily_stop_no_stale_or_manual_resume_closes():
+    fake = FakeBinance()
+    eng, st = make_engine(fake)
+    open_lot(eng, "long", 60000, level="b1")
+    _risk_day(st, -0.12, day="2026-10-06")          # baseline hom qua
+    binance_bot.enforce_daily_stop(eng, st, {"BTCUSDT": 59000}, "2026-10-07")
+    check("daily: baseline chua sang ngay moi -> khong kich hoat",
+          len(st["positions"]) == 1 and not st.get("halted")
+          and "daily_stop_day" not in st)
+    _risk_day(st, -0.12)
+    st["daily_stop_day"] = "2026-10-07"             # da stop hom nay
+    st["halted"], st["halt_reason"] = False, ""     # van hanh unhalt tay
+    binance_bot.enforce_daily_stop(eng, st, {"BTCUSDT": 59000}, "2026-10-07")
+    check("daily: da unhalt tay -> khong dong lot moi, khong kich lai",
+          len(st["positions"]) == 1 and not st.get("halted"))
+
+
 TESTS = [
     test_close_one_of_many_grid_lots,
     test_close_detects_real_partial,
@@ -1243,6 +1311,9 @@ TESTS = [
     test_partial_manual_close_books_lot_lifo,
     test_partial_guard_fill_left_to_sync,
     test_partial_unmatched_reduction_still_halts,
+    test_daily_stop_runs_while_halted_other_reason,
+    test_daily_stop_retries_unclosed_lots,
+    test_daily_stop_no_stale_or_manual_resume_closes,
 ]
 
 
