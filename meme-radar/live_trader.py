@@ -131,7 +131,119 @@ DEFAULTS = {
     "sl_pct": 0.25,
     "time_stop_min": 480,
     "ts_keep_pct": 0.20, "ts_keep_frac": 0.50,
+    # ---- Jupiter: lite-api dang bi giam rate dan roi khai tu. Co API key
+    # (env JUPITER_API_KEY hoac file .jupiter_key, chmod 600) -> tu chuyen
+    # sang api.jup.ag. Keyless api.jup.ag chi 0.5 req/s -> dat
+    # jupiter_min_interval_seconds = 2.
+    "jupiter_api_key_file": ".jupiter_key",
+    "jupiter_min_interval_seconds": 0.0,
+    # ---- (1) thu hoi rent token account (~0.00204 SOL/token) sau khi ban
+    # sach. Chi dong account so du 0 (on-chain cung tu choi neu con token).
+    "reclaim_rent": True,
+    "reclaim_max_per_loop": 2,
+    "reclaim_retry_seconds": 30,
+    "reclaim_give_up_seconds": 900,
+    # ---- (2) loc token nguy hiem truoc khi mua (fail closed)
+    "token_safety": True,
+    "reject_freeze_authority": True,
+    "reject_mint_authority": True,
+    # Extension Token-2022 bi tu choi (ten theo jsonParsed). transferFeeConfig
+    # chi tu choi khi phi > 0; defaultAccountState chi khi = frozen;
+    # transferHook chi khi co programId; permanentDelegate khi co delegate.
+    "reject_token2022_extensions": [
+        "transferFeeConfig", "transferHook", "permanentDelegate",
+        "nonTransferable", "defaultAccountState", "pausableConfig",
+    ],
+    # Quote thu ban lai luong token se nhan: lo khu hoi > N% -> bo (pool
+    # mong / thue / honeypot). 0 = tat.
+    "max_round_trip_loss_pct": 6.0,
+    # ---- (3) chong mua duoi: gia minh > gia vi nguon khop (tu tx) qua N%
+    # -> bo. 0 = tat. Signal khong co wallet_price_usd -> bo qua kiem tra.
+    "max_entry_premium_pct": 20.0,
+    # ---- (4) thoat khan cap: SL/TRAIL/SMART_EXIT/COPY_EXIT/TIME ban that
+    # bai -> lan sau dung bac ke tiep (lan dau dung sell_slippage_bps /
+    # sell_max_price_impact_pct). priority_fee: null = nhu priority_fee_lamports.
+    "exit_escalation": [
+        {"slippage_bps": 1000, "max_impact_pct": 30.0,
+         "priority_fee": {"auto": True, "max_lamports": 200000,
+                          "level": "veryHigh"}},
+        {"slippage_bps": 2500, "max_impact_pct": 60.0,
+         "priority_fee": {"auto": True, "max_lamports": 1000000,
+                          "level": "veryHigh"}},
+    ],
+    # ---- (5) gia: Jupiter Price API v3 lay 1 request cho moi vi the (<=50).
+    # Token Price API bo qua (khong du tin cay) -> quote tung token, gian
+    # cach price_fallback_seconds.
+    "price_batch": True,
+    "price_fallback_seconds": 20,
+    # ---- (6) copy exit: vi nguon (vi minh copy) ban >= N% luong dang giu
+    # (cong don nhieu lenh) -> ban het. Nguon: alert wallet_sell cua radar.
+    "copy_exit": True,
+    "copy_exit_min_sold_frac": 0.5,
 }
+
+# Lenh thoat bat buoc (cat lo / bao ve): duoc nang bac slippage khi that bai.
+MUST_EXIT_WHYS = ("SL", "TRAIL", "SMART_EXIT", "COPY_EXIT", "TIME")
+
+
+def token_risk_reasons(mint_value, cfg):
+    """Ly do tu choi token tu getAccountInfo(mint, jsonParsed)['value'].
+
+    [] = an toan theo cac kiem tra cau hinh. Khong doc duoc cau truc ->
+    ['unparsed_mint'] (fail closed)."""
+    try:
+        parsed = mint_value["data"]["parsed"]
+        info = parsed["info"]
+    except (KeyError, TypeError):
+        return ["unparsed_mint"]
+    if parsed.get("type") not in (None, "mint"):
+        return ["not_a_mint"]
+    out = []
+    if cfg.get("reject_freeze_authority", True) and info.get("freezeAuthority"):
+        out.append("freeze_authority")
+    if cfg.get("reject_mint_authority", True) and info.get("mintAuthority"):
+        out.append("mint_authority")
+    deny = set(cfg.get("reject_token2022_extensions") or [])
+    for ext in info.get("extensions") or []:
+        if not isinstance(ext, dict):
+            continue
+        name = ext.get("extension")
+        if name not in deny:
+            continue
+        state = ext.get("state") or {}
+        if name == "transferFeeConfig":
+            bps = max(int((state.get(k) or {}).get("transferFeeBasisPoints")
+                          or 0)
+                      for k in ("olderTransferFee", "newerTransferFee"))
+            if bps <= 0:
+                continue
+            out.append(f"transfer_fee_{bps}bps")
+        elif name == "transferHook":
+            if state.get("programId"):
+                out.append("transfer_hook")
+        elif name == "permanentDelegate":
+            if state.get("delegate"):
+                out.append("permanent_delegate")
+        elif name == "defaultAccountState":
+            if str(state.get("accountState")).lower() == "frozen":
+                out.append("default_frozen")
+        else:
+            out.append(name)
+    return out
+
+
+def exit_tier_params(cfg, tier):
+    """(slippage_bps, max_impact_pct, priority_fee|None) cho bac thoat."""
+    base = (int(cfg.get("sell_slippage_bps", cfg["slippage_bps"])),
+            float(cfg.get("sell_max_price_impact_pct",
+                          cfg["max_price_impact_pct"])), None)
+    tiers = cfg.get("exit_escalation") or []
+    if tier <= 0 or not tiers:
+        return base
+    t = tiers[min(tier, len(tiers)) - 1] or {}
+    return (int(t.get("slippage_bps", base[0])),
+            float(t.get("max_impact_pct", base[1])),
+            t.get("priority_fee"))
 
 
 def load_config(path=CFG_P):
@@ -317,6 +429,49 @@ class RpcClient:
         self._decimals_cache[mint] = dec
         return dec
 
+    def get_mint_info(self, mint, max_age=300):
+        """getAccountInfo(mint, jsonParsed)['value'] (cache max_age giay).
+        Mint khong ton tai -> RpcError (fail closed)."""
+        cache = self.__dict__.setdefault("_mint_info_cache", {})
+        hit = cache.get(mint)
+        if hit and time.time() - hit[0] < max_age:
+            return hit[1]
+        res = self.call("getAccountInfo",
+                        [mint, {"encoding": "jsonParsed",
+                                "commitment": "confirmed"}])
+        value = (res or {}).get("value")
+        if not value:
+            raise RpcError(f"mint {mint[:10]}... khong ton tai")
+        cache[mint] = (time.time(), value)
+        try:
+            self._decimals_cache[mint] = int(
+                value["data"]["parsed"]["info"]["decimals"])
+        except (KeyError, TypeError, ValueError, AttributeError):
+            pass
+        return value
+
+    def get_token_accounts_for_mint(self, owner, mint):
+        """Moi token account cua owner cho mint (ca SPL va Token-2022):
+        [{pubkey, program, lamports, amount}]."""
+        res = self.call("getTokenAccountsByOwner",
+                        [owner, {"mint": mint},
+                         {"encoding": "jsonParsed", "commitment": "confirmed"}])
+        out = []
+        for item in res.get("value", []):
+            acct = item.get("account") or {}
+            info = acct["data"]["parsed"]["info"]
+            out.append({
+                "pubkey": item["pubkey"],
+                "program": acct.get("owner"),
+                "lamports": int(acct.get("lamports") or 0),
+                "amount": int(info["tokenAmount"]["amount"]),
+            })
+        return out
+
+    def get_latest_blockhash(self):
+        res = self.call("getLatestBlockhash", [{"commitment": "confirmed"}])
+        return res["value"]["blockhash"]
+
     def _token_account_rows(self, owner):
         """Read both SPL Token programs; never silently omit Token-2022."""
         rows = []
@@ -404,38 +559,90 @@ class SwapError(Exception):
     pass
 
 
+class EntryRejected(SwapError):
+    """Tu choi mua TRUOC khi gui bat ky tx nao (token nguy hiem, mua duoi,
+    lo khu hoi). Khong retry: signal danh dau skipped_<reason>."""
+
+    def __init__(self, reason, detail=""):
+        super().__init__(f"{reason}: {detail}" if detail else reason)
+        self.reason = reason
+
+
 class SwapUncertain(SwapError):
     """A transaction may have landed; never blindly retry this operation."""
 
 
 class JupiterClient:
     def __init__(self, base="https://lite-api.jup.ag", timeout=20,
-                 http_get=None, http_post=None):
+                 http_get=None, http_post=None, api_key=None,
+                 min_interval=0.0):
         self.base = base.rstrip("/")
         self.timeout = timeout
         self._get = http_get or requests.get
         self._post = http_post or requests.post
         self._sol_usd = (0, 0.0)
+        self.api_key = api_key or None
+        self.min_interval = float(min_interval or 0.0)
+        self._last_req = 0.0
+
+    def _headers(self):
+        key = getattr(self, "api_key", None)
+        return {"x-api-key": key} if key else None
+
+    def _throttle(self):
+        """Gian cach toi thieu giua 2 request (keyless api.jup.ag 0.5 rps)."""
+        gap = float(getattr(self, "min_interval", 0.0) or 0.0)
+        if gap <= 0:
+            return
+        wait = getattr(self, "_last_req", 0.0) + gap - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        self._last_req = time.monotonic()
 
     def quote(self, in_mint, out_mint, amount_base, slippage_bps):
+        self._throttle()
         r = self._get(f"{self.base}/swap/v1/quote", params={
             "inputMint": in_mint, "outputMint": out_mint,
             "amount": str(int(amount_base)),
             "slippageBps": str(int(slippage_bps)),
-        }, timeout=self.timeout)
+        }, timeout=self.timeout, headers=self._headers())
         r.raise_for_status()
         q = r.json()
         if not isinstance(q, dict) or "outAmount" not in q:
             raise NoRoute(f"no route: {str(q)[:150]}")
         return q
 
+    def prices_usd(self, mints):
+        """Jupiter Price API v3: {mint: usdPrice} cho toi da 50 mint/request.
+        Token khong co gia tin cay bi Jupiter BO KHOI response (khong co
+        key) -> khong co trong ket qua."""
+        out = {}
+        mints = [m for m in dict.fromkeys(mints) if m]
+        for i in range(0, len(mints), 50):
+            chunk = mints[i:i + 50]
+            self._throttle()
+            r = self._get(f"{self.base}/price/v3",
+                          params={"ids": ",".join(chunk)},
+                          timeout=self.timeout, headers=self._headers())
+            r.raise_for_status()
+            d = r.json() or {}
+            for m in chunk:
+                try:
+                    px = float((d.get(m) or {}).get("usdPrice"))
+                except (TypeError, ValueError, AttributeError):
+                    continue
+                if px > 0 and math.isfinite(px):
+                    out[m] = px
+        return out
+
     def swap_tx(self, quote, user_pubkey, priority_fee):
+        self._throttle()
         r = self._post(f"{self.base}/swap/v1/swap", json={
             "quoteResponse": quote,
             "userPublicKey": user_pubkey,
             "dynamicComputeUnitLimit": True,
             "prioritizationFeeLamports": priority_fee,
-        }, timeout=self.timeout)
+        }, timeout=self.timeout, headers=self._headers())
         r.raise_for_status()
         d = r.json()
         tx = d.get("swapTransaction")
@@ -477,8 +684,8 @@ class Swapper:
         self.dry = dry_run
         self.pubkey = str(keypair.pubkey()) if keypair else None
 
-    def _priority_fee(self):
-        pf = self.cfg["priority_fee_lamports"]
+    def _priority_fee(self, override=None):
+        pf = self.cfg["priority_fee_lamports"] if override is None else override
         if isinstance(pf, dict) and pf.get("auto"):
             return {"priorityLevelWithMaxLamports": {
                 "maxLamports": pf.get("max_lamports", 1000000),
@@ -496,6 +703,40 @@ class Swapper:
             # da nhan, reconcile van tra duoc tx that cua bot.
             on_signed(str(signed.signatures[0]))
         return self.rpc.send_transaction(raw_b64, self.cfg["skip_preflight"])
+
+    def close_token_accounts(self, accounts):
+        """Gui 1 tx CloseAccount (SPL/Token-2022, instruction 9) cho cac token
+        account so du 0 -> rent ve vi. Tra ve signature (biet truoc khi gui).
+        On-chain tu choi neu account con token, nen khong the mat token."""
+        from solders.hash import Hash
+        from solders.instruction import AccountMeta, Instruction
+        from solders.message import MessageV0
+        from solders.pubkey import Pubkey
+        from solders.transaction import VersionedTransaction
+        if self.dry or self.kp is None:
+            raise SwapError("close account chi chay o mode live")
+        owner = self.kp.pubkey()
+        ixs = []
+        for a in accounts:
+            if int(a.get("amount", 1)) != 0:
+                raise SwapError(f"account {a.get('pubkey')} con token -> "
+                                "khong dong")
+            if a.get("program") not in (TOKEN_PROGRAM, TOKEN_2022_PROGRAM):
+                raise SwapError(f"program la {a.get('program')} -> khong dong")
+            ixs.append(Instruction(
+                Pubkey.from_string(a["program"]), bytes([9]),
+                [AccountMeta(Pubkey.from_string(a["pubkey"]), False, True),
+                 AccountMeta(owner, False, True),
+                 AccountMeta(owner, True, False)]))
+        if not ixs:
+            raise SwapError("khong co account de dong")
+        blockhash = self.rpc.get_latest_blockhash()
+        msg = MessageV0.try_compile(owner, ixs, [], Hash.from_string(blockhash))
+        tx = VersionedTransaction(msg, [self.kp])
+        sig = str(tx.signatures[0])
+        self.rpc.send_transaction(base64.b64encode(bytes(tx)).decode(),
+                                  self.cfg["skip_preflight"])
+        return sig
 
     def _buy_signed(self, sig):
         hook = getattr(self, "on_buy_sent", None)
@@ -550,10 +791,12 @@ class Swapper:
         return 0, last_dec, last_error
 
     def _buy_result(self, sig, symbol, size_usd, sol_usd, bal_before,
-                    token_delta, dec):
+                    token_delta, dec, mint=None, had_account=True,
+                    extra=None):
         if dec is None or token_delta <= 0:
             raise SwapUncertain(
                 f"BUY {symbol} verify khong co token delta hop le")
+        measured = True
         try:
             bal_after = self.rpc.get_balance_lamports(self.pubkey)
             spent_usd = max(bal_before - bal_after, 0) / 1e9 * sol_usd
@@ -561,19 +804,112 @@ class Swapper:
             # Token delta is the authoritative execution proof; SOL P&L is
             # only accounting, so retain a conservative cost fallback.
             spent_usd = size_usd
+            measured = False
             log(f"BUY {symbol}: khong doc duoc SOL balance sau tx ({e}); "
                 f"dung cost=${size_usd:.2f}")
         if spent_usd <= 0:
             spent_usd = size_usd
-        entry_usd = spent_usd / (token_delta / (10 ** dec))
+            measured = False
+        # Rent token account moi (lan dau mua token nay) nam trong SOL da chi
+        # nhung KHONG phai gia token va duoc lay lai khi dong account -> tach
+        # ra khoi gia vao (truoc day entry bi doi ~3-4% voi lenh $10).
+        rent_lamports = 0
+        if measured and not had_account and mint:
+            try:
+                accts = self.rpc.get_token_accounts_for_mint(self.pubkey, mint)
+                rent_lamports = sum(int(a.get("lamports") or 0) for a in accts)
+            except Exception as e:
+                log(f"BUY {symbol}: khong doc duoc rent token account ({e}) "
+                    "-> tinh vao gia vao nhu cu")
+        rent_usd = rent_lamports / 1e9 * sol_usd
+        if rent_usd >= spent_usd:
+            rent_lamports, rent_usd = 0, 0.0
+        cost_usd = spent_usd - rent_usd
+        entry_usd = cost_usd / (token_delta / (10 ** dec))
         log(f"LIVE BUY {symbol} OK nhan {token_delta/(10**dec):.4f} token "
-            f"@{entry_usd:.8f} tx={(sig or 'unknown')[:12]}...")
-        return {"tokens_base": token_delta, "decimals": dec,
-                "cost_usd": round(spent_usd, 4), "entry_usd": entry_usd,
-                "tx": sig, "dry": False}
+            f"@{entry_usd:.8f} (rent {rent_lamports/1e9:.5f} SOL tach rieng) "
+            f"tx={(sig or 'unknown')[:12]}...")
+        out = {"tokens_base": token_delta, "decimals": dec,
+               "cost_usd": round(cost_usd, 4), "entry_usd": entry_usd,
+               "rent_lamports": rent_lamports,
+               "rent_usd": round(rent_usd, 4),
+               "tx": sig, "dry": False}
+        out.update(extra or {})
+        return out
+
+    def _entry_safety(self, mint, symbol):
+        """Kiem tra mint qua RPC TRUOC khi quote. Tra ve decimals (hoac None
+        neu tat kiem tra). Khong doc duoc -> SwapError (retry, KHONG mua)."""
+        if not self.cfg.get("token_safety", True):
+            return None
+        try:
+            info = self.rpc.get_mint_info(mint)
+        except Exception as e:
+            raise SwapError(f"khong doc duoc mint {symbol} de kiem tra an "
+                            f"toan: {redact(e)[:150]}")
+        reasons = token_risk_reasons(info, self.cfg)
+        if reasons:
+            raise EntryRejected("unsafe_token", ",".join(reasons))
+        try:
+            return int(info["data"]["parsed"]["info"]["decimals"])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def _entry_quote_check(self, mint, symbol, lamports, sol_usd, dec,
+                           ref_price_usd, report):
+        """Ham kiem tra quote mua (chay ngay truoc khi build tx):
+        - chong mua duoi: gia minh vs gia vi nguon khop;
+        - quote thu ban lai: khong co route / lo khu hoi qua nguong -> bo."""
+        def check(q):
+            out = int(q.get("outAmount") or 0)
+            if out <= 0:
+                raise SwapError("quote mua outAmount = 0")
+            d = dec
+            if d is None:
+                try:
+                    d = self.rpc.get_mint_decimals(mint)
+                except Exception:
+                    d = None   # khong co decimals -> bo qua kiem tra gia
+            my_px = ((lamports / 1e9 * sol_usd) / (out / 10 ** d)
+                     if d is not None else None)
+            report["quote_price_usd"] = my_px
+            maxp = float(self.cfg.get("max_entry_premium_pct") or 0)
+            if my_px and ref_price_usd and ref_price_usd > 0:
+                prem = (my_px / ref_price_usd - 1) * 100
+                report["wallet_price_usd"] = ref_price_usd
+                report["premium_pct"] = round(prem, 2)
+                if maxp > 0 and prem > maxp:
+                    raise EntryRejected(
+                        "chase", f"{symbol} gia ~{my_px:.4g} cao hon vi nguon "
+                        f"{ref_price_usd:.4g} {prem:+.1f}% > {maxp:g}%")
+            maxrt = float(self.cfg.get("max_round_trip_loss_pct") or 0)
+            if maxrt > 0:
+                slip = int(self.cfg.get("sell_slippage_bps",
+                                        self.cfg["slippage_bps"]))
+                try:
+                    q2 = self.jup.quote(mint, SOL_MINT, out, slip)
+                except NoRoute as e:
+                    raise EntryRejected("no_sell_route", str(e)[:120])
+                except requests.HTTPError as e:
+                    code = getattr(getattr(e, "response", None),
+                                   "status_code", None)
+                    if code == 400:
+                        raise EntryRejected("no_sell_route", str(e)[:120])
+                    raise SwapError(f"quote ban thu loi: {e}")
+                except Exception as e:
+                    raise SwapError(f"quote ban thu loi: {e}")
+                back = int(q2.get("outAmount") or 0)
+                loss = (1 - back / lamports) * 100 if lamports > 0 else 100.0
+                report["round_trip_loss_pct"] = round(loss, 2)
+                if loss > maxrt:
+                    raise EntryRejected(
+                        "round_trip", f"{symbol} lo khu hoi {loss:.1f}% > "
+                        f"{maxrt:g}% (pool mong/thue/honeypot)")
+        return check
 
     def _quote_swap(self, in_mint, out_mint, amount_base,
-                    slippage_bps=None, max_price_impact_pct=None):
+                    slippage_bps=None, max_price_impact_pct=None,
+                    check=None, priority_fee=None):
         slippage_bps = (self.cfg["slippage_bps"] if slippage_bps is None
                         else slippage_bps)
         max_price_impact_pct = (
@@ -599,8 +935,18 @@ class Swapper:
             if pi > max_price_impact_pct:
                 raise SwapError(f"price impact {pi:.2f}% > max "
                                 f"{max_price_impact_pct}% -> skip")
+            if check is not None:
+                # Chua gui gi: moi loi o day la loi "chac chan khong mua"
+                # (SwapError -> retry), KHONG duoc thanh SwapUncertain/block.
+                try:
+                    check(q)
+                except SwapError:
+                    raise
+                except Exception as e:
+                    raise SwapError(f"kiem tra quote loi: {e}")
             try:
-                txb64 = self.jup.swap_tx(q, self.pubkey, self._priority_fee())
+                txb64 = self.jup.swap_tx(q, self.pubkey,
+                                         self._priority_fee(priority_fee))
             except Exception as e:
                 last = e
                 time.sleep(1)
@@ -609,8 +955,9 @@ class Swapper:
         raise SwapError(f"quote/swap failed sau {self.cfg['max_swap_retries']} "
                         f"lan thu: {last}")
 
-    def execute_buy(self, mint, size_usd, symbol="?"):
-        """Mua token bang SOL tri gia size_usd. Tra ve dict ket qua."""
+    def execute_buy(self, mint, size_usd, symbol="?", ref_price_usd=None):
+        """Mua token bang SOL tri gia size_usd. Tra ve dict ket qua.
+        ref_price_usd: gia vi nguon khop (chong mua duoi)."""
         try:
             sol_usd = self.jup.sol_price_usd()
             if not sol_usd or sol_usd <= 0:
@@ -619,6 +966,10 @@ class Swapper:
             # No transaction has been submitted yet, so the signal may retry.
             raise SwapError(f"khong lay duoc SOL price truoc BUY: {e}")
         lamports = usd_to_lamports(size_usd, sol_usd)
+        dec_safe = self._entry_safety(mint, symbol)
+        report = {}
+        check = self._entry_quote_check(mint, symbol, lamports, sol_usd,
+                                        dec_safe, ref_price_usd, report)
         if self.dry:
             q = self.jup.quote(SOL_MINT, mint, lamports,
                                self.cfg["slippage_bps"])
@@ -626,14 +977,18 @@ class Swapper:
             if pi > self.cfg["max_price_impact_pct"]:
                 raise SwapError(f"price impact {pi:.2f}% > max "
                                 f"{self.cfg['max_price_impact_pct']}% -> skip")
-            dec = self.rpc.get_mint_decimals(mint)
+            check(q)
+            dec = (dec_safe if dec_safe is not None
+                   else self.rpc.get_mint_decimals(mint))
             tokens = int(q["outAmount"]) / (10 ** dec)
             price = size_usd / tokens if tokens > 0 else 0
             log(f"DRY_RUN BUY {symbol} ${size_usd:.2f} -> {tokens:.4f} token "
                 f"@~${price:.8f} (khong gui tx)")
-            return {"tokens_base": int(q["outAmount"]), "decimals": dec,
-                    "cost_usd": size_usd, "entry_usd": price, "tx": None,
-                    "dry": True}
+            out = {"tokens_base": int(q["outAmount"]), "decimals": dec,
+                   "cost_usd": size_usd, "entry_usd": price, "tx": None,
+                   "dry": True}
+            out.update(report)
+            return out
         try:
             bal = self.rpc.get_balance_lamports(self.pubkey)
         except Exception as e:
@@ -652,7 +1007,8 @@ class Swapper:
             # uncertain or placing a second transaction.
             raise SwapError(
                 f"khong doc duoc token balance truoc BUY {symbol}: {e}")
-        q, txb64 = self._quote_swap(SOL_MINT, mint, lamports)
+        had_account = dec_before is not None
+        q, txb64 = self._quote_swap(SOL_MINT, mint, lamports, check=check)
         try:
             sig = self._sign_and_send(txb64, on_signed=self._buy_signed)
         except Exception as e:
@@ -665,7 +1021,8 @@ class Swapper:
                     "vi -> coi la thanh cong")
                 return self._buy_result(
                     None, symbol, size_usd, sol_usd, bal_before, delta,
-                    dec if dec is not None else dec_before)
+                    dec if dec is not None else dec_before, mint=mint,
+                    had_account=had_account, extra=report)
             if verify_error:
                 raise SwapUncertain(
                     f"BUY {symbol} send exception + verify loi: {verify_error}")
@@ -695,7 +1052,8 @@ class Swapper:
                     "token delta da xac nhan")
             return self._buy_result(
                 sig, symbol, size_usd, sol_usd, bal_before, delta,
-                dec if dec is not None else dec_before)
+                dec if dec is not None else dec_before, mint=mint,
+                had_account=had_account, extra=report)
         if verify_error:
             raise SwapUncertain(
                 f"BUY {symbol} status={confirm_error or 'timeout'}; "
@@ -706,8 +1064,10 @@ class Swapper:
             f"BUY {symbol} unconfirmed/unknown {sig[:12]} (da verify, "
             "khong thay token)")
 
-    def execute_sell(self, mint, frac, symbol="?"):
-        """Ban frac so token DANG CO tren vi. Tra ve dict ket qua."""
+    def execute_sell(self, mint, frac, symbol="?", tier=0):
+        """Ban frac so token DANG CO tren vi. Tra ve dict ket qua.
+        tier >= 1: bac thoat khan cap (slippage/impact/phi uu tien cao hon,
+        xem exit_escalation)."""
         if self.dry:
             # dry-run: khong co so du that -> mo phong hoan toan theo gia quote
             log(f"DRY_RUN SELL {symbol} {frac:.0%} (mo phong, khong gui tx)")
@@ -729,14 +1089,13 @@ class Swapper:
             sol_before = self.rpc.get_balance_lamports(self.pubkey)
         except Exception as e:
             raise SwapError(f"khong lay duoc gia/balance truoc SELL: {e}")
-        sell_slippage = int(self.cfg.get(
-            "sell_slippage_bps", self.cfg["slippage_bps"]))
-        sell_impact = float(self.cfg.get(
-            "sell_max_price_impact_pct", self.cfg["max_price_impact_pct"]))
+        sell_slippage, sell_impact, sell_fee = exit_tier_params(
+            self.cfg, int(tier or 0))
         q, txb64 = self._quote_swap(
             mint, SOL_MINT, amount,
             slippage_bps=sell_slippage,
             max_price_impact_pct=sell_impact,
+            priority_fee=sell_fee,
         )
         # Token da roi vi it nhat ~90% luong ban -> coi la tx da land.
         landed_below = bal_base - amount * 0.9
@@ -767,7 +1126,8 @@ class Swapper:
             raise SwapUncertain(
                 f"SELL {symbol} send exception, chua thay token giam: {e}")
         log(f"LIVE SELL {symbol} {frac:.0%} tx={sig[:12]}... cho confirm "
-            f"(slippage={sell_slippage}bps, impact<={sell_impact:g}%)")
+            f"(slippage={sell_slippage}bps, impact<={sell_impact:g}%"
+            f"{f', bac thoat {tier}' if tier else ''})")
         confirmed = self._confirm(sig)
         if not confirmed:
             # Do not retry blindly: inspect the actual token balance first.
@@ -877,7 +1237,7 @@ class LiveTrader:
     def __init__(self, cfg, jup=None, rpc=None, swapper=None):
         self.cfg = cfg
         self.dry = cfg["mode"] != "live"
-        self.jup = jup or JupiterClient(cfg["jupiter_base"])
+        self.jup = jup or self._make_jupiter(cfg)
         helius_key = ""
         kp_path = os.path.join(BASE, cfg["helius_key_file"])
         if os.path.exists(kp_path):
@@ -915,6 +1275,31 @@ class LiveTrader:
         self._init_source_offsets(not bool(st))
         self._price_last = {}
         self._log_source_health()
+
+    @staticmethod
+    def _make_jupiter(cfg):
+        """JupiterClient voi API key (env JUPITER_API_KEY uu tien, roi file
+        jupiter_api_key_file). Co key ma base la lite-api -> api.jup.ag (key
+        khong dung duoc tren lite-api, lite-api dang bi khai tu)."""
+        key = os.environ.get("JUPITER_API_KEY", "").strip()
+        if not key:
+            kp = os.path.join(BASE, cfg.get("jupiter_api_key_file")
+                              or ".jupiter_key")
+            if os.path.exists(kp):
+                key = open(kp).read().strip()
+        base = cfg["jupiter_base"]
+        if key:
+            register_secret(key)
+            if "lite-api.jup.ag" in base:
+                base = "https://api.jup.ag"
+            log(f"Jupiter: dung API key (da che), base={base}")
+        elif "lite-api.jup.ag" in base:
+            log("CANH BAO Jupiter lite-api dang bi giam rate va se khai tu. "
+                "Nen tao API key (developers.jup.ag) -> env JUPITER_API_KEY "
+                "hoac file .jupiter_key")
+        return JupiterClient(
+            base, api_key=key or None,
+            min_interval=float(cfg.get("jupiter_min_interval_seconds") or 0))
 
     def _init_source_offsets(self, first_start):
         """Bind persisted offsets to the configured files.
@@ -1389,6 +1774,14 @@ class LiveTrader:
         self.swapper.on_buy_sent = _on_sent
         try:
             self._open_from_signal(s, now)
+        except EntryRejected as e:
+            # Tu choi TRUOC khi gui tx (khong co side effect) -> khong retry.
+            pending.pop(tid, None)
+            self.state.setdefault("entry_rejects", {})[e.reason] = \
+                self.state.setdefault("entry_rejects", {}).get(e.reason, 0) + 1
+            log(f"BO QUA {s.get('symbol', '?')}: {e}")
+            self._mark_processed(tid, f"skipped_{e.reason}")
+            return False
         except SwapUncertain as e:
             pending[tid]["status"] = "buy_uncertain"
             pending[tid]["error"] = redact(e)[:300]
@@ -1435,18 +1828,29 @@ class LiveTrader:
                 self.manage_positions(now + elapsed)
         return opened
 
+    @staticmethod
+    def _wallet_price(s):
+        try:
+            px = float(s.get("wallet_price_usd") or 0)
+        except (TypeError, ValueError):
+            return None
+        return px if px > 0 and math.isfinite(px) else None
+
     def _open_from_signal(self, s, now):
         mint = s["token"]
         symbol = s.get("symbol", "?")
         size = float(self.cfg["trade_size_usd"])
+        ref = self._wallet_price(s)
+        # Swapper/stub cu khong nhan ref_price_usd -> chi truyen khi co.
+        kw = {"ref_price_usd": ref} if ref else {}
         if self.dry:
-            r = self.swapper.execute_buy(mint, size, symbol)
+            r = self.swapper.execute_buy(mint, size, symbol, **kw)
             entry = r["entry_usd"] or s.get("price_now") or s.get("price_usd")
             dec = r["decimals"]
             cost = size
             tx = None
         else:
-            r = self.swapper.execute_buy(mint, size, symbol)
+            r = self.swapper.execute_buy(mint, size, symbol, **kw)
             entry = r["entry_usd"]
             dec = r["decimals"]
             cost = r["cost_usd"]
@@ -1462,6 +1866,12 @@ class LiveTrader:
             "tp1": False, "tp2": False, "ts_keep": False, "ts_done": False,
             "smart_exit": False, "legs": [], "entry_tx": tx,
             "price_poll_at": 0,
+            "signal_ts": signal_event_ts(s),
+            "rent_lamports": int(r.get("rent_lamports") or 0),
+            "wallet_price_usd": ref,
+            "entry_premium_pct": r.get("premium_pct"),
+            "round_trip_loss_pct": r.get("round_trip_loss_pct"),
+            "liquidity_usd": s.get("liquidity_usd"),
         }
         self.positions.append(pos)
         log(f"{'DRY' if self.dry else 'LIVE'} OPEN {symbol} @{entry:.8f} "
@@ -1475,6 +1885,9 @@ class LiveTrader:
     def ingest_alerts(self):
         alerts, _ = self._tail_source("alerts")
         for a in alerts:
+            if a.get("type") == "wallet_sell":
+                self._on_wallet_sell(a)
+                continue
             if a.get("type") != "sell_cluster":
                 continue
             tok = a.get("token")
@@ -1488,19 +1901,68 @@ class LiveTrader:
                 log(f"SMART EXIT: {n} vi the {tok[:8]}... bi dan qua bay "
                     f"({a.get('n_wallets')} vi xa)")
 
+    def _on_wallet_sell(self, a):
+        """Copy exit: vi nguon cua vi the ban token -> cong don phan da ban;
+        >= copy_exit_min_sold_frac -> bat co copy_exit (ban het)."""
+        if not self.cfg.get("copy_exit", True):
+            return
+        tok, wallet = a.get("token"), a.get("wallet")
+        try:
+            frac = min(1.0, max(0.0, float(a.get("sold_frac"))))
+        except (TypeError, ValueError):
+            return
+        ts = signal_event_ts(a) or 0
+        need = float(self.cfg.get("copy_exit_min_sold_frac", 0.5))
+        for p in self.positions:
+            if (p.get("token") != tok or p.get("wallet") != wallet
+                    or p.get("remaining", 1.0) <= 0 or p.get("copy_exit")):
+                continue
+            # Chi tinh lenh ban SAU lenh mua cua vi (dung sai dong ho 5s).
+            since = p.get("signal_ts") or p.get("opened_at") or 0
+            if ts and ts < float(since) - 5:
+                continue
+            seen = p.setdefault("src_sell_tids", [])
+            tid = a.get("tid")
+            if tid and tid in seen:
+                continue
+            if tid:
+                seen.append(tid)
+                del seen[:-20]
+            p["src_remaining"] = round(
+                float(p.get("src_remaining", 1.0)) * (1.0 - frac), 6)
+            sold = 1.0 - p["src_remaining"]
+            if sold >= need - 1e-9:
+                p["copy_exit"] = True
+                log(f"COPY EXIT: vi nguon {wallet[:8]}... da ban {sold:.0%} "
+                    f"{p.get('symbol')} -> ban het theo")
+            else:
+                log(f"vi nguon {wallet[:8]}... ban {frac:.0%} "
+                    f"{p.get('symbol')} (cong don {sold:.0%} < {need:.0%}) "
+                    "-> giu")
+
     # -- exit engine -----------------------------------------------------
 
-    def manage_one(self, pos, now):
+    def manage_one(self, pos, now, price=None, batch_ok=False):
         """Poll gia 1 vi the, chay exit ladder, thuc hien ban. Tra ve True
-        neu vi the da dong han."""
+        neu vi the da dong han.
+
+        price: gia tu Price API batch (manage_positions). batch_ok=True ma
+        price None = Jupiter bo token nay khoi Price API -> quote tung token
+        nhung gian cach price_fallback_seconds (do ton rate limit)."""
         if now - pos.get("price_poll_at", 0) < self.cfg["price_poll_seconds"]:
             return False
+        if price is None and batch_ok:
+            gap = float(self.cfg.get("price_fallback_seconds", 20))
+            if now - pos.get("fallback_poll_at", 0) < gap:
+                return False
+            pos["fallback_poll_at"] = now
         pos["price_poll_at"] = now
-        try:
-            price = self._token_price(pos["token"], pos["decimals"])
-        except Exception as e:
-            log(f"khong lay duoc gia {pos['symbol']}: {e}")
-            return False
+        if price is None:
+            try:
+                price = self._token_price(pos["token"], pos["decimals"])
+            except Exception as e:
+                log(f"khong lay duoc gia {pos['symbol']}: {e}")
+                return False
         if not price:
             return False
         # `held` = phan vi the (theo luong mua ban dau) DANG CON tren vi
@@ -1641,13 +2103,29 @@ class LiveTrader:
         if held is None:
             held = float(pos.get("remaining", 0.0)) + frac
         bal_frac = self.balance_fraction(frac, held)
+        must_exit = why in MUST_EXIT_WHYS
+        tier = int(pos.get("exit_tier", 0) or 0) if must_exit else 0
+        # Swapper/stub cu khong nhan tier -> chi truyen khi > 0.
+        kw = {"tier": tier} if tier else {}
         try:
-            r = self.swapper.execute_sell(pos["token"], bal_frac, pos["symbol"])
+            r = self.swapper.execute_sell(pos["token"], bal_frac,
+                                          pos["symbol"], **kw)
         except Exception as e:
             definite = (isinstance(e, (NoRoute, SwapError))
                         and not isinstance(e, SwapUncertain))
             if definite:
                 log(f"{pos['symbol']} ban {why} THAT BAI: {e} (se thu lai)")
+                if must_exit:
+                    # Lenh cat lo/bao ve that bai chac chan (khong land):
+                    # lan sau nang slippage/impact/phi uu tien, thu lai ngay
+                    # vong ke (khong cho price_poll_seconds).
+                    n_tiers = len(self.cfg.get("exit_escalation") or [])
+                    pos["exit_tier"] = min(tier + 1, n_tiers)
+                    pos["price_poll_at"] = 0
+                    pos["fallback_poll_at"] = 0
+                    if pos["exit_tier"] > tier:
+                        log(f"{pos['symbol']} {why}: nang bac thoat "
+                            f"{tier} -> {pos['exit_tier']}")
             else:
                 log(f"{pos['symbol']} ban {why} KHONG CHAC ket qua:\n"
                     + traceback.format_exc())
@@ -1677,6 +2155,10 @@ class LiveTrader:
                 f"({r['note']}) -> dong vi the, P&L phan con lai KHONG XAC "
                 "DINH (khong tinh vao daily)")
             return True
+        if must_exit and pos.get("exit_tier"):
+            pos["exit_tier_used"] = max(int(pos.get("exit_tier_used", 0)),
+                                        int(pos["exit_tier"]))
+            pos.pop("exit_tier", None)
         if r.get("simulated"):
             proceeds = r["proceeds_usd"]
             # dry-run: tinh theo gia quote
@@ -1711,24 +2193,159 @@ class LiveTrader:
             "realized_usd": round(pos.get("realized_usd", 0.0), 4),
             "reason": reason, "mode": "dry" if self.dry else "live",
             "entry_tx": pos.get("entry_tx"),
+            "signal_ts": pos.get("signal_ts"),
+            "wallet_price_usd": pos.get("wallet_price_usd"),
+            "entry_premium_pct": pos.get("entry_premium_pct"),
+            "round_trip_loss_pct": pos.get("round_trip_loss_pct"),
+            "liquidity_usd": pos.get("liquidity_usd"),
+            "rent_lamports": pos.get("rent_lamports", 0),
+            "exit_tier_used": pos.get("exit_tier_used", 0),
         }
         with open(TRADES_P, "a") as f:
             f.write(json.dumps(rec) + "\n")
         self.positions.remove(pos)
+        self._queue_rent_reclaim(pos.get("token"), now,
+                                 pos.get("rent_lamports", 0))
         log(f"{'DRY' if self.dry else 'LIVE'} CLOSE {pos['symbol']} "
             f"final={total_ret:+.1%} (${pos.get('realized_usd', 0.0):+.2f}) "
             f"reason={reason}")
 
     # -- main loop --------------------------------------------------------
 
+    def _batch_prices(self, now):
+        """Gia moi vi the qua 1 request Price API (gian cach
+        price_poll_seconds). Tra ve (prices, ok); ok=False khi API loi /
+        khong ho tro -> manage_one quote tung token nhu cu."""
+        if not self.cfg.get("price_batch", True):
+            return {}, False
+        mints = [p["token"] for p in self.positions
+                 if p.get("remaining", 1.0) > 0 and p.get("token")]
+        if not mints:
+            return {}, False
+        cache = getattr(self, "_batch_cache", None)
+        gap = float(self.cfg["price_poll_seconds"])
+        if (cache and now - cache["at"] < gap
+                and set(mints) <= set(cache["mints"])):
+            return cache["prices"], cache["ok"]
+        try:
+            prices, ok = self.jup.prices_usd(mints), True
+        except Exception as e:
+            if not getattr(self, "_batch_warned", False):
+                log(f"Price API batch loi ({redact(e)[:120]}) -> quote tung "
+                    "token")
+                self._batch_warned = True
+            prices, ok = {}, False
+        self._batch_cache = {"at": now, "mints": mints, "prices": prices,
+                             "ok": ok}
+        return prices, ok
+
     def manage_positions(self, now):
         """Chay exit ladder cho moi vi the (stagger price poll)."""
+        prices, batch_ok = self._batch_prices(now)
         for i, p in enumerate(list(self.positions)):
             try:
-                self.manage_one(p, now + i * 0.05)
+                if batch_ok:
+                    self.manage_one(p, now + i * 0.05,
+                                    price=prices.get(p.get("token")),
+                                    batch_ok=True)
+                else:
+                    self.manage_one(p, now + i * 0.05)
             except Exception:
                 log(f"ERROR manage {p.get('symbol')}:\n"
                     + traceback.format_exc())
+
+    # -- (1) thu hoi rent token account -----------------------------------
+
+    def _queue_rent_reclaim(self, mint, now, rent_lamports=0):
+        if self.dry or not mint or not self.cfg.get("reclaim_rent", True):
+            return
+        if mint == SOL_MINT or mint in STABLE_MINTS:
+            return
+        q = self.state.setdefault("rent_reclaim", {})
+        if mint not in q:
+            q[mint] = {"queued_at": int(now), "attempts": 0,
+                       "rent_lamports": int(rent_lamports or 0)}
+
+    def process_rent_reclaim(self, now):
+        """Dong token account so du 0 cua token da ban sach -> rent ve vi.
+        Khong chan vong lap: gui tx roi vong sau moi kiem tra ket qua."""
+        q = self.state.setdefault("rent_reclaim", {})
+        if self.dry or not q or not self.cfg.get("reclaim_rent", True):
+            return 0
+        active = {p.get("token") for p in self.positions}
+        for rec in (self.state.get("pending_buys") or {}).values():
+            active.add(((rec or {}).get("signal") or {}).get("token"))
+        rpc = self.swapper.rpc
+        give_up = float(self.cfg.get("reclaim_give_up_seconds", 900))
+        retry = float(self.cfg.get("reclaim_retry_seconds", 30))
+        budget = int(self.cfg.get("reclaim_max_per_loop", 2))
+        done = 0
+        for mint, rec in list(q.items()):
+            if budget <= 0:
+                break
+            if mint in active:
+                q.pop(mint, None)     # mua lai: dong khi vi the moi dong
+                continue
+            if now < float(rec.get("retry_at", 0)):
+                continue
+            sig = rec.get("sig")
+            if sig:
+                try:
+                    st = rpc.get_sig_status(sig)
+                except Exception as e:
+                    rec["retry_at"] = now + retry
+                    log(f"RENT {mint[:8]}...: loi doc status ({e}) -> cho")
+                    continue
+                if st in ("confirmed", "finalized"):
+                    q.pop(mint, None)
+                    done += 1
+                    log(f"THU HOI RENT {mint[:8]}... "
+                        f"+{rec.get('closing_lamports', 0)/1e9:.5f} SOL "
+                        f"tx={sig[:12]}...")
+                    continue
+                if st == "failed" or now - float(rec.get("sent_at", now)) > \
+                        float(self.cfg.get("confirm_timeout_seconds", 90)):
+                    rec.pop("sig", None)
+                    rec["retry_at"] = now + retry
+                    log(f"RENT {mint[:8]}...: tx dong account "
+                        f"{'that bai' if st == 'failed' else 'het han'} "
+                        "-> thu lai")
+                continue
+            if (rec.get("attempts", 0) >= 3
+                    or now - float(rec.get("queued_at", now)) > give_up):
+                q.pop(mint, None)
+                log(f"RENT {mint[:8]}...: bo thu hoi sau "
+                    f"{rec.get('attempts', 0)} lan (con dust/loi)")
+                continue
+            budget -= 1
+            try:
+                accts = rpc.get_token_accounts_for_mint(self.swapper.pubkey,
+                                                        mint)
+            except Exception as e:
+                rec["retry_at"] = now + retry
+                log(f"RENT {mint[:8]}...: loi doc token account ({e})")
+                continue
+            empty = [a for a in accts if int(a.get("amount", 1)) == 0]
+            if not empty:
+                if not accts:
+                    q.pop(mint, None)  # da dong (tay / lan truoc)
+                else:
+                    # So du chua ve 0 (RPC tre / dust) -> thu lai sau, toi
+                    # reclaim_give_up_seconds thi bo.
+                    rec["retry_at"] = now + retry
+                continue
+            rec["attempts"] = int(rec.get("attempts", 0)) + 1
+            try:
+                rec["sig"] = self.swapper.close_token_accounts(empty)
+                rec["sent_at"] = int(now)
+                rec["closing_lamports"] = sum(a["lamports"] for a in empty)
+                log(f"RENT {mint[:8]}...: gui dong {len(empty)} account "
+                    f"({rec['closing_lamports']/1e9:.5f} SOL)")
+            except Exception as e:
+                rec["retry_at"] = now + retry
+                log(f"RENT {mint[:8]}...: gui dong account loi: "
+                    f"{redact(e)[:150]}")
+        return done
 
     def skip_signals_paused(self, now):
         """Dang PAUSE: doc signal moi + signal retry den han, danh dau
@@ -1776,6 +2393,10 @@ class LiveTrader:
         except Exception:
             log("ERROR ingest alerts:\n" + traceback.format_exc())
         self.manage_positions(now)
+        try:
+            self.process_rent_reclaim(now)
+        except Exception:
+            log("ERROR rent reclaim:\n" + traceback.format_exc())
         try:
             if paused:
                 # PAUSE: KHONG mo lenh moi. Van tieu thu signal (danh dau

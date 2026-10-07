@@ -4,7 +4,7 @@
  "_exit_note": "Exit ladder mirror y het paper (radar.py plan scalp): TP1 +50% ban 1/3, TP2 +100% ban them 1/3, con lai trailing -30% tu dinh; SL -25% cat het; smart exit khi >=2 vi tracked xa cung token/30p; time stop 480p (lai >=20% -> chot 1/2 giu 1/2 trailing, khong thi cat het).",
  "_fee_buffer_note": "Giu lai toi thieu 0.02 SOL trong vi cho phi tx + rent, khong dung de swap.",
  "_impact_note": "Bo qua lenh neu price impact vuot nguong, don vi PHAN TRAM (5.0 = 5%). Jupiter tra priceImpactPct dang phan so (0.05 = 5%), code tu quy doi.",
- "_jupiter_note": "Jupiter Swap API v1 (keyless). Neu co Jupiter API key rieng: doi thanh https://api.jup.ag (can them header x-api-key - tu sua code).",
+ "_jupiter_note": "lite-api.jup.ag dang bi giam rate va se khai tu. Tao API key (developers.jup.ag) -> env JUPITER_API_KEY hoac file .jupiter_key (chmod 600): bot tu chuyen sang https://api.jup.ag va gui header x-api-key. Khong co key ma dung api.jup.ag: gioi han 0.5 req/s -> dat jupiter_min_interval_seconds = 2.",
  "_key_note": "Private key base58: dat trong env SOLANA_PRIVATE_KEY (nap tu file .env chmod 600, uu tien) hoac file .solana_key chmod 600. KHONG commit, KHONG paste vao chat.",
  "_mode_note": "dry_run = chi log y dinh swap, KHONG gui transaction, khong can key. live = swap THAT bang tien that, bat buoc co key (env/file) va pubkey khop wallet_address (thieu -> tu dung).",
  "_preflight_note": "false = mo phong tx truoc khi gui (an toan hon, cham hon). true = gui thang (nhanh hon, rui ro hon).",
@@ -40,5 +40,53 @@
  "trailing_pct": 0.3,
  "ts_keep_frac": 0.5,
  "ts_keep_pct": 0.2,
- "wallet_address": "DxYkrsJA6YdS1cqJ9ocPCYRBacd7Xan3DeYWZva89dLd"
+ "wallet_address": "DxYkrsJA6YdS1cqJ9ocPCYRBacd7Xan3DeYWZva89dLd",
+ "jupiter_api_key_file": ".jupiter_key",
+ "jupiter_min_interval_seconds": 0,
+ "_safety_note": "Truoc khi mua: doc mint qua RPC (fail closed) -> bo token con freeze/mint authority hoac extension Token-2022 nguy hiem; quote thu ban lai luong token se nhan: khong co route -> no_sell_route, lo khu hoi > max_round_trip_loss_pct (%) -> round_trip. Chong mua duoi: gia minh cao hon gia vi nguon khop > max_entry_premium_pct (%) -> chase. Signal bi tu choi ghi skipped_<ly do>, dem trong live_state.json entry_rejects. 0 = tat tung kiem tra.",
+ "token_safety": true,
+ "reject_freeze_authority": true,
+ "reject_mint_authority": true,
+ "reject_token2022_extensions": [
+  "transferFeeConfig",
+  "transferHook",
+  "permanentDelegate",
+  "nonTransferable",
+  "defaultAccountState",
+  "pausableConfig"
+ ],
+ "max_round_trip_loss_pct": 6.0,
+ "max_entry_premium_pct": 20.0,
+ "_rent_note": "Ban sach token -> dong token account so du 0, lay lai rent ~0.00204 SOL (lenh $10 la ~3%). Rent cua lan mua dau duoc tach khoi gia vao (rent_lamports). Account rong ton tu truoc: python close_empty_accounts.py (liet ke) roi --yes.",
+ "reclaim_rent": true,
+ "reclaim_max_per_loop": 2,
+ "_escalation_note": "SL/TRAIL/SMART_EXIT/COPY_EXIT/TIME ban that bai chac chan (impact/no route/tx fail) -> vong sau thu lai NGAY voi bac ke tiep (slippage/impact/phi uu tien cao hon). TP khong nang bac.",
+ "sell_slippage_bps": 300,
+ "sell_max_price_impact_pct": 10.0,
+ "exit_escalation": [
+  {
+   "slippage_bps": 1000,
+   "max_impact_pct": 30.0,
+   "priority_fee": {
+    "auto": true,
+    "max_lamports": 200000,
+    "level": "veryHigh"
+   }
+  },
+  {
+   "slippage_bps": 2500,
+   "max_impact_pct": 60.0,
+   "priority_fee": {
+    "auto": true,
+    "max_lamports": 1000000,
+    "level": "veryHigh"
+   }
+  }
+ ],
+ "_price_note": "Gia moi vi the qua 1 request Jupiter Price API v3. Token Jupiter khong co gia tin cay -> quote rieng, gian cach price_fallback_seconds.",
+ "price_batch": true,
+ "price_fallback_seconds": 20,
+ "_copy_exit_note": "Vi nguon (vi minh copy) ban cong don >= copy_exit_min_sold_frac luong dang giu -> ban het theo. Nguon: alert wallet_sell cua radar (can radar ban moi).",
+ "copy_exit": true,
+ "copy_exit_min_sold_frac": 0.5
 }

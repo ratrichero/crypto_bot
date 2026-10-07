@@ -53,6 +53,11 @@ def decide_exits(pos, price, now, P):
     if not reason and rem > 0 and pos.get("smart_exit"):
         take(rem, "SMART_EXIT")
         reason = "smart_exit"
+    # copy exit: vi nguon (vi minh copy) da ban >= nguong luong dang giu
+    rem = pos.get("remaining", 1.0)
+    if not reason and rem > 0 and pos.get("copy_exit"):
+        take(rem, "COPY_EXIT")
+        reason = "copy_exit"
     # time stop
     rem = pos.get("remaining", 1.0)
     el_min = (now - pos["opened_at"]) / 60

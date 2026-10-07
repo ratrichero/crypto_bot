@@ -168,9 +168,15 @@ class FakeJup(lt.JupiterClient):
             return {"outAmount": str(int(tokens * 10 ** self.DEC)),
                     "otherAmountThreshold": str(int(tokens * 10 ** self.DEC)),
                     "priceImpactPct": "0.001"}
-        # token -> USDC: dung de dinh gia
         px = self.price_map.get(in_mint, 0.001)
         tokens = amount_base / (10 ** self.DEC)
+        if out_mint == lt.SOL_MINT:
+            # token -> SOL (ban / quote thu khu hoi)
+            lamports = int(tokens * px / self._sol * 1e9)
+            return {"outAmount": str(lamports),
+                    "otherAmountThreshold": str(int(lamports * 0.97)),
+                    "priceImpactPct": "0.001"}
+        # token -> USDC: dung de dinh gia
         return {"outAmount": str(int(tokens * px * 1e6)),
                 "otherAmountThreshold": str(int(tokens * px * 1e6 * 0.99)),
                 "priceImpactPct": "0.001"}
@@ -198,6 +204,12 @@ class FakeRpc(lt.RpcClient):
 
     def get_mint_decimals(self, mint):
         return 6
+
+    def get_mint_info(self, mint, max_age=300):
+        # mint an toan mac dinh (da revoke mint/freeze authority)
+        return {"owner": lt.TOKEN_PROGRAM, "data": {"parsed": {
+            "type": "mint", "info": {"decimals": 6, "mintAuthority": None,
+                                     "freezeAuthority": None}}}}
 
 
 def b58encode(raw: bytes) -> str:
@@ -388,7 +400,7 @@ class FlakySwapper:
         self.exc = exc or lt.SwapError("no route tam thoi")
         self.calls = []
 
-    def execute_sell(self, mint, frac, symbol="?"):
+    def execute_sell(self, mint, frac, symbol="?", tier=0):
         self.calls.append((mint, frac))
         if self.fails > 0:
             self.fails -= 1
@@ -475,7 +487,7 @@ class WalletSwapper:
         self.calls = []
         self.fail_next = list(fail_whys)
 
-    def execute_sell(self, mint, frac, symbol="?"):
+    def execute_sell(self, mint, frac, symbol="?", tier=0):
         self.calls.append(round(frac, 4))
         if self.fail_next:
             self.fail_next.pop(0)
@@ -807,7 +819,7 @@ class UncertainWallet:
     def get_balance_lamports(self, owner):
         return 10 * 10 ** 9
 
-    def execute_sell(self, mint, frac, symbol="?"):
+    def execute_sell(self, mint, frac, symbol="?", tier=0):
         self.calls.append(round(frac, 4))
         mode = self.modes.pop(0) if self.modes else "ok"
         amount = self.balance if frac >= 0.999 else int(self.balance * frac)
@@ -882,7 +894,7 @@ def test_uncertain_pending_allows_full_sl():
 # ---- vi het token: khong ghi lo gia ----
 
 class EmptyWallet(UncertainWallet):
-    def execute_sell(self, mint, frac, symbol="?"):
+    def execute_sell(self, mint, frac, symbol="?", tier=0):
         self.calls.append(round(frac, 4))
         return {"sold_base": 0, "proceeds_usd": 0.0, "tx": None,
                 "dry": False, "note": "empty"}
@@ -957,13 +969,13 @@ class SlowBuySwapper:
         self.events = events
         self.buy_seconds = buy_seconds
 
-    def execute_buy(self, mint, size_usd, symbol="?"):
+    def execute_buy(self, mint, size_usd, symbol="?", ref_price_usd=None):
         self.events.append(("buy", mint))
         self.clock[0] += self.buy_seconds
         return {"tokens_base": 10_000_000, "decimals": 6, "cost_usd": size_usd,
                 "entry_usd": 0.001, "tx": None, "dry": True}
 
-    def execute_sell(self, mint, frac, symbol="?"):
+    def execute_sell(self, mint, frac, symbol="?", tier=0):
         self.events.append(("sell", mint))
         return {"sold_base": 0, "proceeds_usd": 0.0, "tx": None,
                 "dry": True, "simulated": True}
@@ -1174,8 +1186,9 @@ def test_buy_signature_saved_before_send():
         tr, _ = _dry_trader(tmpd, {"NEWTOK": 0.001})
         tr.dry = False
         rpc = BuyRpc()
+        # token_safety tat: test nay chi kiem thu tu ghi signature/gui tx
         cfg = dict(tr.cfg, mode="live", buy_balance_verify_attempts=1,
-                   buy_balance_verify_seconds=0)
+                   buy_balance_verify_seconds=0, token_safety=False)
         jup = SellJup(price_map={"NEWTOK": 0.001})
         jup.swap_tx = lambda q, pk, fee: txb64
         sw = lt.Swapper(rpc, jup, kp, cfg, dry_run=False)
