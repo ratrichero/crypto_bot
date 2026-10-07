@@ -182,3 +182,10 @@ Doi chieu tung lenh voi tx that (chi doc, khong can private key):
   Chain + phi mang (gan voi so app vi). `Bot` ≠ `Chain` -> co `BOT_LECH_CHAIN`.
 - `--scan`: tx cua vi ma bot khong ghi (tx loi van mat phi, thu hoi rent, mua/ban
   tay...).
+
+Tu 10/2026 bot ghi P&L tu **chinh tx** (`getTransaction`: so du truoc/sau + phi)
+thay vi `getBalance` sau confirm (node RPC lag co the tra so du cu -> tien ban ve
+ghi $0 / chi phi mua sai). Khong doc duoc tx sau 3 lan -> dung so du nhu cu (log
+"dung so du"). Moi lenh/leg co `fee_usd` (phi mang) va `acct` (tx|balance); ban ghi
+dong lenh co `fee_usd` + `fee_known` -> dashboard hien cot "Phi mang" va "Truoc phi".
+Tat: `"tx_accounting": false` trong config.live.json.

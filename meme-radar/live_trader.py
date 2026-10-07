@@ -38,6 +38,7 @@ import requests
 
 from dexscreener import pick_pair
 from strategy import decide_exits
+from txparse import parse_tx
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 
@@ -104,6 +105,12 @@ DEFAULTS = {
     "confirm_poll_seconds": 2,
     "buy_balance_verify_attempts": 4,
     "buy_balance_verify_seconds": 2,
+    # Ke toan P&L tu chinh tx (getTransaction: so du truoc/sau + phi) thay
+    # vi getBalance sau confirm (node RPC lag -> so cu -> proceeds sai).
+    # Khong doc duoc tx -> dung so du nhu cu.
+    "tx_accounting": True,
+    "tx_accounting_attempts": 3,
+    "tx_accounting_wait_seconds": 1.0,
     "max_swap_retries": 3,
     "fee_buffer_sol": 0.02,
     "daily_stop_pct": 0.20,
@@ -553,6 +560,12 @@ class RpcClient:
             return "failed"
         return v.get("confirmationStatus")
 
+    def get_transaction(self, sig):
+        """Tx da confirm (jsonParsed) hoac None neu node chua index."""
+        return self.call("getTransaction", [sig, {
+            "encoding": "jsonParsed", "commitment": "confirmed",
+            "maxSupportedTransactionVersion": 0}])
+
 
 # ---------------------------------------------------------------- Jupiter
 
@@ -797,6 +810,45 @@ class Swapper:
                                   self.cfg["skip_preflight"])
         return sig
 
+    def _tx_accounting(self, sig, mint):
+        """So lieu THAT cua vi tu tx (txparse.parse_tx): sol_delta (da gom
+        phi), fee, fee_payer, token_delta, rent_open/close. None -> caller
+        dung so du getBalance nhu cu (rpc khong ho tro / loi / chua index /
+        tx loi). Chi la ke toan: KHONG bao gio quyet dinh tx land hay chua."""
+        if not sig or not self.pubkey or not self.cfg.get("tx_accounting",
+                                                          True):
+            return None
+        fn = getattr(self.rpc, "get_transaction", None)
+        if fn is None:
+            return None
+        attempts = max(1, int(self.cfg.get("tx_accounting_attempts", 3)))
+        wait = float(self.cfg.get("tx_accounting_wait_seconds", 1.0))
+        for i in range(attempts):
+            try:
+                tx = fn(sig)
+            except Exception as e:
+                log(f"ke toan tx {sig[:12]}...: loi doc tx "
+                    f"({redact(e)[:120]}) -> dung so du")
+                return None
+            if tx:
+                try:
+                    p = parse_tx(tx, self.pubkey, mint)
+                except Exception as e:
+                    log(f"ke toan tx {sig[:12]}...: parse loi ({e}) "
+                        "-> dung so du")
+                    return None
+                return p if p and p["ok"] else None
+            if i + 1 < attempts:
+                time.sleep(wait)
+        log(f"ke toan tx {sig[:12]}...: node chua tra tx -> dung so du")
+        return None
+
+    @staticmethod
+    def _fee_usd(acct, sol_usd):
+        if not acct or not acct.get("fee_payer"):
+            return None
+        return round(acct["fee"] / 1e9 * sol_usd, 6)
+
     def _buy_signed(self, sig):
         hook = getattr(self, "on_buy_sent", None)
         if hook is not None:
@@ -856,9 +908,15 @@ class Swapper:
             raise SwapUncertain(
                 f"BUY {symbol} verify khong co token delta hop le")
         measured = True
+        acct = self._tx_accounting(sig, mint) if mint else None
+        if acct and (acct["token_delta"] <= 0 or acct["sol_delta"] >= 0):
+            acct = None   # tx khong giong 1 lenh mua -> dung so du
         try:
-            bal_after = self.rpc.get_balance_lamports(self.pubkey)
-            spent_usd = max(bal_before - bal_after, 0) / 1e9 * sol_usd
+            if acct:
+                spent_usd = -acct["sol_delta"] / 1e9 * sol_usd
+            else:
+                bal_after = self.rpc.get_balance_lamports(self.pubkey)
+                spent_usd = max(bal_before - bal_after, 0) / 1e9 * sol_usd
         except Exception as e:
             # Token delta is the authoritative execution proof; SOL P&L is
             # only accounting, so retain a conservative cost fallback.
@@ -873,7 +931,9 @@ class Swapper:
         # nhung KHONG phai gia token va duoc lay lai khi dong account -> tach
         # ra khoi gia vao (truoc day entry bi doi ~3-4% voi lenh $10).
         rent_lamports = 0
-        if measured and not had_account and mint:
+        if acct:
+            rent_lamports = int(acct["rent_open"])
+        elif measured and not had_account and mint:
             try:
                 accts = self.rpc.get_token_accounts_for_mint(self.pubkey, mint)
                 rent_lamports = sum(int(a.get("lamports") or 0) for a in accts)
@@ -892,6 +952,8 @@ class Swapper:
                "cost_usd": round(cost_usd, 4), "entry_usd": entry_usd,
                "rent_lamports": rent_lamports,
                "rent_usd": round(rent_usd, 4),
+               "fee_usd": self._fee_usd(acct, sol_usd),
+               "acct": "tx" if acct else "balance",
                "tx": sig, "dry": False}
         out.update(extra or {})
         return out
@@ -1160,6 +1222,17 @@ class Swapper:
         landed_below = bal_base - amount * 0.9
 
         def _unconfirmed_result(sig_, nb_, why_):
+            # Co chu ky -> thu doc tx: neu node da co thi dung so THAT thay
+            # vi uoc tinh theo nguong slippage (luon thap hon thuc te).
+            a_ = self._tx_accounting(sig_, mint) if sig_ else None
+            if a_ and a_["token_delta"] < 0:
+                got = max(a_["sol_delta"], 0) / 1e9 * sol_usd
+                log(f"LIVE SELL {symbol} {why_} nhung tx da co tren chain "
+                    f"-> so that +${got:.2f}")
+                return {"sold_base": -a_["token_delta"],
+                        "proceeds_usd": round(got, 4), "tx": sig_,
+                        "dry": False, "acct": "tx",
+                        "fee_usd": self._fee_usd(a_, sol_usd)}
             est = int(q.get("otherAmountThreshold", 0)) / 1e9 * sol_usd
             log(f"LIVE SELL {symbol} {why_} nhung token da di "
                 f"-> tinh theo threshold ~${est:.2f} (CANH BAO)")
@@ -1198,20 +1271,30 @@ class Swapper:
             if nb <= landed_below:
                 return _unconfirmed_result(sig, nb, "timeout")
             raise SwapUncertain(f"sell unconfirmed: {sig[:12]} (se reconcile)")
-        try:
-            sol_after = self.rpc.get_balance_lamports(self.pubkey)
-            nb, _ = self.rpc.get_token_balance_base(self.pubkey, mint)
-        except Exception as e:
-            raise SwapUncertain(
-                f"SELL {symbol} da confirm nhung khong doc duoc balance: {e}")
-        sold_base = max(bal_base - nb, 0)
-        if sold_base <= 0:
-            raise SwapUncertain(
-                f"SELL {symbol} da confirm nhung token balance khong giam")
-        proceeds_usd = max(sol_after - sol_before, 0) / 1e9 * sol_usd
-        log(f"LIVE SELL {symbol} OK +${proceeds_usd:.2f} tx={sig[:12]}...")
+        acct = self._tx_accounting(sig, mint)
+        if acct and acct["token_delta"] < 0:
+            sold_base = -acct["token_delta"]
+            proceeds_usd = max(acct["sol_delta"], 0) / 1e9 * sol_usd
+        else:
+            acct = None
+            try:
+                sol_after = self.rpc.get_balance_lamports(self.pubkey)
+                nb, _ = self.rpc.get_token_balance_base(self.pubkey, mint)
+            except Exception as e:
+                raise SwapUncertain(
+                    f"SELL {symbol} da confirm nhung khong doc duoc "
+                    f"balance: {e}")
+            sold_base = max(bal_base - nb, 0)
+            if sold_base <= 0:
+                raise SwapUncertain(
+                    f"SELL {symbol} da confirm nhung token balance khong "
+                    "giam")
+            proceeds_usd = max(sol_after - sol_before, 0) / 1e9 * sol_usd
+        log(f"LIVE SELL {symbol} OK +${proceeds_usd:.2f} tx={sig[:12]}..."
+            f"{'' if acct else ' (so du)'}")
         return {"sold_base": sold_base, "proceeds_usd": round(proceeds_usd, 4),
-                "tx": sig, "dry": False}
+                "tx": sig, "dry": False, "acct": "tx" if acct else "balance",
+                "fee_usd": self._fee_usd(acct, sol_usd)}
 
 
 # ---------------------------------------------------------------- trader
@@ -1934,6 +2017,10 @@ class LiveTrader:
             "price_poll_at": 0,
             "signal_ts": signal_event_ts(s),
             "rent_lamports": int(r.get("rent_lamports") or 0),
+            # Phi mang (base+priority) da nam trong size_usd/realized; ghi
+            # rieng de dashboard hien "truoc phi" (~ cach app vi tinh).
+            "fee_usd": float(r.get("fee_usd") or 0.0),
+            "fee_known": r.get("fee_usd") is not None,
             "wallet_price_usd": ref,
             "entry_premium_pct": r.get("premium_pct"),
             "round_trip_loss_pct": r.get("round_trip_loss_pct"),
@@ -2236,11 +2323,21 @@ class LiveTrader:
         pos["realized_usd"] = pos.get("realized_usd", 0.0) + pnl
         self._daily()["realized_usd"] = self._daily().get(
             "realized_usd", 0.0) + pnl
-        pos["legs"].append({"frac": round(frac, 4), "why": why,
-                            "balance_frac": round(bal_frac, 4),
-                            "proceeds_usd": round(proceeds, 4),
-                            "pnl_usd": round(pnl, 4),
-                            "at": int(now), "tx": r.get("tx")})
+        leg = {"frac": round(frac, 4), "why": why,
+               "balance_frac": round(bal_frac, 4),
+               "proceeds_usd": round(proceeds, 4),
+               "pnl_usd": round(pnl, 4),
+               "at": int(now), "tx": r.get("tx")}
+        if r.get("unconfirmed"):
+            leg["estimated"] = True
+        if r.get("acct"):
+            leg["acct"] = r["acct"]
+        if r.get("fee_usd") is not None:
+            leg["fee_usd"] = r["fee_usd"]
+            pos["fee_usd"] = float(pos.get("fee_usd") or 0.0) + r["fee_usd"]
+        elif not r.get("simulated"):
+            pos["fee_known"] = False
+        pos["legs"].append(leg)
         log(f"{'DRY' if self.dry else 'LIVE'} SELL {pos['symbol']} {why} "
             f"{frac:.0%} goc ({bal_frac:.0%} so du) +${proceeds:.2f} "
             f"(pnl {pnl:+.2f})")
@@ -2266,6 +2363,8 @@ class LiveTrader:
             "liquidity_usd": pos.get("liquidity_usd"),
             "rent_lamports": pos.get("rent_lamports", 0),
             "exit_tier_used": pos.get("exit_tier_used", 0),
+            "fee_usd": round(float(pos.get("fee_usd") or 0.0), 6),
+            "fee_known": bool(pos.get("fee_known", False)),
         }
         with open(TRADES_P, "a") as f:
             f.write(json.dumps(rec) + "\n")

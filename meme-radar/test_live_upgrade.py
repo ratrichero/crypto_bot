@@ -891,6 +891,229 @@ def test_graceful_signal_shutdown():
           lt.time.time() - slept >= 0.19)
 
 
+# ------------------------------------------------------------ ke toan tx
+
+def _acct_tx(sol_pre, sol_post, fee, tok_pre, tok_post, ata_pre=0,
+             ata_post=0, err=None, wallet="PUB", mint="MINT"):
+    keys = [{"pubkey": wallet}, {"pubkey": "ATA"}, {"pubkey": "PROG"}]
+    pre_tb = [] if tok_pre is None else [{
+        "accountIndex": 1, "mint": mint, "owner": wallet,
+        "uiTokenAmount": {"amount": str(tok_pre)}}]
+    post_tb = [] if tok_post is None else [{
+        "accountIndex": 1, "mint": mint, "owner": wallet,
+        "uiTokenAmount": {"amount": str(tok_post)}}]
+    return {"transaction": {"message": {"accountKeys": keys}},
+            "meta": {"err": err, "fee": fee,
+                     "preBalances": [sol_pre, ata_pre, 1],
+                     "postBalances": [sol_post, ata_post, 1],
+                     "preTokenBalances": pre_tb,
+                     "postTokenBalances": post_tb}}
+
+
+class AcctRpc:
+    """getBalance LAG (tra so cu) + getTransaction dieu khien duoc."""
+
+    def __init__(self, sol, tok, txs=None, tx_exc=None, none_times=0):
+        self.sol, self.tok = sol, tok
+        self.txs = txs or {}
+        self.tx_exc = tx_exc
+        self.none_times = none_times
+        self.tx_calls = 0
+
+    def get_balance_lamports(self, owner):
+        return self.sol            # khong doi sau tx = node lag
+
+    def get_token_balance_base(self, owner, mint):
+        return self.tok, 6
+
+    def get_token_accounts_for_mint(self, owner, mint):
+        return []
+
+    def get_transaction(self, sig):
+        self.tx_calls += 1
+        if self.tx_exc:
+            raise self.tx_exc
+        if self.none_times > 0:
+            self.none_times -= 1
+            return None
+        return self.txs.get(sig)
+
+
+def _acct_swapper(rpc, **cfg_kw):
+    cfg = dict(lt.DEFAULTS, mode="live", tx_accounting_wait_seconds=0,
+               buy_balance_verify_seconds=0, **cfg_kw)
+    sw = lt.Swapper(rpc, SellJupA(), None, cfg, dry_run=False)
+    sw.pubkey = "PUB"
+    return sw
+
+
+class SellJupA(FakeJup):
+    def swap_tx(self, quote, user_pubkey, priority_fee):
+        return "TX"
+
+
+def test_tx_accounting():
+    print("== ke toan P&L tu tx that (getBalance co the lag) ==")
+    sol = 150.0
+    L = 10 ** 9
+    rent = 2_039_280
+    swap = int(10 / sol * L)
+    fee = 120_000
+    buy_tx = _acct_tx(10 * L, 10 * L - swap - rent - fee, fee, None,
+                      10_000_000_000, ata_pre=0, ata_post=rent)
+    rpc = AcctRpc(10 * L, 0, {"BUY": buy_tx})
+    sw = _acct_swapper(rpc)
+    r = sw._buy_result("BUY", "T", 10, sol, 10 * L, 10_000_000_000, 6,
+                       mint="MINT", had_account=False)
+    want = (swap + fee) / L * sol
+    check("BUY: getBalance lag nhung cost lay tu tx (swap + phi, khong rent)",
+          abs(r["cost_usd"] - want) < 1e-3 and r["acct"] == "tx", r)
+    check("BUY: rent tu tx", r["rent_lamports"] == rent, r)
+    check("BUY: fee_usd = phi tx", abs(r["fee_usd"] - fee / L * sol) < 1e-6,
+          r)
+    rpc2 = AcctRpc(10 * L, 0, {})
+    r2 = _acct_swapper(rpc2)._buy_result("BUY", "T", 10, sol, 10 * L,
+                                         10_000_000_000, 6, mint="MINT",
+                                         had_account=False)
+    check("BUY: node chua co tx -> thu 3 lan roi dung so du (nhu cu)",
+          rpc2.tx_calls == 3 and r2["acct"] == "balance"
+          and r2["cost_usd"] == 10 and r2["fee_usd"] is None, r2)
+    rpc3 = AcctRpc(10 * L, 0, {"BUY": buy_tx}, none_times=1)
+    r3 = _acct_swapper(rpc3)._buy_result("BUY", "T", 10, sol, 10 * L,
+                                         10_000_000_000, 6, mint="MINT")
+    check("BUY: lan 1 None, lan 2 co tx -> dung tx", r3["acct"] == "tx"
+          and rpc3.tx_calls == 2, r3)
+    rpc4 = AcctRpc(10 * L, 0, {"BUY": buy_tx}, tx_exc=RuntimeError("x"))
+    r4 = _acct_swapper(rpc4)._buy_result("BUY", "T", 10, sol, 10 * L,
+                                         10_000_000_000, 6, mint="MINT")
+    check("BUY: getTransaction loi -> 1 lan, dung so du", rpc4.tx_calls == 1
+          and r4["acct"] == "balance", r4)
+    bad = _acct_tx(10 * L, 10 * L - fee, fee, None, 5, err={"x": 1})
+    r5 = _acct_swapper(AcctRpc(10 * L, 0, {"BUY": bad}))._buy_result(
+        "BUY", "T", 10, sol, 10 * L, 10_000_000_000, 6, mint="MINT")
+    check("BUY: tx loi on-chain -> khong dung lam ke toan",
+          r5["acct"] == "balance", r5)
+    r6 = _acct_swapper(AcctRpc(10 * L, 0, {"BUY": buy_tx}),
+                       tx_accounting=False)._buy_result(
+        "BUY", "T", 10, sol, 10 * L, 10_000_000_000, 6, mint="MINT")
+    check("tx_accounting=false -> nhu cu", r6["acct"] == "balance", r6)
+    rpc_old = RentLike(10 * L)
+    r7 = _acct_swapper(rpc_old)._buy_result("BUY", "T", 10, sol, 10 * L,
+                                            10_000_000_000, 6, mint="MINT")
+    check("rpc khong co get_transaction -> nhu cu", r7["acct"] == "balance")
+
+    # ---- SELL confirmed: proceeds tu tx du getBalance lag
+    got = int(12 / sol * L)
+    sell_tx = _acct_tx(10 * L, 10 * L + got - fee, fee, 1_000_000, 0,
+                       ata_pre=rent, ata_post=rent)
+    rpc = AcctRpc(10 * L, 1_000_000, {"SELL": sell_tx})
+    sw = _acct_swapper(rpc)
+    sw._sign_and_send = lambda tx, on_signed=None: "SELL"
+    sw._confirm = lambda sig: True
+    sw.jup.sol_price_usd = lambda: sol
+    rs = sw.execute_sell("MINT", 1.0, "T")
+    check("SELL: getBalance lag (truoc day = $0) -> proceeds tu tx",
+          abs(rs["proceeds_usd"] - (got - fee) / L * sol) < 1e-3
+          and rs["acct"] == "tx" and rs["sold_base"] == 1_000_000, rs)
+    check("SELL: fee_usd", abs(rs["fee_usd"] - fee / L * sol) < 1e-6, rs)
+    rpc_b = AcctRpc(10 * L, 1_000_000, {})
+    sw_b = _acct_swapper(rpc_b)
+    calls = {"n": 0}
+
+    def bal_after(owner):
+        calls["n"] += 1
+        return 10 * L if calls["n"] == 1 else 10 * L + got - fee
+    rpc_b.get_balance_lamports = bal_after
+
+    def tok_after(owner, mint):
+        return (1_000_000 if calls["n"] <= 1 else 0), 6
+    rpc_b.get_token_balance_base = tok_after
+    sw_b._sign_and_send = lambda tx, on_signed=None: "SELL"
+    sw_b._confirm = lambda sig: True
+    sw_b.jup.sol_price_usd = lambda: sol
+    rb = sw_b.execute_sell("MINT", 1.0, "T")
+    check("SELL: khong co tx -> dung so du nhu cu", rb["acct"] == "balance"
+          and abs(rb["proceeds_usd"] - (got - fee) / L * sol) < 1e-3
+          and rb["fee_usd"] is None, rb)
+
+    # ---- SELL timeout nhung token da di: co tx -> so that, khong uoc tinh
+    rpc_u = AcctRpc(10 * L, 1_000_000, {"SELL": sell_tx})
+    sw_u = _acct_swapper(rpc_u)
+    sw_u._sign_and_send = lambda tx, on_signed=None: "SELL"
+
+    def conf_timeout(sig):
+        rpc_u.tok = 0
+        return False
+    sw_u._confirm = conf_timeout
+    sw_u.jup.sol_price_usd = lambda: sol
+    ru = sw_u.execute_sell("MINT", 1.0, "T")
+    check("SELL timeout + tx co tren chain -> so that, khong 'unconfirmed'",
+          not ru.get("unconfirmed") and ru["acct"] == "tx"
+          and abs(ru["proceeds_usd"] - (got - fee) / L * sol) < 1e-3, ru)
+    rpc_v = AcctRpc(10 * L, 1_000_000, {})
+    sw_v = _acct_swapper(rpc_v)
+    sw_v._sign_and_send = lambda tx, on_signed=None: "SELL"
+
+    def conf_timeout2(sig):
+        rpc_v.tok = 0
+        return False
+    sw_v._confirm = conf_timeout2
+    sw_v.jup.sol_price_usd = lambda: sol
+    rv = sw_v.execute_sell("MINT", 1.0, "T")
+    check("SELL timeout + chua co tx -> uoc tinh nhu cu (unconfirmed)",
+          rv.get("unconfirmed") is True, rv)
+
+    # ---- trader: phi luu vao vi the/leg/ban ghi dong lenh
+    with isolated() as tmpd:
+        tr, _ = _dry_trader(tmpd, {"MINT": 1.0})
+        tr.dry = False
+
+        class W:
+            rpc = None
+            pubkey = "PUB"
+
+            def __init__(self):
+                self.rs = [
+                    {"sold_base": 5, "proceeds_usd": 6.0, "tx": "S1",
+                     "dry": False, "acct": "tx", "fee_usd": 0.02},
+                    {"sold_base": 5, "proceeds_usd": 6.0, "tx": "S2",
+                     "dry": False, "unconfirmed": True}]
+
+            def execute_sell(self, mint, frac, symbol="?", tier=0):
+                return self.rs.pop(0)
+        tr.swapper = W()
+        pos = mkpos()
+        pos["fee_usd"], pos["fee_known"] = 0.03, True
+        tr.positions.append(pos)
+        tr._sell_leg(pos, 0.5, "tp1", 1.2, 100, held=1.0)
+        check("leg ghi fee_usd + cong vao vi the",
+              pos["legs"][0].get("fee_usd") == 0.02
+              and abs(pos["fee_usd"] - 0.05) < 1e-9 and pos["fee_known"],
+              pos)
+        tr._sell_leg(pos, 0.5, "tp2", 1.2, 101, held=0.5)
+        check("leg uoc tinh -> estimated + fee_known=False",
+              pos["legs"][1].get("estimated") is True
+              and pos["fee_known"] is False, pos["legs"][1])
+        pos["remaining"] = 0.0
+        tr._close_position(pos, "tp", 1.2, 102)
+        with open(lt.TRADES_P) as f:
+            rec = json.loads(f.read().strip().splitlines()[-1])
+        check("ban ghi dong lenh co fee_usd/fee_known",
+              abs(rec["fee_usd"] - 0.05) < 1e-9 and rec["fee_known"] is False,
+              rec)
+
+
+class RentLike:
+    def __init__(self, sol):
+        self.sol = sol
+
+    def get_balance_lamports(self, owner):
+        return self.sol - 10 ** 7
+
+    def get_token_accounts_for_mint(self, owner, mint):
+        return []
+
+
 if __name__ == "__main__":
     test_token_risk_reasons()
     test_entry_checks()
@@ -906,5 +1129,6 @@ if __name__ == "__main__":
     test_copy_exit()
     test_close_empty_script()
     test_graceful_signal_shutdown()
+    test_tx_accounting()
     print(f"\n{PASS} pass, {FAIL} fail")
     sys.exit(1 if FAIL else 0)
