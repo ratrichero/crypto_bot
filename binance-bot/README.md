@@ -275,6 +275,16 @@ Cột `LONG%/SHORT%` = giá còn phải giảm/tăng bao nhiêu % mới chạm t
 (≤ 0 = đã chạm). `test_grid_diag.py` đối chiếu 2000 tình huống ngẫu nhiên:
 "sẵn sàng mở" ⇔ `manage_grid` thật sự mở lot.
 
+**Scanner chặn nhiều quá? Đo trước khi nới** (`scanner_whatif.py`, chỉ đọc,
+không gọi mạng): chấm lại kết quả scan mới nhất với ngưỡng khác — tiêu chí
+nào loại nhiều coin nhất, bao nhiêu coin CHỈ trượt đúng tiêu chí đó, số coin
+đạt ở các mức nới gợi ý (nhẹ/vừa/mạnh) và số coin còn qua regime 15m.
+
+```bash
+.venv/bin/python binance-bot/scanner_whatif.py
+.venv/bin/python binance-bot/scanner_whatif.py --set adx_1h_max=25 --set min_mid_crosses=3
+```
+
 ## Chạy thử (data-only → dry-run)
 
 ```bash
