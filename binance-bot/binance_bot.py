@@ -50,6 +50,7 @@ CLEAR_HALT_RESULT_P = os.path.join(BASE, "clear_halt_result.json")
 FAST_POLL = CFG.get("fast_poll_seconds", 0.5)
 SLOW_EVERY = 10          # slow tasks every N fast loops (~5s)
 CANDLE_PER_SLOW = 2      # symbols refreshed per slow tick
+GRID_DIAG_SECONDS = 600  # log "GRID WAIT" + st["grid_diag"] (task 42)
 WARMUP_DELAY = float(CFG.get("warmup_delay_seconds", 0.75))
 MODE = CFG.get("mode", "dry_run")
 DATA_ONLY = MODE == "data_only"
@@ -627,6 +628,26 @@ def grid_side_allowed(st, symbol, side, cap=True):
                            grid_trend_block(symbol, side))
 
 
+def grid_diag_tick(st, prices, candles, paused):
+    """Task 42: phan lon dieu kien chan mo lot grid la im lang -> dinh ky
+    tong hop ly do theo tung symbol (grid_diag, CHI DOC) vao st + 1 dong log.
+    Loi o day khong bao gio duoc lam hong vong chinh."""
+    try:
+        import grid_diag
+        diag = grid_diag.explain_classic(
+            st, CFG, SYMBOLS, prices, paused=paused,
+            has_data=lambda s: bool(candles.get(s)),
+            scanner_block=(lambda s: SCANNER.block_reason(s, SYMBOLS))
+            if SCANNER is not None else None,
+            trend_block=grid_trend_block,
+            side_cap_block=lambda side: grid_side_cap_block(st, side),
+            manage_only=MANAGE_ONLY)
+        st["grid_diag"] = diag
+        log(grid_diag.summary_line(diag))
+    except Exception:
+        log("grid_diag loi:\n" + traceback.format_exc(limit=3))
+
+
 def manage_grid(engine, st, symbol, price):
     g = CFG["grid"]
     grid = st["grids"].setdefault(symbol, {"anchor": None, "taken": {}})
@@ -1166,6 +1187,7 @@ def main():
     last_rest_px = 0
     last_equity_refresh = 0
     last_heartbeat = 0
+    last_grid_diag = time.time() - GRID_DIAG_SECONDS + 120  # sau ~2 phut
     last_cfg_reload = 0
     loop = 0
     while True:
@@ -1558,6 +1580,10 @@ def main():
                     f"daily_dd={st.get('daily_drawdown_pct', 0.0)*100:+.2f}% "
                     f"pos={len(st['positions'])} ws={ws.healthy()} mode={MODE}")
                 last_heartbeat = now
+            if now - last_grid_diag > GRID_DIAG_SECONDS:
+                grid_diag_tick(st, prices, candles, os.path.exists(
+                    os.path.join(BASE, "PAUSE")))
+                last_grid_diag = now
         except binance_safety.BinanceSafetyStop as e:
             # Critical rule: 429/418/-1003 and a persisted circuit stop all
             # REST/private trading; do not let the 0.5s loop retry it.

@@ -370,12 +370,36 @@ class ScannerRunner:
                ) -> bool:
         """Grid co duoc mo lot moi tren symbol? Chi chan o che do filter;
         thieu/het han du lieu -> chan (fail-closed)."""
+        return self.block_reason(symbol, universe) is None
+
+    def block_reason(self, symbol: str,
+                     universe: Optional[Sequence[str]] = None
+                     ) -> Optional[str]:
+        """Ly do scanner chan mo lot moi tren symbol (None = cho phep). Cung
+        logic voi allows() - dung cho log GRID WAIT / grid_diag."""
         sc = self.scfg()
         if not sc.get("enabled", True) or sc.get("mode") != "filter":
-            return True
+            return None
         res = self.results
         if universe is not None:
             uni = set(universe)
             res = {k: v for k, v in res.items() if k in uni}
-        return symbol in allowed_symbols(res, int(sc["top_k"]), self.clock(),
-                                         self.max_age())
+        now = self.clock()
+        top_k = int(sc["top_k"])
+        allowed = allowed_symbols(res, top_k, now, self.max_age())
+        if symbol in allowed:
+            return None
+        r = res.get(symbol)
+        if r is None:
+            return "scanner chưa quét"
+        age = now - float(r.get("ts", 0))
+        if age > self.max_age():
+            return "kết quả scanner hết hạn (%d phút)" % (age // 60)
+        if not r.get("passed"):
+            why = "; ".join((r.get("reasons") or [])[:2])
+            return "scanner trượt" + (": " + why if why else "")
+        fresh = [x for x in res.values() if x.get("passed")
+                 and now - float(x.get("ts", 0)) <= self.max_age()]
+        pos = [x["symbol"] for x in rank(fresh)].index(symbol) + 1
+        return "ngoài top K (hạng %d/%d đạt, top_k=%d)" % (
+            pos, len(fresh), top_k)
