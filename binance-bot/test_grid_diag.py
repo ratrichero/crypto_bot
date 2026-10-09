@@ -77,6 +77,7 @@ check("summary_line co GRID WAIT + gan nhat",
       and "gần nhất ETHUSDT SHORT" in gd.summary_line(d), gd.summary_line(d))
 _, r = one(st_base(), cfg_base(), 98.9)
 check("cham b1, khong chan -> ready", r["code"] == "ready", r)
+check("row co label tieng Viet (dashboard)", r["label"] == "sẵn sàng mở", r)
 _, r = one(st_base(), cfg_base(), 98.9,
            trend_block=lambda s, side: "BTC xu hướng giảm (x)"
            if side == "long" else None)

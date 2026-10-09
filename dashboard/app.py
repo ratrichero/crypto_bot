@@ -2060,6 +2060,55 @@ def trend_table(snap):
     return (syms.get(mkt) or {}).get("bias"), rows
 
 
+GRID_WAIT_ORDER = ("ready", "side_blocked", "wait_price", "full",
+                   "levels_full", "scanner", "max_symbols", "frozen",
+                   "range_lots", "risk_halted", "regime", "manage_only",
+                   "disabled", "no_data")
+
+
+def grid_wait_rows(diag):
+    """state['grid_diag'] (bot ghi moi 10 phut, task 42) -> rows: coin gan
+    mo lot nhat len dau."""
+    def gap(r):
+        v = [x for x in (r.get("long_gap_pct"), r.get("short_gap_pct"))
+             if x is not None]
+        return min(v) if v else 999.0
+    order = {c: i for i, c in enumerate(GRID_WAIT_ORDER)}
+    rows = sorted((diag or {}).get("symbols") or [],
+                  key=lambda r: (order.get(r.get("code"), 99), gap(r)))
+    return [{"Symbol": r.get("symbol"),
+             "Lý do": r.get("label") or r.get("code"),
+             "LONG cách %": r.get("long_gap_pct"),
+             "SHORT cách %": r.get("short_gap_pct"),
+             "Chi tiết": r.get("detail") or ""} for r in rows]
+
+
+def _grid_wait_section():
+    diag = (load_state(BINANCE_STATE) or {}).get("grid_diag")
+    if not diag:
+        st.info("Chưa có chẩn đoán grid (bot cần chạy bản mới; cập nhật mỗi "
+                "10 phút).")
+        return
+    ts = diag.get("ts")
+    st.markdown("**Vì sao grid chưa mở lot** · engine %s · cập nhật %s" % (
+        diag.get("engine"), _ts_local(datetime.fromtimestamp(
+            float(ts), timezone.utc)) if ts else "—"))
+    for g in diag.get("global") or []:
+        st.warning(g)
+    near = diag.get("nearest")
+    if near:
+        st.caption("Gần mở nhất: %s %s, giá cần đi thêm %.2f%%." % (
+            near["symbol"], near["side"].upper(), near["gap_pct"]))
+    rows = grid_wait_rows(diag)
+    if rows:
+        st.dataframe(pd.DataFrame(rows), hide_index=True,
+                     use_container_width=True)
+    st.caption("LONG/SHORT cách %: giá còn phải giảm/tăng bao nhiêu % mới "
+               "chạm tầng kế tiếp (≤ 0 = đã chạm). Chỉ đọc, không ảnh hưởng "
+               "giao dịch.")
+    st.divider()
+
+
 def _trend_section(cfg):
     on = [name for key, name in (("trend.market_filter", "xu hướng BTC"),
                                  ("trend.symbol_filter", "xu hướng từng coin"))
@@ -2086,6 +2135,7 @@ def _trend_section(cfg):
 def _tab_scanner():
     row = db_call(bc.load_version, bc.BOT_BINANCE)
     cfg = dict(bc.defaults(), **(row["config"] if row else {}))
+    _grid_wait_section()
     _trend_section(cfg)
     mode = cfg["scanner.mode"]
     st.caption("Chế độ: **%s** · top K = %s · quét lại mỗi %s phút. %s" % (

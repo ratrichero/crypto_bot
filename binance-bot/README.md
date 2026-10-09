@@ -249,6 +249,32 @@ OOS synthetic là kiểm tra model/code, không phải bằng chứng strategy c
 nhuận; chỉ xem xét Testnet sau khi OOS trên dữ liệu thật và cost/funding
 đầy đủ được duyệt.
 
+## Grid không mở lot — vì sao? (`grid_diag.py`)
+
+Phần lớn điều kiện chặn mở lot grid classic là **im lặng**: regime 15m
+trending, scanner `filter` (trượt / ngoài top K / hết hạn), `max_symbols`,
+`max_positions`, khoá `risk_halted` (sau basket/total/daily stop, tới 0h UTC),
+anchor đóng băng chờ flat, hoặc đơn giản giá chưa chạm tầng (≥ 1 step từ
+anchor). Lọc xu hướng / trần cùng chiều chỉ log **1 lần** khi lý do đổi.
+
+- Bot ghi 1 dòng `GRID WAIT ...` mỗi 10 phút (đếm theo lý do + coin gần mở
+  nhất) và lưu `state.json` → `grid_diag`; dashboard hiển thị ở tab Scanner
+  ("Vì sao grid chưa mở lot").
+- Xem ngay trên VPS (CHỈ ĐỌC, không cần dừng bot, không dùng key; giá lấy
+  từ 1 request public weight 2):
+
+```bash
+cd ~/muse_bot
+.venv/bin/python binance-bot/grid_diag.py              # bảng từng coin
+.venv/bin/python binance-bot/grid_diag.py --no-fetch   # không gọi mạng
+.venv/bin/python binance-bot/grid_diag.py --symbol WLDUSDT --json
+grep "GRID WAIT" binance-bot/bot.log | tail -5    # hoac pm2 logs muse-binance
+```
+
+Cột `LONG%/SHORT%` = giá còn phải giảm/tăng bao nhiêu % mới chạm tầng kế tiếp
+(≤ 0 = đã chạm). `test_grid_diag.py` đối chiếu 2000 tình huống ngẫu nhiên:
+"sẵn sàng mở" ⇔ `manage_grid` thật sự mở lot.
+
 ## Chạy thử (data-only → dry-run)
 
 ```bash

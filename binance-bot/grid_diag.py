@@ -221,6 +221,7 @@ def explain_classic(st: dict, cfg: dict, symbols: Iterable[str],
                     out["nearest"] = {"symbol": sym, "side": side,
                                       "gap_pct": v}
     for row in out["symbols"]:
+        row["label"] = LABELS.get(row["code"], row["code"])
         out["counts"][row["code"]] = out["counts"].get(row["code"], 0) + 1
     return out
 

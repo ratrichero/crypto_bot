@@ -231,7 +231,8 @@ def test_scanner_tab_levels():
         return scans if fn is bc.latest_scans else None
     fst = FakeSt()
     ns = load("_tab_scanner", "_trend_section", "trend_table", "TREND_LABEL",
-              "load_state", extra={
+              "load_state", "_grid_wait_section", "grid_wait_rows",
+              "GRID_WAIT_ORDER", extra={
         "bc": bc, "range_grid": range_grid, "st": fst, "db_call": db_call,
         "pd": type("PD", (), {"DataFrame": staticmethod(lambda r: r)}),
         "_ts_local": lambda t: t, "BINANCE_STATE": "/nonexistent/state.json"})
@@ -556,10 +557,86 @@ def test_live_radar_charts():
     check("khong co snapshot", sm([]) == (None, None, None))
 
 
+def test_grid_wait_section():
+    print("== Scanner tab: Vi sao grid chua mo lot (task 42) ==")
+    import tempfile as _tf
+
+    class FakeSt:
+        def __init__(self):
+            self.frames, self.warnings, self.infos, self.md = [], [], [], []
+            self.captions = []
+
+        def dataframe(self, df, **kw):
+            self.frames.append(df)
+
+        def warning(self, t):
+            self.warnings.append(t)
+
+        def info(self, t):
+            self.infos.append(t)
+
+        def markdown(self, t, **k):
+            self.md.append(t)
+
+        def caption(self, t, **k):
+            self.captions.append(t)
+
+        def divider(self):
+            pass
+
+    diag = {"ts": 1.7e9, "engine": "classic",
+            "global": ["có file PAUSE"],
+            "nearest": {"symbol": "WLDUSDT", "side": "short",
+                        "gap_pct": 0.42},
+            "symbols": [
+                {"symbol": "AAAUSDT", "code": "regime",
+                 "label": "regime trending", "detail": "ADX 15m=31",
+                 "long_gap_pct": None, "short_gap_pct": None},
+                {"symbol": "BBBUSDT", "code": "wait_price",
+                 "label": "chờ giá chạm tầng", "detail": "",
+                 "long_gap_pct": 1.2, "short_gap_pct": 0.8},
+                {"symbol": "WLDUSDT", "code": "wait_price",
+                 "label": "chờ giá chạm tầng", "detail": "",
+                 "long_gap_pct": 1.6, "short_gap_pct": 0.42},
+                {"symbol": "CCCUSDT", "code": "side_blocked",
+                 "label": "chạm tầng nhưng bị chặn chiều",
+                 "detail": "LONG: BTC xu hướng giảm",
+                 "long_gap_pct": -0.1, "short_gap_pct": 2.0}]}
+    with _tf.TemporaryDirectory() as d:
+        sp = os.path.join(d, "state.json")
+        json.dump({"grid_diag": diag}, open(sp, "w"))
+        fst = FakeSt()
+        ns = load("_grid_wait_section", "grid_wait_rows", "GRID_WAIT_ORDER",
+                  "load_state", extra={
+                      "st": fst, "BINANCE_STATE": sp,
+                      "pd": type("PD", (), {
+                          "DataFrame": staticmethod(lambda r: r)}),
+                      "_ts_local": lambda t: t.strftime("%H:%M")})
+        ns["_grid_wait_section"]()
+        rows = fst.frames[0]
+        check("thu tu: bi chan chieu > cho gia (gan truoc) > trending",
+              [r["Symbol"] for r in rows] == ["CCCUSDT", "WLDUSDT",
+                                              "BBBUSDT", "AAAUSDT"],
+              [r["Symbol"] for r in rows])
+        check("cot ly do + chi tiet", rows[0]["Lý do"].startswith("chạm tầng")
+              and "BTC" in rows[0]["Chi tiết"], rows[0])
+        check("ly do toan cuc -> warning", fst.warnings == ["có file PAUSE"],
+              fst.warnings)
+        check("gan mo nhat -> caption", any("WLDUSDT SHORT" in c and "0.42"
+                                            in c for c in fst.captions),
+              fst.captions)
+        fst2 = FakeSt()
+        ns["st"] = fst2
+        ns["BINANCE_STATE"] = os.path.join(d, "nope.json")
+        ns["_grid_wait_section"]()
+        check("chua co grid_diag -> info, khong bang",
+              fst2.infos and not fst2.frames, (fst2.infos, fst2.frames))
+
+
 TESTS = [test_session_cookie, test_helius_key, test_sol_wallet, test_live_radar_halt_status, test_config_helpers,
          test_scanner_tab_levels, test_trend_section, test_bot_runtime_note,
          test_monitor_pm2, test_live_fee,
-         test_live_radar_charts]
+         test_live_radar_charts, test_grid_wait_section]
 
 
 if __name__ == "__main__":
