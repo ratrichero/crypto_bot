@@ -75,5 +75,12 @@
  "_copy_exit_note": "Moi lenh ban cua vi theo doi (>= min_sell_sol) -> alert wallet_sell (live copy exit); paper thoat khi vi nguon da ban cong don >= copy_exit_min_sold_frac. sell_cluster van chi tinh lenh >= min_sol_spent.",
  "min_sell_sol": 0.05,
  "copy_exit": true,
- "copy_exit_min_sold_frac": 0.5
+ "copy_exit_min_sold_frac": 0.5,
+ "_rug_gate_note": "Cong loc rug (RugCheck, rugcheck.py): chi mo paper khi khong rugged, mint/freeze authority da thu hoi, khong risk muc danger, LP market chinh lock >= rug_min_lp_locked_pct, score_normalised <= rug_max_score_normalised, transfer fee <= rug_max_transfer_fee_pct. Khong co du lieu -> skipped_rug_* (fail closed), ghi trong paper_entries.jsonl.",
+ "rug_gate_enabled": true,
+ "rug_max_score_normalised": 50,
+ "rug_min_lp_locked_pct": 80,
+ "rug_max_transfer_fee_pct": 10,
+ "rug_cache_ttl_sec": 600,
+ "rug_timeout_sec": 6
 }

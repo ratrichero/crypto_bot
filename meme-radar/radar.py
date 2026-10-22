@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 import requests
 
 import feasibility as feas
+import rugcheck
 from dexscreener import pick_pair
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -510,6 +511,15 @@ def open_paper(st, s, now, info_fn=None):
                 f"${size * float(F['min_liquidity_mult']):,.0f})")
             return None
         slip = feas.slippage_pct(size, liq, F)
+    ok_rug, why_rug, rug_det = rugcheck.evaluate(s["token"], CFG)
+    if not ok_rug:
+        record_entry(s, plan, why_rug, now, size_usd=size, liquidity_usd=liq,
+                     rug_score=rug_det.get("rug_score"),
+                     rug_lp_locked_pct=rug_det.get("rug_lp_locked_pct"))
+        log(f"PAPER[{plan}] {why_rug} {s.get(symbol)} "
+            f"score={rug_det.get(rug_score)} "
+            f"lp_lock={rug_det.get(rug_lp_locked_pct)}")
+        return None
     pos = {
         "token": s["token"], "symbol": s["symbol"],
         "wallet": s["wallet"], "opened_at": int(now),
@@ -518,6 +528,8 @@ def open_paper(st, s, now, info_fn=None):
         "peak": entry, "remaining": 1.0, "realized": 0.0,
         "realized_adj": 0.0, "liquidity_usd": liq,
         "entry_slip_pct": round(slip, 3),
+        "rug_score": rug_det.get("rug_score"),
+        "rug_lp_locked_pct": rug_det.get("rug_lp_locked_pct"),
         "entry_eff": feas.apply_buy(entry, slip),
         "src_remaining": 1.0, "snaps": {}, "legs": [],
     }
@@ -527,7 +539,8 @@ def open_paper(st, s, now, info_fn=None):
         pos.update(tp1=False, tp2=False)
     st.setdefault(plan, []).append(pos)
     record_entry(s, plan, "opened", now, size_usd=size, liquidity_usd=liq,
-                 slip_pct=round(slip, 3))
+                 slip_pct=round(slip, 3), rug_score=rug_det.get("rug_score"),
+                 rug_lp_locked_pct=rug_det.get("rug_lp_locked_pct"))
     if is_holder:
         log(f"PAPER[paper_holder] open {s['symbol']} @{entry} "
             f"size=${size} slip {slip:.1f}% (holder {s['wallet'][:8]}...)")
