@@ -1,8 +1,11 @@
-"""Kenh real-time: websocket logsSubscribe Helius -> hang doi tin hieu BUY.
+"""Kenh real-time: websocket logsSubscribe (RPC Solana chuan) -> hang doi
+tin hieu BUY. Nha cung cap cau hinh qua cfg ws_url (vd Alchemy); khong co
+thi dung Helius, cuoi cung la public WS.
 
-Moi vi duoc subscribe rieng (Helius gioi han 1 address/subscription).
+Moi vi duoc subscribe rieng (gioi han 1 address/subscription).
 Nhan notification -> fetch transaction -> parse_buy -> day vao queue.
-Tu reconnect khi rot mang. Poll RPC trong radar.py van chay lam fallback.
+Tu reconnect khi rot mang, xoay vong sang URL ke tiep sau moi lan rot.
+Poll RPC trong radar.py van chay lam fallback.
 """
 import asyncio
 import json
@@ -12,7 +15,8 @@ import time
 
 import websockets
 
-from .helius import Helius, parse_buy, parse_sell, load_wallets, redact_key
+from .helius import (Helius, parse_buy, parse_sell, load_wallets, redact_key,
+                     rpc_urls_from_cfg, ws_urls_from_cfg)
 
 
 class WSFeed(threading.Thread):
@@ -23,6 +27,7 @@ class WSFeed(threading.Thread):
         self.q = out_q
         self.log = log
         self.stop_event = stop_event
+        self._url_idx = 0
 
     def run(self):
         try:
@@ -39,21 +44,23 @@ class WSFeed(threading.Thread):
             except Exception as e:
                 if self.stop_event.is_set():
                     return
+                self._url_idx += 1  # rot thi lan reconnect sau thu URL ke tiep
                 self.log(f"ws feed reconnect sau {backoff}s ({redact_key(str(e))[:100]})")
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 120)
 
     async def _run_once(self):
-        key = self.cfg.get("helius_api_key")
-        if not key:
-            self.log("ws feed: thieu key, khong chay")
+        if not self.cfg.get("ws_url") and not self.cfg.get("helius_api_key"):
+            self.log("ws feed: thieu ws_url/key, khong chay")
             return
         wallets = load_wallets(self.cfg, self.base)
         if not wallets:
             self.log("ws feed: chua co vi theo doi")
             return
-        h = Helius(key, timeout=30)
-        url = f"wss://mainnet.helius-rpc.com/?api-key={key}"
+        h = Helius(timeout=30, urls=rpc_urls_from_cfg(self.cfg))
+        urls = ws_urls_from_cfg(self.cfg)
+        url = urls[self._url_idx % len(urls)]
+        self.log(f"ws feed: ket noi {redact_key(url)}")
         sub2wallet = {}
         async with websockets.connect(url, max_size=8 * 1024 * 1024,
                                       ping_interval=20, ping_timeout=20) as ws:

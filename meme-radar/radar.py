@@ -35,6 +35,22 @@ if not CFG.get("helius_api_key"):
         CFG["helius_api_key"] = open(os.path.join(BASE, ".helius_key")).read().strip()
     except FileNotFoundError:
         pass
+# Endpoint RPC/WS cua nha cung cap chinh (vd Alchemy; URL chua key nen KHONG
+# ghi vao config.json commit len git): env RADAR_RPC_URL/RADAR_WS_URL, roi
+# file .rpc_endpoints (dong 1 = https RPC, dong 2 = wss), roi config.
+if not CFG.get("rpc_url"):
+    CFG["rpc_url"] = os.environ.get("RADAR_RPC_URL", "")
+if not CFG.get("ws_url"):
+    CFG["ws_url"] = os.environ.get("RADAR_WS_URL", "")
+try:
+    _ep = [ln.strip() for ln in
+           open(os.path.join(BASE, ".rpc_endpoints")) if ln.strip()]
+    if _ep and not CFG.get("rpc_url"):
+        CFG["rpc_url"] = _ep[0]
+    if len(_ep) > 1 and not CFG.get("ws_url"):
+        CFG["ws_url"] = _ep[1]
+except FileNotFoundError:
+    pass
 STATE_P = os.path.join(BASE, "radar_state.json")
 SIG_P = os.path.join(BASE, "signals.jsonl")
 ALERT_P = os.path.join(BASE, "alerts.jsonl")
@@ -675,7 +691,8 @@ def main():
     # kenh real-time websocket (poll RPC van chay lam fallback)
     ws_q = queue_mod.Queue()
     ws_stop = threading.Event()
-    if CFG.get("ws_enabled", True) and CFG.get("helius_api_key"):
+    if CFG.get("ws_enabled", True) and (CFG.get("helius_api_key")
+                                        or CFG.get("ws_url")):
         try:
             from sources.ws_feed import WSFeed
             WSFeed(CFG, BASE, ws_q, log, ws_stop).start()
@@ -708,8 +725,8 @@ def main():
                                     for r in buys_ws], seen, now)
             if src == "helius":
                 # --- nguon mien phi: doc truc tiep tx cac vi qua Helius ---
-                if not CFG.get("helius_api_key"):
-                    log("FATAL: chua co HELIUS_API_KEY -> dung, doi key")
+                if not CFG.get("helius_api_key") and not CFG.get("rpc_url"):
+                    log("FATAL: chua co HELIUS_API_KEY/RADAR_RPC_URL -> dung, doi key")
                     return
                 try:
                     from sources.helius import poll_wallet_txs

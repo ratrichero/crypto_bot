@@ -2,6 +2,8 @@
 *.key
 .okx_key
 .helius_key
+.rpc_endpoints
+meme-radar/config.json
 *_state.json
 radar_state.json
 # du lieu chay live

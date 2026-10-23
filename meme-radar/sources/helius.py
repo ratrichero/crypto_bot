@@ -18,29 +18,101 @@ STABLES = {
 
 
 def redact_key(s):
-    """Xoa api-key khoi moi chuoi log."""
-    return re.sub(r"api-key=[^&\s'\"]+", "api-key=***", str(s))
+    """Xoa moi dang key khoi chuoi log: api-key=/api_key= va /v2/<key> (Alchemy)."""
+    s = str(s)
+    s = re.sub(r"api[-_]key=[^&\s'\"]+", "api-key=***", s)
+    s = re.sub(r"/v2/[^/\s'\"]+", "/v2/***", s)
+    return s
+
+
+PUBLIC_RPC = "https://api.mainnet-beta.solana.com"
+PUBLIC_WS = "wss://api.mainnet-beta.solana.com"
+
+
+def helius_rpc_url(api_key):
+    return f"https://mainnet.helius-rpc.com/?api-key={api_key}"
+
+
+def helius_ws_url(api_key):
+    return f"wss://mainnet.helius-rpc.com/?api-key={api_key}"
+
+
+def rpc_urls_from_cfg(cfg):
+    """Danh sach URL RPC theo thu tu uu tien: chinh (vd Alchemy) -> fallback ->
+    Helius (neu co key) -> public RPC. Radar chi dung method RPC chuan nen
+    nha cung cap nao cung thay duoc; failover de khong mu toan tap khi 1
+    nguon chet (bai hoc Helius can credits 21/10/2026)."""
+    urls = []
+    for u in (cfg.get("rpc_url"), cfg.get("rpc_fallback_url")):
+        if u and u not in urls:
+            urls.append(u)
+    key = cfg.get("helius_api_key")
+    if key:
+        hu = helius_rpc_url(key)
+        if hu not in urls:
+            urls.append(hu)
+    if PUBLIC_RPC not in urls:
+        urls.append(PUBLIC_RPC)
+    return urls
+
+
+def ws_urls_from_cfg(cfg):
+    """Tuong tu rpc_urls_from_cfg nhung cho websocket."""
+    urls = []
+    for u in (cfg.get("ws_url"), cfg.get("ws_fallback_url")):
+        if u and u not in urls:
+            urls.append(u)
+    key = cfg.get("helius_api_key")
+    if key:
+        wu = helius_ws_url(key)
+        if wu not in urls:
+            urls.append(wu)
+    if PUBLIC_WS not in urls:
+        urls.append(PUBLIC_WS)
+    return urls
 
 
 class Helius:
-    def __init__(self, api_key, timeout=20):
-        self.url = f"https://mainnet.helius-rpc.com/?api-key={api_key}"
+    """Client JSON-RPC Solana chuan (ten cu giu nguyen de khong sua moi noi
+    import). Ho tro nhieu URL + failover: goi that bai o URL nay thi thu URL
+    ke tiep, va uu tien URL lan truoc goi thanh cong."""
+
+    def __init__(self, api_key=None, timeout=20, urls=None):
+        if urls:
+            self.urls = list(urls)
+        elif api_key:
+            self.urls = [helius_rpc_url(api_key)]
+        else:
+            self.urls = [PUBLIC_RPC]
+        self.url = self.urls[0]
         self.timeout = timeout
+        self._good = 0
 
     def rpc(self, method, params):
-        try:
-            r = requests.post(
-                self.url,
-                json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
-                timeout=self.timeout,
-            )
-            r.raise_for_status()
-        except Exception as e:
-            raise RuntimeError(redact_key(e))
-        j = r.json()
-        if j.get("error"):
-            raise RuntimeError(str(j["error"])[:200])
-        return j.get("result")
+        last_err = None
+        n = len(self.urls)
+        for k in range(n):
+            i = (self._good + k) % n
+            url = self.urls[i]
+            try:
+                r = requests.post(
+                    url,
+                    json={"jsonrpc": "2.0", "id": 1, "method": method,
+                          "params": params},
+                    timeout=self.timeout,
+                )
+                r.raise_for_status()
+                j = r.json()
+            except Exception as e:
+                last_err = RuntimeError(redact_key(e))
+                continue
+            if j.get("error"):
+                last_err = RuntimeError(redact_key(str(j["error"])[:200]))
+                continue
+            self._good = i
+            self.url = url
+            return j.get("result")
+        raise last_err or RuntimeError("rpc: khong co URL nao kha dung")
 
 
 def parse_buy(tx, wallet, min_sol):
@@ -183,7 +255,7 @@ def load_wallets(cfg, base):
 
 def poll_wallet_txs(cfg, st, log, ds_token_fn, sol_usd, base):
     """Quet moi vi, tra ve (buys_enriched, sells_raw). Luu last sig vao st."""
-    h = Helius(cfg["helius_api_key"])
+    h = Helius(urls=rpc_urls_from_cfg(cfg))
     wallets = load_wallets(cfg, base)
     if not wallets:
         return [], []
