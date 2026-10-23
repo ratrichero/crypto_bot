@@ -532,9 +532,9 @@ def open_paper(st, s, now, info_fn=None):
         record_entry(s, plan, why_rug, now, size_usd=size, liquidity_usd=liq,
                      rug_score=rug_det.get("rug_score"),
                      rug_lp_locked_pct=rug_det.get("rug_lp_locked_pct"))
-        log(f"PAPER[{plan}] {why_rug} {s.get(symbol)} "
-            f"score={rug_det.get(rug_score)} "
-            f"lp_lock={rug_det.get(rug_lp_locked_pct)}")
+        log(f"PAPER[{plan}] {why_rug} {s.get('symbol')} "
+            f"score={rug_det.get('rug_score')} "
+            f"lp_lock={rug_det.get('rug_lp_locked_pct')}")
         return None
     pos = {
         "token": s["token"], "symbol": s["symbol"],
