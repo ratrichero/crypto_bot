@@ -165,6 +165,17 @@ def main(argv=None):
         except Exception:
             cfg = {}
     F = feas.params(cfg)
+    # Chi thong ke lenh tu version moi (cong loc rug) de giam nhieu:
+    # config stats_since = epoch giay. --all -> xem toan bo lich su.
+    since = 0
+    if "--all" not in argv:
+        try:
+            since = int(cfg.get("stats_since") or 0)
+        except (TypeError, ValueError):
+            since = 0
+    if since:
+        trades = [t for t in trades if (t.get("opened_at") or 0) >= since]
+        entries = [e for e in entries if (e.get("ts") or 0) >= since]
     st = {}
     sp = os.path.join(BASE, "radar_state.json")
     if os.path.exists(sp):
@@ -172,7 +183,15 @@ def main(argv=None):
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     L = [f"RADAR MEME (Solana smart money, paper) — {ts}"]
-    L.append(f"Vi the paper dang mo: {len(st.get('paper', []))}")
+    open_pos = st.get("paper", [])
+    if since:
+        from datetime import timedelta
+        vn = datetime.fromtimestamp(since, timezone(timedelta(hours=7)))
+        L.append(f"Thong ke tu {vn:%d/%m/%Y %H:%M} +07 (version cong loc rug; --all de xem toan bo)")
+        n_new = sum(1 for p in open_pos if (p.get("opened_at") or 0) >= since)
+        L.append(f"Vi the paper dang mo: {n_new} (tong tat ca: {len(open_pos)})")
+    else:
+        L.append(f"Vi the paper dang mo: {len(open_pos)}")
     if not trades:
         L.append("Chua co lenh paper nao dong (can ~4h moi dong 1 lenh).")
         if entries:
@@ -224,6 +243,8 @@ def main(argv=None):
              "ket qua ao khong dam bao ket qua that.")
     # plan holder (vi holder: SL rong, om dai, scale-in, chot theo vi)
     ht = load_jsonl(os.path.join(BASE, "paper_trades_holder.jsonl"))
+    if since:
+        ht = [t for t in ht if (t.get("opened_at") or 0) >= since]
     if ht:
         hn = len(ht)
         hw = sum(1 for t in ht if (t.get("final_ret") or 0) > 0)
