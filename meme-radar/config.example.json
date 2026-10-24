@@ -86,5 +86,7 @@
  "rug_min_lp_locked_pct": 80,
  "rug_max_transfer_fee_pct": 10,
  "rug_cache_ttl_sec": 600,
- "rug_timeout_sec": 6
+ "rug_timeout_sec": 6,
+ "_stats_note": "report.py chi thong ke lenh mo tu stats_since (epoch giay) tro di - moc bat dau version cong loc rug (23/10/2026 15:45 +07). Chay report.py --all de xem toan bo lich su.",
+ "stats_since": 1792745120
 }
