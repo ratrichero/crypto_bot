@@ -40,6 +40,8 @@ from dexscreener import pick_pair
 from strategy import decide_exits
 from txparse import parse_tx
 
+import rugcheck
+
 BASE = os.path.dirname(os.path.abspath(__file__))
 
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -405,30 +407,39 @@ class RpcError(Exception):
 
 class RpcClient:
     def __init__(self, url, timeout=20):
-        self.url = url
+        self.urls = [url] if isinstance(url, str) else list(url)
+        self.url = self.urls[0]
         self.timeout = timeout
         self._id = 0
         self._decimals_cache = {}
 
     def call(self, method, params):
         self._id += 1
-        try:
-            r = requests.post(self.url, json={
-                "jsonrpc": "2.0", "id": self._id,
-                "method": method, "params": params,
-            }, timeout=self.timeout)
-            r.raise_for_status()
-            d = r.json()
-        except requests.RequestException as e:
-            # Message cua requests chua full URL (?api-key=...) -> redact,
-            # `from None` de traceback khong in lai exception goc.
-            raise RpcError(f"{method}: {type(e).__name__}: "
-                           f"{redact(e)[:200]}") from None
-        except ValueError as e:
-            raise RpcError(f"{method}: JSON khong hop le: {redact(e)[:200]}") from None
-        if d.get("error"):
-            raise RpcError(redact(d["error"])[:200])
-        return d["result"]
+        payload = {
+            "jsonrpc": "2.0", "id": self._id,
+            "method": method, "params": params,
+        }
+        last_err = None
+        for url in self.urls:
+            try:
+                r = requests.post(url, json=payload, timeout=self.timeout)
+                r.raise_for_status()
+                d = r.json()
+            except requests.RequestException as e:
+                # Message cua requests co the chua full URL (co api-key)
+                # -> redact, de traceback khong in lai exception goc.
+                last_err = RpcError(f"{method}: {type(e).__name__}: "
+                                    f"{redact(e)[:200]}")
+                continue
+            except ValueError as e:
+                last_err = RpcError(
+                    f"{method}: JSON khong hop le: {redact(e)[:200]}")
+                continue
+            if d.get("error"):
+                raise RpcError(redact(d["error"])[:200])
+            return d["result"]
+        raise last_err from None
+
 
     def get_balance_lamports(self, pubkey):
         return int(self.call("getBalance", [pubkey, {"commitment": "confirmed"}])["value"])
@@ -1385,9 +1396,13 @@ class LiveTrader:
         if os.path.exists(kp_path):
             helius_key = open(kp_path).read().strip()
         register_secret(helius_key)
-        rpc_url = (f"https://mainnet.helius-rpc.com/?api-key={helius_key}"
-                   if helius_key else "https://api.mainnet-beta.solana.com")
-        self.rpc = rpc or RpcClient(rpc_url)
+        rpc_urls = []
+        if helius_key:
+            rpc_urls.append(
+                f"https://mainnet.helius-rpc.com/?api-key={helius_key}")
+        rpc_urls.append("https://api.mainnet-beta.solana.com")
+        rpc_urls.append("https://solana-rpc.publicnode.com")
+        self.rpc = rpc or RpcClient(rpc_urls)
         if self.dry:
             self.kp = None
             log("DRY_RUN mode: chi log y dinh swap, KHONG gui transaction")
@@ -1922,7 +1937,15 @@ class LiveTrader:
             self.save()
         self.swapper.on_buy_sent = _on_sent
         try:
-            self._open_from_signal(s, now)
+            ok_rug, why_rug, rug_det = rugcheck.evaluate(mint, self.cfg)
+            if not ok_rug:
+                reason = (why_rug[len("skipped_"):]
+                          if why_rug.startswith("skipped_") else why_rug)
+                raise EntryRejected(
+                    reason,
+                    f"score={rug_det.get('rug_score')} "
+                    f"lp_lock={rug_det.get('rug_lp_locked_pct')}")
+            self._open_from_signal(s, now, rug_det)
         except EntryRejected as e:
             # Tu choi TRUOC khi gui tx (khong co side effect) -> khong retry.
             pending.pop(tid, None)
@@ -1985,7 +2008,7 @@ class LiveTrader:
             return None
         return px if px > 0 and math.isfinite(px) else None
 
-    def _open_from_signal(self, s, now):
+    def _open_from_signal(self, s, now, rug_det=None):
         mint = s["token"]
         symbol = s.get("symbol", "?")
         size = float(self.cfg["trade_size_usd"])
@@ -2025,6 +2048,8 @@ class LiveTrader:
             "entry_premium_pct": r.get("premium_pct"),
             "round_trip_loss_pct": r.get("round_trip_loss_pct"),
             "liquidity_usd": s.get("liquidity_usd"),
+            "rug_score": (rug_det or {}).get("rug_score"),
+            "rug_lp_locked_pct": (rug_det or {}).get("rug_lp_locked_pct"),
         }
         self.positions.append(pos)
         log(f"{'DRY' if self.dry else 'LIVE'} OPEN {symbol} @{entry:.8f} "

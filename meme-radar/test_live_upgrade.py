@@ -16,6 +16,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import live_trader as lt  # noqa: E402
+
+# Test offline: stub cong loc rug (mint gia khong qua RugCheck that).
+lt.rugcheck.evaluate = lambda mint, cfg=None: (
+    True, None, {"rug_score": 10, "rug_lp_locked_pct": 100.0})
 from test_live_trader import (FakeJup, FakeRpc, _dry_trader,  # noqa: E402
                               _sig, isolated, mkpos)
 

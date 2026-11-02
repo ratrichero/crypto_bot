@@ -15,6 +15,10 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE)
 import live_trader as lt
 
+# Test offline: stub cong loc rug (mint gia khong qua RugCheck that).
+lt.rugcheck.evaluate = lambda mint, cfg=None: (
+    True, None, {"rug_score": 10, "rug_lp_locked_pct": 100.0})
+
 PASS, FAIL = 0, 0
 
 
@@ -324,6 +328,37 @@ def test_run_once_dry_e2e():
               str(pos["remaining"]))
         check("co leg TP1", any(l["why"] == "TP1" for l in pos["legs"]))
         check("khong goi swap that", jup.swaps == 0)
+
+
+
+def test_rug_gate_blocks_entry():
+    print("== cong loc rug: token danger -> khong mo vi the ==")
+    with isolated() as tmpd:
+        sig = {"detected_at": 1000, "tid": "tid_rug", "wallet": "W",
+               "token": "MINT_RUG", "symbol": "RUG", "amount_usd": 500.0,
+               "price_usd": 0.001, "price_now": 0.001, "ts": 1000,
+               "tx": "x", "mcap_usd": 60000, "src": "ws"}
+        with open(os.path.join(tmpd, "sig_p"), "w") as f:
+            f.write(json.dumps(sig) + "\n")
+        cfg = dict(lt.DEFAULTS, mode="dry_run", price_poll_seconds=0)
+        jup = FakeJup(price_map={"MINT_RUG": 0.001})
+        rpc = FakeRpc()
+        tr = lt.LiveTrader(cfg, jup=jup, rpc=rpc)
+        tr.swapper = lt.Swapper(rpc, jup, None, cfg, dry_run=True)
+        tr.state["sig_offset"] = 0  # doc tu dau file
+        orig = lt.rugcheck.evaluate
+        lt.rugcheck.evaluate = lambda mint, cfg=None: (
+            False, "skipped_rug_danger_risk",
+            {"rug_score": 90, "rug_lp_locked_pct": 10.0})
+        try:
+            tr.run_once(now=1000)
+        finally:
+            lt.rugcheck.evaluate = orig
+        check("khong mo vi the khi rug gate chan",
+              len(tr.positions) == 0, f"positions={len(tr.positions)}")
+        check("dem entry_rejects rug_danger_risk",
+              tr.state.get("entry_rejects", {}).get("rug_danger_risk", 0) == 1,
+              str(tr.state.get("entry_rejects", {})))
 
 
 # ---- PAUSE + rollback leg that bai ----
@@ -1229,6 +1264,7 @@ if __name__ == "__main__":
     test_key_match_ok()
     test_stop_file()
     test_run_once_dry_e2e()
+    test_rug_gate_blocks_entry()
     test_pause_still_manages_exits()
     test_pause_smart_exit()
     test_no_dead_sells_source()
