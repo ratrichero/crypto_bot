@@ -2386,6 +2386,8 @@ class LiveTrader:
             "entry_premium_pct": pos.get("entry_premium_pct"),
             "round_trip_loss_pct": pos.get("round_trip_loss_pct"),
             "liquidity_usd": pos.get("liquidity_usd"),
+            "rug_score": pos.get("rug_score"),
+            "rug_lp_locked_pct": pos.get("rug_lp_locked_pct"),
             "rent_lamports": pos.get("rent_lamports", 0),
             "exit_tier_used": pos.get("exit_tier_used", 0),
             "fee_usd": round(float(pos.get("fee_usd") or 0.0), 6),

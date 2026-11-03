@@ -1088,6 +1088,7 @@ def test_tx_accounting():
         tr.swapper = W()
         pos = mkpos()
         pos["fee_usd"], pos["fee_known"] = 0.03, True
+        pos["rug_score"], pos["rug_lp_locked_pct"] = 12, 92.5
         tr.positions.append(pos)
         tr._sell_leg(pos, 0.5, "tp1", 1.2, 100, held=1.0)
         check("leg ghi fee_usd + cong vao vi the",
@@ -1104,6 +1105,9 @@ def test_tx_accounting():
             rec = json.loads(f.read().strip().splitlines()[-1])
         check("ban ghi dong lenh co fee_usd/fee_known",
               abs(rec["fee_usd"] - 0.05) < 1e-9 and rec["fee_known"] is False,
+              rec)
+        check("ban ghi dong lenh co rug_score/rug_lp_locked_pct",
+              rec.get("rug_score") == 12 and rec.get("rug_lp_locked_pct") == 92.5,
               rec)
 
 
